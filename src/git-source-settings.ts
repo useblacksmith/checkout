@@ -118,4 +118,14 @@ export interface IGitSourceSettings {
    * User override on the GitHub Server/Host URL that hosts the repository to be cloned
    */
   githubServerUrl: string | undefined
+
+  /**
+   * Indicates whether to enable git directory caching
+   */
+  cache: boolean
+
+  /**
+   * Cache save mode: 'auto', 'always', or 'never'
+   */
+  cacheSave: string
 }

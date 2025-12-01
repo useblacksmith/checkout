@@ -26,6 +26,21 @@ export const SshKeyPath = core.getState('sshKeyPath')
 export const SshKnownHostsPath = core.getState('sshKnownHostsPath')
 
 /**
+ * Whether cache is enabled for the POST action.
+ */
+export const CacheEnabled = core.getState('cacheEnabled') === 'true'
+
+/**
+ * The cache key for the POST action.
+ */
+export const CacheKey = core.getState('cacheKey')
+
+/**
+ * Whether to save the cache in the POST action.
+ */
+export const ShouldSaveCache = core.getState('shouldSaveCache') === 'true'
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -51,6 +66,27 @@ export function setSshKnownHostsPath(sshKnownHostsPath: string) {
  */
 export function setSafeDirectory() {
   core.saveState('setSafeDirectory', 'true')
+}
+
+/**
+ * Save the cache enabled state so the POST action can retrieve the value.
+ */
+export function setCacheEnabled(cacheEnabled: boolean) {
+  core.saveState('cacheEnabled', cacheEnabled.toString())
+}
+
+/**
+ * Save the cache key so the POST action can retrieve the value.
+ */
+export function setCacheKey(cacheKey: string) {
+  core.saveState('cacheKey', cacheKey)
+}
+
+/**
+ * Save whether to save cache so the POST action can retrieve the value.
+ */
+export function setShouldSaveCache(shouldSaveCache: boolean) {
+  core.saveState('shouldSaveCache', shouldSaveCache.toString())
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

@@ -1,5 +1,6 @@
 import * as core from '@actions/core'
 import * as coreCommand from '@actions/core/lib/command'
+import * as cacheHelper from './cache-helper'
 import * as gitSourceProvider from './git-source-provider'
 import * as inputHelper from './input-helper'
 import * as path from 'path'
@@ -17,9 +18,40 @@ async function run(): Promise<void> {
         path.join(__dirname, 'problem-matcher.json')
       )
 
+      // Restore cache if enabled
+      let cacheKey: string | undefined
+      if (sourceSettings.cache) {
+        cacheKey = cacheHelper.getCacheKey(
+          sourceSettings.repositoryOwner,
+          sourceSettings.repositoryName,
+          sourceSettings.githubServerUrl
+        )
+        stateHelper.setCacheKey(cacheKey)
+        stateHelper.setCacheEnabled(true)
+
+        await cacheHelper.restoreCache(
+          sourceSettings.repositoryPath,
+          cacheKey
+        )
+      } else {
+        stateHelper.setCacheEnabled(false)
+      }
+
       // Get sources
       await gitSourceProvider.getSource(sourceSettings)
       core.setOutput('ref', sourceSettings.ref)
+
+      // Determine if we should save cache
+      if (sourceSettings.cache && cacheKey) {
+        const shouldSave = await cacheHelper.shouldSaveCache(
+          sourceSettings.cacheSave,
+          sourceSettings.repositoryOwner,
+          sourceSettings.repositoryName,
+          sourceSettings.authToken,
+          sourceSettings.githubServerUrl
+        )
+        stateHelper.setShouldSaveCache(shouldSave)
+      }
     } finally {
       // Unregister problem matcher
       coreCommand.issueCommand('remove-matcher', {owner: 'checkout-git'}, '')
@@ -32,6 +64,19 @@ async function run(): Promise<void> {
 async function cleanup(): Promise<void> {
   try {
     await gitSourceProvider.cleanup(stateHelper.RepositoryPath)
+
+    // Save cache if enabled and should save
+    if (
+      stateHelper.CacheEnabled &&
+      stateHelper.ShouldSaveCache &&
+      stateHelper.CacheKey &&
+      stateHelper.RepositoryPath
+    ) {
+      await cacheHelper.saveCache(
+        stateHelper.RepositoryPath,
+        stateHelper.CacheKey
+      )
+    }
   } catch (error) {
     core.warning(`${(error as any)?.message ?? error}`)
   }
