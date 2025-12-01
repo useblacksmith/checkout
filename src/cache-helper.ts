@@ -38,9 +38,7 @@ export async function restoreCache(
       return undefined
     }
   } catch (error) {
-    core.warning(
-      `Failed to restore cache: ${(error as any)?.message ?? error}`
-    )
+    core.warning(`Failed to restore cache: ${(error as any)?.message ?? error}`)
     return undefined
   }
 }
@@ -122,4 +120,3 @@ export async function shouldSaveCache(
   core.warning(`Unknown cache-save mode: ${cacheSaveMode}, not saving cache`)
   return false
 }
-

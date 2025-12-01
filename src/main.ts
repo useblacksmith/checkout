@@ -29,10 +29,7 @@ async function run(): Promise<void> {
         stateHelper.setCacheKey(cacheKey)
         stateHelper.setCacheEnabled(true)
 
-        await cacheHelper.restoreCache(
-          sourceSettings.repositoryPath,
-          cacheKey
-        )
+        await cacheHelper.restoreCache(sourceSettings.repositoryPath, cacheKey)
       } else {
         stateHelper.setCacheEnabled(false)
       }

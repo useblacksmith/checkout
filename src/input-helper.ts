@@ -162,8 +162,7 @@ export async function getInputs(): Promise<IGitSourceSettings> {
   core.debug(`GitHub Host URL = ${result.githubServerUrl}`)
 
   // Cache
-  result.cache =
-    (core.getInput('cache') || 'false').toUpperCase() === 'TRUE'
+  result.cache = (core.getInput('cache') || 'false').toUpperCase() === 'TRUE'
   core.debug(`cache = ${result.cache}`)
 
   result.cacheSave = core.getInput('cache-save') || 'auto'
