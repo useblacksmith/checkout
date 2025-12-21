@@ -10,5 +10,11 @@ jobs:
     name: Check licenses
     steps:
       - uses: actions/checkout@v6
+      - name: Configure npm for buf registry
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        run: |
+          npm config set @buf:registry https://buf.build/gen/npm/v1/
+          npm config set //buf.build/gen/npm/v1/:_authToken $BUF_TOKEN
       - run: npm ci
       - run: npm run licensed-check

@@ -29,6 +29,13 @@ jobs:
         with:
           node-version: 24.x
 
+      - name: Configure npm for buf registry
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        run: |
+          npm config set @buf:registry https://buf.build/gen/npm/v1/
+          npm config set //buf.build/gen/npm/v1/:_authToken $BUF_TOKEN
+
       - name: Install dependencies
         run: npm ci
 
