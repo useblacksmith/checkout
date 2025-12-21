@@ -20,9 +20,13 @@ jobs:
         with:
           node-version: 24.x
       - uses: actions/checkout@v6
-      - run: npm ci
+      - name: Configure npm for buf registry
         env:
-          BUF_API_TOKEN: ${{ secrets.BUF_API_TOKEN }}
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+        run: |
+          npm config set @buf:registry https://buf.build/gen/npm/v1/
+          npm config set //buf.build/gen/npm/v1/:_authToken $BUF_TOKEN
+      - run: npm ci
       - run: npm run build
       - run: npm run format-check
       - run: npm run lint
