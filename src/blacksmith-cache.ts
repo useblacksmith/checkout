@@ -34,9 +34,7 @@ export function getMirrorPath(owner: string, repo: string): string {
  * Create a gRPC client for communicating with the Blacksmith VM agent
  */
 function createBlacksmithClient() {
-  core.debug(
-    `Creating Blacksmith agent client with port: ${GRPC_PORT}`
-  )
+  core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`)
   const transport = createGrpcTransport({
     baseUrl: `http://192.168.127.1:${GRPC_PORT}`,
     httpVersion: '2'

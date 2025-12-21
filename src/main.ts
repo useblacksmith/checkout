@@ -43,7 +43,9 @@ async function cleanup(): Promise<void> {
     try {
       await blacksmithCache.cleanup(exposeId)
     } catch (error) {
-      core.warning(`Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`)
+      core.warning(
+        `Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`
+      )
     }
   }
 }
