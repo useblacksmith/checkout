@@ -26,6 +26,11 @@ export const SshKeyPath = core.getState('sshKeyPath')
 export const SshKnownHostsPath = core.getState('sshKnownHostsPath')
 
 /**
+ * The Blacksmith cache expose ID for the POST action. The value is empty during the MAIN action.
+ */
+export const BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId')
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -51,6 +56,13 @@ export function setSshKnownHostsPath(sshKnownHostsPath: string) {
  */
 export function setSafeDirectory() {
   core.saveState('setSafeDirectory', 'true')
+}
+
+/**
+ * Save the Blacksmith cache expose ID so the POST action can commit the sticky disk.
+ */
+export function setBlacksmithCacheExposeId(exposeId: string) {
+  core.saveState('blacksmithCacheExposeId', exposeId)
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

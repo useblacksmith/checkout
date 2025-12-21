@@ -9,6 +9,7 @@ import * as path from 'path'
 import * as refHelper from './ref-helper'
 import * as stateHelper from './state-helper'
 import * as urlHelper from './url-helper'
+import * as blacksmithCache from './blacksmith-cache'
 import {
   MinimumGitSparseCheckoutVersion,
   IGitCommandManager
@@ -105,12 +106,40 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // Save state for POST action
     stateHelper.setRepositoryPath(settings.repositoryPath)
 
+    // Setup Blacksmith git mirror cache if in Blacksmith environment
+    let cacheInfo: blacksmithCache.CacheInfo | null = null
+    if (blacksmithCache.isBlacksmithEnvironment()) {
+      try {
+        core.startGroup('Setting up Blacksmith git mirror cache')
+        cacheInfo = await blacksmithCache.setupCache(
+          settings.repositoryOwner,
+          settings.repositoryName
+        )
+        await blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl)
+        stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+        core.endGroup()
+      } catch (error) {
+        core.endGroup()
+        core.warning(
+          `Blacksmith cache setup failed, using standard checkout: ${error}`
+        )
+        cacheInfo = null
+      }
+    }
+
     // Initialize the repository
     if (
       !fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))
     ) {
       core.startGroup('Initializing the repository')
       await git.init()
+      // Setup alternates to use objects from Blacksmith mirror if available
+      if (cacheInfo) {
+        await blacksmithCache.writeAlternates(
+          settings.repositoryPath,
+          cacheInfo.mirrorPath
+        )
+      }
       await git.remoteAdd('origin', repositoryUrl)
       core.endGroup()
     }
@@ -231,6 +260,14 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     core.startGroup('Checking out the ref')
     await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
     core.endGroup()
+
+    // Dissociate from Blacksmith mirror if requested
+    // This copies all objects from alternates into the local repo so it's independent
+    if (settings.dissociate && cacheInfo) {
+      core.startGroup('Dissociating from Blacksmith mirror')
+      await blacksmithCache.dissociate(settings.repositoryPath)
+      core.endGroup()
+    }
 
     // Submodules
     if (settings.submodules) {

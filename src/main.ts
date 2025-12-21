@@ -4,6 +4,7 @@ import * as gitSourceProvider from './git-source-provider'
 import * as inputHelper from './input-helper'
 import * as path from 'path'
 import * as stateHelper from './state-helper'
+import * as blacksmithCache from './blacksmith-cache'
 
 async function run(): Promise<void> {
   try {
@@ -34,6 +35,16 @@ async function cleanup(): Promise<void> {
     await gitSourceProvider.cleanup(stateHelper.RepositoryPath)
   } catch (error) {
     core.warning(`${(error as any)?.message ?? error}`)
+  }
+
+  // Cleanup Blacksmith git mirror cache (unmount and commit sticky disk)
+  const exposeId = stateHelper.BlacksmithCacheExposeId
+  if (exposeId) {
+    try {
+      await blacksmithCache.cleanup(exposeId)
+    } catch (error) {
+      core.warning(`Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`)
+    }
   }
 }
 

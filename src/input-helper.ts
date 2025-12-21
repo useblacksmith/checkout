@@ -161,5 +161,10 @@ export async function getInputs(): Promise<IGitSourceSettings> {
   result.githubServerUrl = core.getInput('github-server-url')
   core.debug(`GitHub Host URL = ${result.githubServerUrl}`)
 
+  // Dissociate from Blacksmith git mirror cache
+  result.dissociate =
+    (core.getInput('dissociate') || 'false').toUpperCase() === 'TRUE'
+  core.debug(`dissociate = ${result.dissociate}`)
+
   return result
 }
