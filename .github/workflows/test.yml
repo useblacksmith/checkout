@@ -49,6 +49,7 @@ jobs:
       - name: Checkout basic
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -62,6 +63,7 @@ jobs:
       - name: Checkout clean
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify clean
@@ -72,11 +74,13 @@ jobs:
       - name: Checkout side by side 1
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/side-by-side-1
           path: side-by-side-1
       - name: Checkout side by side 2
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/side-by-side-2
           path: side-by-side-2
       - name: Verify side by side
@@ -146,6 +150,7 @@ jobs:
       - name: Checkout submodules false
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/submodule-ssh-url
           path: submodules-false
       - name: Verify submodules false
@@ -155,6 +160,7 @@ jobs:
       - name: Checkout submodules true
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/submodule-ssh-url
           path: submodules-true
           submodules: true
@@ -165,6 +171,7 @@ jobs:
       - name: Checkout submodules recursive
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/submodule-ssh-url
           path: submodules-recursive
           submodules: recursive
@@ -188,6 +195,7 @@ jobs:
       - name: Checkout basic using REST API
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -214,6 +222,7 @@ jobs:
       - name: Checkout basic
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -227,6 +236,7 @@ jobs:
       - name: Basic checkout using REST API
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -246,6 +256,7 @@ jobs:
       - name: Checkout basic
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -259,6 +270,7 @@ jobs:
       - name: Checkout basic using REST API
         uses: ./
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
@@ -278,6 +290,7 @@ jobs:
       - name: Checkout basic
         uses: ./localClone
         with:
+          repository: actions/checkout
           ref: test-data/v2/basic
       - name: Verify basic
         run: |
@@ -316,6 +329,7 @@ jobs:
         id: checkout
         uses: ./actions-checkout
         with:
+          repository: actions/checkout
           path: cloned-using-local-action
           ref: test-data/v2/basic
 
