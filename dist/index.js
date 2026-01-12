@@ -218,32 +218,25 @@ function dissociate(workspacePath) {
 /**
  * Run garbage collection on the mirror to consolidate pack files and remove unreachable objects.
  * This runs in the post-job phase to avoid impacting checkout performance.
+ *
+ * Using `git gc --prune=now` is safe here because:
+ * 1. Post-job runs after all user workflow steps complete
+ * 2. No concurrent processes are writing to the mirror
+ * 3. The mirror is only used by the checkout action
  */
 function runMirrorGC(mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
         core.info('Running garbage collection on git mirror');
         try {
-            // Repack all objects into a single pack file and remove redundant packs
-            // -a: pack all objects (not just unreachable ones)
-            // -d: remove redundant packs after repacking
-            yield exec.exec('git', ['-C', mirrorPath, 'repack', '-a', '-d'], {
-                ignoreReturnCode: true // Don't fail cleanup if repack fails
+            // git gc handles everything: repack, prune, pack-refs, reflog expire
+            // --prune=now is safe because no concurrent writes during post-job
+            yield exec.exec('git', ['-C', mirrorPath, 'gc', '--prune=now'], {
+                ignoreReturnCode: true // Don't fail cleanup if gc fails
             });
-            core.debug('Completed git repack');
+            core.debug('Completed git gc');
         }
         catch (_a) {
-            core.warning('Failed to run git repack on mirror');
-        }
-        try {
-            // Prune unreachable objects older than 2 weeks
-            // This is conservative to avoid removing objects that might still be referenced
-            yield exec.exec('git', ['-C', mirrorPath, 'prune', '--expire', '2.weeks.ago'], {
-                ignoreReturnCode: true
-            });
-            core.debug('Completed git prune');
-        }
-        catch (_b) {
-            core.warning('Failed to run git prune on mirror');
+            core.warning('Failed to run git gc on mirror');
         }
     });
 }

@@ -33,7 +33,9 @@ export const BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId')
 /**
  * The Blacksmith cache mirror path for the POST action. The value is empty during the MAIN action.
  */
-export const BlacksmithCacheMirrorPath = core.getState('blacksmithCacheMirrorPath')
+export const BlacksmithCacheMirrorPath = core.getState(
+  'blacksmithCacheMirrorPath'
+)
 
 /**
  * Save the repository path so the POST action can retrieve the value.

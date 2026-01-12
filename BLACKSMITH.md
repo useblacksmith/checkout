@@ -208,10 +208,10 @@ GC runs **in the post-job cleanup phase** to avoid impacting checkout performanc
     │    │               │                          │                │           │
     │    ▼               ▼                          ▼                ▼           │
     │  ┌─────┐     ┌───────────┐            ┌────────────┐    ┌────────────┐    │
-    │  │Start│     │setupCache │            │ build/test │    │ git repack │    │
-    │  │ VM  │     │ensureMirror│            │   etc.     │    │ git prune  │    │
-    │  └─────┘     │(fetch only)│            └────────────┘    │ unmount    │    │
-    │              └───────────┘                               │ commit     │    │
+    │  │Start│     │setupCache │            │ build/test │    │  git gc    │    │
+    │  │ VM  │     │ensureMirror│            │   etc.     │    │--prune=now │    │
+    │  └─────┘     │(fetch only)│            └────────────┘    │  unmount   │    │
+    │              └───────────┘                               │  commit    │    │
     │                   │                                      └────────────┘    │
     │                   │                                            │           │
     │              NO GC HERE                              GC RUNS HERE          │
@@ -222,21 +222,34 @@ GC runs **in the post-job cleanup phase** to avoid impacting checkout performanc
 
 ### What GC Does
 
-1. **`git repack -a -d`**: Consolidates all objects into a single pack file, removes redundant packs
-2. **`git prune --expire 2.weeks.ago`**: Removes unreachable objects older than 2 weeks
+We run **`git gc --prune=now`** which orchestrates:
+- **Repack**: Consolidates all reachable objects into optimized pack files
+- **Prune**: Removes all unreachable loose objects immediately
+- **Pack-refs**: Compresses refs for faster lookups
+- **Reflog expire**: Cleans up old reflog entries
 
 ```
     Before GC:                              After GC:
     ┌────────────────────────────┐          ┌────────────────────────────┐
     │ pack-aaa.pack  (100MB)     │          │ pack-consolidated.pack     │
-    │ pack-bbb.pack  (5MB)       │          │ (95MB - deduplicated)      │
-    │ pack-ccc.pack  (3MB)       │    ──►   │                            │
-    │ loose objects  (2MB)       │          │ Unreachable objects:       │
-    │ unreachable    (10MB)      │          │ (removed if >2 weeks old)  │
+    │ pack-bbb.pack  (5MB)       │          │ (95MB - only reachable     │
+    │ pack-ccc.pack  (3MB)       │    ──►   │  objects, deduplicated)    │
+    │ loose objects  (2MB)       │          │                            │
+    │ unreachable    (10MB)      │          │ Unreachable: removed       │
     │                            │          │                            │
     │ Total: ~120MB              │          │ Total: ~95MB               │
     └────────────────────────────┘          └────────────────────────────┘
 ```
+
+### Why `--prune=now` Is Safe
+
+Using `--prune=now` (immediate pruning) is safe in our context because:
+
+1. **Post-job timing**: GC runs after all user workflow steps complete
+2. **No concurrent writes**: The mirror is idle during cleanup
+3. **Single consumer**: Only the checkout action uses the mirror
+
+The default `git gc` uses `--prune=2.weeks.ago` to protect against concurrent processes, but that's unnecessary here.
 
 ### Why Post-Job GC?
 
@@ -249,11 +262,11 @@ GC runs **in the post-job cleanup phase** to avoid impacting checkout performanc
 
 ### Disk Size Growth
 
-Even with GC, the mirror grows with:
-- **Repository history**: New commits, branches, tags
-- **2-week retention**: Unreachable objects kept for safety window
+With GC, the mirror is bounded to approximately the size of reachable objects:
+- **Repository history**: All reachable commits, trees, blobs
+- **All branches and tags**: Objects referenced by any ref
 
-The 2-week prune expiry is conservative to avoid removing objects that might be referenced by concurrent jobs or recent force-pushes.
+Unreachable objects (from force-pushes, deleted branches) are removed immediately.
 
 ## Syncing with Upstream
 
@@ -291,8 +304,8 @@ The mirror stays in sync with GitHub through **incremental fetches**:
 - New commits and their objects
 
 **What gets cleaned up (in post-job GC):**
-- Redundant pack files (consolidated via `git repack`)
-- Unreachable objects older than 2 weeks (via `git prune`)
+- Redundant pack files (consolidated into single optimized pack)
+- All unreachable objects (removed immediately via `git gc --prune=now`)
 
 ## The `dissociate` Option
 
