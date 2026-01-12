@@ -199,9 +199,57 @@ export async function dissociate(workspacePath: string): Promise<void> {
 }
 
 /**
- * Cleanup: sync, unmount, and commit the sticky disk
+ * Run garbage collection on the mirror to consolidate pack files and remove unreachable objects.
+ * This runs in the post-job phase to avoid impacting checkout performance.
  */
-export async function cleanup(exposeId: string): Promise<void> {
+async function runMirrorGC(mirrorPath: string): Promise<void> {
+  core.info('Running garbage collection on git mirror')
+
+  try {
+    // Repack all objects into a single pack file and remove redundant packs
+    // -a: pack all objects (not just unreachable ones)
+    // -d: remove redundant packs after repacking
+    await exec.exec('git', ['-C', mirrorPath, 'repack', '-a', '-d'], {
+      ignoreReturnCode: true // Don't fail cleanup if repack fails
+    })
+    core.debug('Completed git repack')
+  } catch {
+    core.warning('Failed to run git repack on mirror')
+  }
+
+  try {
+    // Prune unreachable objects older than 2 weeks
+    // This is conservative to avoid removing objects that might still be referenced
+    await exec.exec(
+      'git',
+      ['-C', mirrorPath, 'prune', '--expire', '2.weeks.ago'],
+      {
+        ignoreReturnCode: true
+      }
+    )
+    core.debug('Completed git prune')
+  } catch {
+    core.warning('Failed to run git prune on mirror')
+  }
+}
+
+/**
+ * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
+ * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
+ */
+export async function cleanup(
+  exposeId: string,
+  mirrorPath?: string
+): Promise<void> {
+  // Run GC on the mirror before unmount to reduce disk size
+  if (mirrorPath) {
+    try {
+      await runMirrorGC(mirrorPath)
+    } catch {
+      core.warning('Mirror GC failed, continuing with cleanup')
+    }
+  }
+
   // Sync filesystem before unmount to ensure all writes are flushed
   core.debug('Syncing filesystem before unmount')
   try {

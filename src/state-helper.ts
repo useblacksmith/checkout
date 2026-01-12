@@ -31,6 +31,11 @@ export const SshKnownHostsPath = core.getState('sshKnownHostsPath')
 export const BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId')
 
 /**
+ * The Blacksmith cache mirror path for the POST action. The value is empty during the MAIN action.
+ */
+export const BlacksmithCacheMirrorPath = core.getState('blacksmithCacheMirrorPath')
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -63,6 +68,13 @@ export function setSafeDirectory() {
  */
 export function setBlacksmithCacheExposeId(exposeId: string) {
   core.saveState('blacksmithCacheExposeId', exposeId)
+}
+
+/**
+ * Save the Blacksmith cache mirror path so the POST action can run GC before commit.
+ */
+export function setBlacksmithCacheMirrorPath(mirrorPath: string) {
+  core.saveState('blacksmithCacheMirrorPath', mirrorPath)
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

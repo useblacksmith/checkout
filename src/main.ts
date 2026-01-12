@@ -37,11 +37,12 @@ async function cleanup(): Promise<void> {
     core.warning(`${(error as any)?.message ?? error}`)
   }
 
-  // Cleanup Blacksmith git mirror cache (unmount and commit sticky disk)
+  // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
   const exposeId = stateHelper.BlacksmithCacheExposeId
+  const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
   if (exposeId) {
     try {
-      await blacksmithCache.cleanup(exposeId)
+      await blacksmithCache.cleanup(exposeId, mirrorPath || undefined)
     } catch (error) {
       core.warning(
         `Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`

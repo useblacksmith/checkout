@@ -117,6 +117,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         )
         await blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl)
         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+        stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
         core.endGroup()
       } catch (error) {
         core.endGroup()

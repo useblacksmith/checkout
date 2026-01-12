@@ -216,16 +216,58 @@ function dissociate(workspacePath) {
     });
 }
 /**
- * Cleanup: sync, unmount, and commit the sticky disk
+ * Run garbage collection on the mirror to consolidate pack files and remove unreachable objects.
+ * This runs in the post-job phase to avoid impacting checkout performance.
  */
-function cleanup(exposeId) {
+function runMirrorGC(mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
+        core.info('Running garbage collection on git mirror');
+        try {
+            // Repack all objects into a single pack file and remove redundant packs
+            // -a: pack all objects (not just unreachable ones)
+            // -d: remove redundant packs after repacking
+            yield exec.exec('git', ['-C', mirrorPath, 'repack', '-a', '-d'], {
+                ignoreReturnCode: true // Don't fail cleanup if repack fails
+            });
+            core.debug('Completed git repack');
+        }
+        catch (_a) {
+            core.warning('Failed to run git repack on mirror');
+        }
+        try {
+            // Prune unreachable objects older than 2 weeks
+            // This is conservative to avoid removing objects that might still be referenced
+            yield exec.exec('git', ['-C', mirrorPath, 'prune', '--expire', '2.weeks.ago'], {
+                ignoreReturnCode: true
+            });
+            core.debug('Completed git prune');
+        }
+        catch (_b) {
+            core.warning('Failed to run git prune on mirror');
+        }
+    });
+}
+/**
+ * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
+ * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
+ */
+function cleanup(exposeId, mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Run GC on the mirror before unmount to reduce disk size
+        if (mirrorPath) {
+            try {
+                yield runMirrorGC(mirrorPath);
+            }
+            catch (_a) {
+                core.warning('Mirror GC failed, continuing with cleanup');
+            }
+        }
         // Sync filesystem before unmount to ensure all writes are flushed
         core.debug('Syncing filesystem before unmount');
         try {
             yield exec.exec('sync');
         }
-        catch (_a) {
+        catch (_b) {
             core.warning('Failed to sync filesystem');
         }
         // Unmount the sticky disk
@@ -233,7 +275,7 @@ function cleanup(exposeId) {
         try {
             yield exec.exec('sudo', ['umount', MOUNT_POINT]);
         }
-        catch (_b) {
+        catch (_c) {
             core.warning(`Failed to unmount ${MOUNT_POINT}`);
         }
         // Commit the sticky disk to persist changes
@@ -1731,6 +1773,7 @@ function getSource(settings) {
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
                     yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl);
                     stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
+                    stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                     core.endGroup();
                 }
                 catch (error) {
@@ -2435,11 +2478,12 @@ function cleanup() {
         catch (error) {
             core.warning(`${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
         }
-        // Cleanup Blacksmith git mirror cache (unmount and commit sticky disk)
+        // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
         const exposeId = stateHelper.BlacksmithCacheExposeId;
+        const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
         if (exposeId) {
             try {
-                yield blacksmithCache.cleanup(exposeId);
+                yield blacksmithCache.cleanup(exposeId, mirrorPath || undefined);
             }
             catch (error) {
                 core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
@@ -2878,12 +2922,13 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
 exports.setSafeDirectory = setSafeDirectory;
 exports.setBlacksmithCacheExposeId = setBlacksmithCacheExposeId;
+exports.setBlacksmithCacheMirrorPath = setBlacksmithCacheMirrorPath;
 const core = __importStar(__nccwpck_require__(2186));
 /**
  * Indicates whether the POST action is running
@@ -2909,6 +2954,10 @@ exports.SshKnownHostsPath = core.getState('sshKnownHostsPath');
  * The Blacksmith cache expose ID for the POST action. The value is empty during the MAIN action.
  */
 exports.BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId');
+/**
+ * The Blacksmith cache mirror path for the POST action. The value is empty during the MAIN action.
+ */
+exports.BlacksmithCacheMirrorPath = core.getState('blacksmithCacheMirrorPath');
 /**
  * Save the repository path so the POST action can retrieve the value.
  */
@@ -2938,6 +2987,12 @@ function setSafeDirectory() {
  */
 function setBlacksmithCacheExposeId(exposeId) {
     core.saveState('blacksmithCacheExposeId', exposeId);
+}
+/**
+ * Save the Blacksmith cache mirror path so the POST action can run GC before commit.
+ */
+function setBlacksmithCacheMirrorPath(mirrorPath) {
+    core.saveState('blacksmithCacheMirrorPath', mirrorPath);
 }
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
 // This is necessary since we don't have a separate entry point.
