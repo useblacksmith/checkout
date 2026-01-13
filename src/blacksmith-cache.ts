@@ -101,6 +101,7 @@ export async function setupCache(
     stickyDiskKey: stickyDiskKey,
     stickyDiskType: 'git-mirror',
     region: process.env.BLACKSMITH_REGION || '',
+    installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
     vmId: process.env.BLACKSMITH_VM_ID || '',
     repoName: process.env.GITHUB_REPO_NAME || '',
     stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
