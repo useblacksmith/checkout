@@ -158,36 +158,46 @@ function setupCache(owner, repo) {
     });
 }
 /**
- * Construct an authenticated URL for git operations
- * Uses the token as password with 'x-access-token' as username (GitHub convention)
+ * Get the extraheader config value for git authentication.
+ * Uses the same format as upstream actions/checkout:
+ * http.<origin>/.extraheader = AUTHORIZATION: basic <base64(x-access-token:TOKEN)>
+ *
+ * This is more secure than embedding credentials in the URL because:
+ * 1. The header value is not visible in process arguments
+ * 2. It follows the same pattern used by the upstream checkout action
  */
-function getAuthenticatedUrl(repoUrl, authToken) {
+function getAuthConfigArgs(repoUrl, authToken) {
     const url = new URL(repoUrl);
-    url.username = 'x-access-token';
-    url.password = authToken;
-    return url.toString();
+    const origin = url.origin; // SCHEME://HOSTNAME[:PORT]
+    const basicCredential = Buffer.from(`x-access-token:${authToken}`, 'utf8').toString('base64');
+    core.setSecret(basicCredential);
+    return {
+        configKey: `http.${origin}/.extraheader`,
+        configValue: `AUTHORIZATION: basic ${basicCredential}`
+    };
 }
 /**
  * Ensure a bare git mirror exists and is up to date
  * If the mirror exists, fetch updates; otherwise clone a new mirror
+ *
+ * Uses http.extraheader for authentication (same as upstream checkout action)
  */
 function ensureMirror(mirrorPath, repoUrl, authToken) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c, _d;
-        const authenticatedUrl = getAuthenticatedUrl(repoUrl, authToken);
+        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
         if (fs.existsSync(mirrorPath)) {
             // Incremental update - fetch new refs and prune deleted ones
             core.info(`Updating existing mirror at ${mirrorPath}`);
-            // Update the remote URL in case token changed, then fetch
             yield exec.exec('git', [
+                '-c',
+                `${configKey}=${configValue}`,
                 '-C',
                 mirrorPath,
-                'remote',
-                'set-url',
-                'origin',
-                authenticatedUrl
+                'fetch',
+                '--prune',
+                'origin'
             ]);
-            yield exec.exec('git', ['-C', mirrorPath, 'fetch', '--prune', 'origin']);
         }
         else {
             // First time - create a bare mirror clone
@@ -198,7 +208,14 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
             const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
             const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
             yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
-            yield exec.exec('git', ['clone', '--mirror', authenticatedUrl, mirrorPath]);
+            yield exec.exec('git', [
+                '-c',
+                `${configKey}=${configValue}`,
+                'clone',
+                '--mirror',
+                repoUrl,
+                mirrorPath
+            ]);
         }
     });
 }

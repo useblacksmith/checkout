@@ -132,40 +132,57 @@ export async function setupCache(
 }
 
 /**
- * Construct an authenticated URL for git operations
- * Uses the token as password with 'x-access-token' as username (GitHub convention)
+ * Get the extraheader config value for git authentication.
+ * Uses the same format as upstream actions/checkout:
+ * http.<origin>/.extraheader = AUTHORIZATION: basic <base64(x-access-token:TOKEN)>
+ *
+ * This is more secure than embedding credentials in the URL because:
+ * 1. The header value is not visible in process arguments
+ * 2. It follows the same pattern used by the upstream checkout action
  */
-function getAuthenticatedUrl(repoUrl: string, authToken: string): string {
+function getAuthConfigArgs(
+  repoUrl: string,
+  authToken: string
+): {configKey: string; configValue: string} {
   const url = new URL(repoUrl)
-  url.username = 'x-access-token'
-  url.password = authToken
-  return url.toString()
+  const origin = url.origin // SCHEME://HOSTNAME[:PORT]
+  const basicCredential = Buffer.from(
+    `x-access-token:${authToken}`,
+    'utf8'
+  ).toString('base64')
+  core.setSecret(basicCredential)
+
+  return {
+    configKey: `http.${origin}/.extraheader`,
+    configValue: `AUTHORIZATION: basic ${basicCredential}`
+  }
 }
 
 /**
  * Ensure a bare git mirror exists and is up to date
  * If the mirror exists, fetch updates; otherwise clone a new mirror
+ *
+ * Uses http.extraheader for authentication (same as upstream checkout action)
  */
 export async function ensureMirror(
   mirrorPath: string,
   repoUrl: string,
   authToken: string
 ): Promise<void> {
-  const authenticatedUrl = getAuthenticatedUrl(repoUrl, authToken)
+  const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
 
   if (fs.existsSync(mirrorPath)) {
     // Incremental update - fetch new refs and prune deleted ones
     core.info(`Updating existing mirror at ${mirrorPath}`)
-    // Update the remote URL in case token changed, then fetch
     await exec.exec('git', [
+      '-c',
+      `${configKey}=${configValue}`,
       '-C',
       mirrorPath,
-      'remote',
-      'set-url',
-      'origin',
-      authenticatedUrl
+      'fetch',
+      '--prune',
+      'origin'
     ])
-    await exec.exec('git', ['-C', mirrorPath, 'fetch', '--prune', 'origin'])
   } else {
     // First time - create a bare mirror clone
     core.info(`Creating new mirror at ${mirrorPath}`)
@@ -175,7 +192,14 @@ export async function ensureMirror(
     const uid = process.getuid?.() ?? 1000
     const gid = process.getgid?.() ?? 1000
     await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
-    await exec.exec('git', ['clone', '--mirror', authenticatedUrl, mirrorPath])
+    await exec.exec('git', [
+      '-c',
+      `${configKey}=${configValue}`,
+      'clone',
+      '--mirror',
+      repoUrl,
+      mirrorPath
+    ])
   }
 }
 
