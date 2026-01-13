@@ -158,15 +158,35 @@ function setupCache(owner, repo) {
     });
 }
 /**
+ * Construct an authenticated URL for git operations
+ * Uses the token as password with 'x-access-token' as username (GitHub convention)
+ */
+function getAuthenticatedUrl(repoUrl, authToken) {
+    const url = new URL(repoUrl);
+    url.username = 'x-access-token';
+    url.password = authToken;
+    return url.toString();
+}
+/**
  * Ensure a bare git mirror exists and is up to date
  * If the mirror exists, fetch updates; otherwise clone a new mirror
  */
-function ensureMirror(mirrorPath, repoUrl) {
+function ensureMirror(mirrorPath, repoUrl, authToken) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c, _d;
+        const authenticatedUrl = getAuthenticatedUrl(repoUrl, authToken);
         if (fs.existsSync(mirrorPath)) {
             // Incremental update - fetch new refs and prune deleted ones
             core.info(`Updating existing mirror at ${mirrorPath}`);
+            // Update the remote URL in case token changed, then fetch
+            yield exec.exec('git', [
+                '-C',
+                mirrorPath,
+                'remote',
+                'set-url',
+                'origin',
+                authenticatedUrl
+            ]);
             yield exec.exec('git', ['-C', mirrorPath, 'fetch', '--prune', 'origin']);
         }
         else {
@@ -178,7 +198,7 @@ function ensureMirror(mirrorPath, repoUrl) {
             const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
             const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
             yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
-            yield exec.exec('git', ['clone', '--mirror', repoUrl, mirrorPath]);
+            yield exec.exec('git', ['clone', '--mirror', authenticatedUrl, mirrorPath]);
         }
     });
 }
@@ -1765,7 +1785,7 @@ function getSource(settings) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
-                    yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl);
+                    yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken);
                     stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
                     stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                     core.endGroup();
