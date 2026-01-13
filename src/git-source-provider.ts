@@ -121,6 +121,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           settings.authToken
         )
         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+        stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
         core.endGroup()
       } catch (error) {

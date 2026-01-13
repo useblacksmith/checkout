@@ -152,6 +152,7 @@ function setupCache(owner, repo) {
         core.debug(`Mounted ${device} at ${MOUNT_POINT}`);
         return {
             exposeId,
+            stickyDiskKey,
             device,
             mirrorPath: getMirrorPath(owner, repo)
         };
@@ -282,7 +283,7 @@ function runMirrorGC(mirrorPath) {
  * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
  * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
  */
-function cleanup(exposeId, mirrorPath) {
+function cleanup(exposeId, stickyDiskKey, mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
         // Run GC on the mirror before unmount to reduce disk size
         if (mirrorPath) {
@@ -314,7 +315,7 @@ function cleanup(exposeId, mirrorPath) {
         const client = createBlacksmithClient();
         yield client.commitStickyDisk({
             exposeId: exposeId,
-            stickyDiskKey: '', // Not needed for commit
+            stickyDiskKey: stickyDiskKey,
             vmId: process.env.BLACKSMITH_VM_ID || '',
             shouldCommit: true,
             repoName: process.env.GITHUB_REPO_NAME || '',
@@ -1804,6 +1805,7 @@ function getSource(settings) {
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
                     yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken);
                     stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
+                    stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
                     stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                     core.endGroup();
                 }
@@ -2511,10 +2513,11 @@ function cleanup() {
         }
         // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
         const exposeId = stateHelper.BlacksmithCacheExposeId;
+        const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
-        if (exposeId) {
+        if (exposeId && stickyDiskKey) {
             try {
-                yield blacksmithCache.cleanup(exposeId, mirrorPath || undefined);
+                yield blacksmithCache.cleanup(exposeId, stickyDiskKey, mirrorPath || undefined);
             }
             catch (error) {
                 core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
@@ -2953,13 +2956,14 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
 exports.setSafeDirectory = setSafeDirectory;
 exports.setBlacksmithCacheExposeId = setBlacksmithCacheExposeId;
 exports.setBlacksmithCacheMirrorPath = setBlacksmithCacheMirrorPath;
+exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 const core = __importStar(__nccwpck_require__(2186));
 /**
  * Indicates whether the POST action is running
@@ -2989,6 +2993,10 @@ exports.BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId');
  * The Blacksmith cache mirror path for the POST action. The value is empty during the MAIN action.
  */
 exports.BlacksmithCacheMirrorPath = core.getState('blacksmithCacheMirrorPath');
+/**
+ * The Blacksmith cache sticky disk key for the POST action. The value is empty during the MAIN action.
+ */
+exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskKey');
 /**
  * Save the repository path so the POST action can retrieve the value.
  */
@@ -3024,6 +3032,12 @@ function setBlacksmithCacheExposeId(exposeId) {
  */
 function setBlacksmithCacheMirrorPath(mirrorPath) {
     core.saveState('blacksmithCacheMirrorPath', mirrorPath);
+}
+/**
+ * Save the Blacksmith cache sticky disk key so the POST action can commit the sticky disk.
+ */
+function setBlacksmithCacheStickyDiskKey(stickyDiskKey) {
+    core.saveState('blacksmithCacheStickyDiskKey', stickyDiskKey);
 }
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
 // This is necessary since we don't have a separate entry point.

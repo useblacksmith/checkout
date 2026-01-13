@@ -12,6 +12,7 @@ const MIRROR_VERSION = 'v1'
 
 export interface CacheInfo {
   exposeId: string
+  stickyDiskKey: string
   device: string
   mirrorPath: string
 }
@@ -126,6 +127,7 @@ export async function setupCache(
 
   return {
     exposeId,
+    stickyDiskKey,
     device,
     mirrorPath: getMirrorPath(owner, repo)
   }
@@ -276,6 +278,7 @@ async function runMirrorGC(mirrorPath: string): Promise<void> {
  */
 export async function cleanup(
   exposeId: string,
+  stickyDiskKey: string,
   mirrorPath?: string
 ): Promise<void> {
   // Run GC on the mirror before unmount to reduce disk size
@@ -309,7 +312,7 @@ export async function cleanup(
 
   await client.commitStickyDisk({
     exposeId: exposeId,
-    stickyDiskKey: '', // Not needed for commit
+    stickyDiskKey: stickyDiskKey,
     vmId: process.env.BLACKSMITH_VM_ID || '',
     shouldCommit: true,
     repoName: process.env.GITHUB_REPO_NAME || '',

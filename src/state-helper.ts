@@ -38,6 +38,13 @@ export const BlacksmithCacheMirrorPath = core.getState(
 )
 
 /**
+ * The Blacksmith cache sticky disk key for the POST action. The value is empty during the MAIN action.
+ */
+export const BlacksmithCacheStickyDiskKey = core.getState(
+  'blacksmithCacheStickyDiskKey'
+)
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -77,6 +84,13 @@ export function setBlacksmithCacheExposeId(exposeId: string) {
  */
 export function setBlacksmithCacheMirrorPath(mirrorPath: string) {
   core.saveState('blacksmithCacheMirrorPath', mirrorPath)
+}
+
+/**
+ * Save the Blacksmith cache sticky disk key so the POST action can commit the sticky disk.
+ */
+export function setBlacksmithCacheStickyDiskKey(stickyDiskKey: string) {
+  core.saveState('blacksmithCacheStickyDiskKey', stickyDiskKey)
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
