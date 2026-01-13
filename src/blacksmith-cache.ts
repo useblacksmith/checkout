@@ -199,6 +199,8 @@ export async function ensureMirror(
       `${configKey}=${configValue}`,
       'clone',
       '--mirror',
+      '--progress',
+      '--verbose',
       repoUrl,
       mirrorPath
     ])

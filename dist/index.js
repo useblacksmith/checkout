@@ -214,6 +214,8 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
                 `${configKey}=${configValue}`,
                 'clone',
                 '--mirror',
+                '--progress',
+                '--verbose',
                 repoUrl,
                 mirrorPath
             ]);
