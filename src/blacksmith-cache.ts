@@ -165,6 +165,15 @@ function getAuthConfigArgs(
  * If the mirror exists, fetch updates; otherwise clone a new mirror
  *
  * Uses http.extraheader for authentication (same as upstream checkout action)
+ *
+ * On first run, we use --filter=blob:none to create a "blobless" mirror.
+ * This dramatically speeds up the initial clone by only fetching commits and trees,
+ * with blobs (file contents) fetched on-demand when needed. For example:
+ * - Full mirror of BabylonJS/Babylon.js: ~4.3GB, 15+ minutes
+ * - Blobless mirror: ~50MB, seconds
+ *
+ * When the user clones from the mirror, git will fetch any missing blobs
+ * from GitHub and cache them in the mirror for future runs.
  */
 export async function ensureMirror(
   mirrorPath: string,
@@ -186,8 +195,9 @@ export async function ensureMirror(
       'origin'
     ])
   } else {
-    // First time - create a bare mirror clone
-    core.info(`Creating new mirror at ${mirrorPath}`)
+    // First time - create a blobless bare mirror clone
+    // Using --filter=blob:none to skip blobs initially (fetched on-demand)
+    core.info(`Creating new blobless mirror at ${mirrorPath}`)
     const mirrorDir = path.dirname(mirrorPath)
     await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
     // Change ownership so git can write to it
@@ -199,6 +209,7 @@ export async function ensureMirror(
       `${configKey}=${configValue}`,
       'clone',
       '--mirror',
+      '--filter=blob:none',
       repoUrl,
       mirrorPath
     ])
