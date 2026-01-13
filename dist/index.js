@@ -257,24 +257,20 @@ function dissociate(workspacePath) {
     });
 }
 /**
- * Run garbage collection on the mirror to consolidate pack files and remove unreachable objects.
- * This runs in the post-job phase to avoid impacting checkout performance.
- *
- * Using `git gc --prune=now` is safe here because:
- * 1. Post-job runs after all user workflow steps complete
- * 2. No concurrent processes are writing to the mirror
- * 3. The mirror is only used by the checkout action
+ * Run lightweight garbage collection on the mirror.
+ * Uses --auto to only run GC when git determines it's needed (based on loose object count).
+ * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
  */
 function runMirrorGC(mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
-        core.info('Running garbage collection on git mirror');
+        core.info('Running auto garbage collection on git mirror');
         try {
-            // git gc handles everything: repack, prune, pack-refs, reflog expire
-            // --prune=now is safe because no concurrent writes during post-job
-            yield exec.exec('git', ['-C', mirrorPath, 'gc', '--prune=now'], {
+            // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
+            // This is much faster than a full gc when not needed
+            yield exec.exec('git', ['-C', mirrorPath, 'gc', '--auto'], {
                 ignoreReturnCode: true // Don't fail cleanup if gc fails
             });
-            core.debug('Completed git gc');
+            core.debug('Completed git gc --auto');
         }
         catch (_a) {
             core.warning('Failed to run git gc on mirror');
