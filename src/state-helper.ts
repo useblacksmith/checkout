@@ -45,6 +45,13 @@ export const BlacksmithCacheStickyDiskKey = core.getState(
 )
 
 /**
+ * Indicates whether this job performed initial git mirror hydration.
+ * Used to notify the backend on commit so it can mark hydration as complete.
+ */
+export const BlacksmithCachePerformedHydration =
+  core.getState('blacksmithCachePerformedHydration') === 'true'
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -91,6 +98,14 @@ export function setBlacksmithCacheMirrorPath(mirrorPath: string) {
  */
 export function setBlacksmithCacheStickyDiskKey(stickyDiskKey: string) {
   core.saveState('blacksmithCacheStickyDiskKey', stickyDiskKey)
+}
+
+/**
+ * Save whether this job performed initial git mirror hydration.
+ * Used by POST action to notify backend so it can mark hydration as complete.
+ */
+export function setBlacksmithCachePerformedHydration(performed: boolean) {
+  core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false')
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

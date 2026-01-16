@@ -115,15 +115,24 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           settings.repositoryOwner,
           settings.repositoryName
         )
-        await blacksmithCache.ensureMirror(
-          cacheInfo.mirrorPath,
-          repositoryUrl,
-          settings.authToken
-        )
-        stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
-        stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
-        stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
-        core.endGroup()
+
+        // Check if hydration is in progress - another job is doing the initial git clone --mirror
+        if (cacheInfo.hydrationInProgress) {
+          // Warning already logged by setupCache, just fall back to standard checkout
+          cacheInfo = null
+          core.endGroup()
+        } else {
+          const performedHydration = await blacksmithCache.ensureMirror(
+            cacheInfo.mirrorPath,
+            repositoryUrl,
+            settings.authToken
+          )
+          stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+          stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
+          stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
+          stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
+          core.endGroup()
+        }
       } catch (error) {
         core.endGroup()
         core.warning(

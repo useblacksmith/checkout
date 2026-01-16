@@ -2,7 +2,7 @@ import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as fs from 'fs'
 import * as path from 'path'
-import {createClient} from '@connectrpc/connect'
+import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
 import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
 
@@ -15,6 +15,13 @@ export interface CacheInfo {
   stickyDiskKey: string
   device: string
   mirrorPath: string
+  // hydrationInProgress indicates that another job is currently hydrating the git mirror.
+  // When true, the caller should fall back to regular checkout without using the cache.
+  hydrationInProgress: boolean
+  hydrationMessage?: string
+  // performedHydration indicates that this job performed the initial git mirror clone.
+  // Used to notify the backend on commit so it can mark hydration as complete.
+  performedHydration: boolean
 }
 
 /**
@@ -78,35 +85,63 @@ async function maybeFormatDevice(device: string): Promise<void> {
 }
 
 /**
- * Request a sticky disk from the VM agent, format if needed, and mount it
+ * Request a sticky disk from the VM agent, format if needed, and mount it.
+ * Returns CacheInfo with hydrationInProgress=true if another job is hydrating,
+ * allowing the caller to fall back to regular checkout.
  */
 export async function setupCache(
   owner: string,
   repo: string
 ): Promise<CacheInfo> {
   const client = createBlacksmithClient()
+  const stickyDiskKey = `${owner}-${repo}`
 
   // Test connection
+  core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`)
   try {
     await client.up({})
-    core.debug('Successfully connected to Blacksmith agent')
+    core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
     throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
   }
 
-  const stickyDiskKey = `${owner}-${repo}`
-  core.info(`Requesting sticky disk for ${stickyDiskKey}`)
+  core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`)
 
   // Request sticky disk from VM agent
-  const response = await client.getStickyDisk({
-    stickyDiskKey: stickyDiskKey,
-    stickyDiskType: 'git-mirror',
-    region: process.env.BLACKSMITH_REGION || '',
-    installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
-    vmId: process.env.BLACKSMITH_VM_ID || '',
-    repoName: process.env.GITHUB_REPO_NAME || '',
-    stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-  })
+  let response
+  try {
+    response = await client.getStickyDisk({
+      stickyDiskKey: stickyDiskKey,
+      stickyDiskType: 'git-mirror',
+      region: process.env.BLACKSMITH_REGION || '',
+      installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
+      vmId: process.env.BLACKSMITH_VM_ID || '',
+      repoName: process.env.GITHUB_REPO_NAME || '',
+      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
+    })
+  } catch (error) {
+    // Check if this is a gRPC Aborted error indicating hydration in progress
+    if (error instanceof ConnectError && error.code === Code.Aborted) {
+      const hydrationMessage = error.message || 'Initial mirror clone is running'
+      core.warning(
+        `[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`
+      )
+      core.warning(
+        '[git-mirror] Falling back to standard checkout. Cache will be available once hydration completes.'
+      )
+      return {
+        exposeId: '',
+        stickyDiskKey,
+        device: '',
+        mirrorPath: '',
+        hydrationInProgress: true,
+        hydrationMessage,
+        performedHydration: false
+      }
+    }
+    // Re-throw other errors
+    throw error
+  }
 
   const exposeId = (response as {exposeId?: string}).exposeId || ''
   const device = (response as {diskIdentifier?: string}).diskIdentifier || ''
@@ -115,7 +150,7 @@ export async function setupCache(
     throw new Error('No device found in sticky disk response')
   }
 
-  core.info(`Got sticky disk device: ${device}`)
+  core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`)
 
   // Format if needed
   await maybeFormatDevice(device)
@@ -123,13 +158,15 @@ export async function setupCache(
   // Mount the device
   await exec.exec('sudo', ['mkdir', '-p', MOUNT_POINT])
   await exec.exec('sudo', ['mount', device, MOUNT_POINT])
-  core.debug(`Mounted ${device} at ${MOUNT_POINT}`)
+  core.info(`[git-mirror] Mounted ${device} at ${MOUNT_POINT}`)
 
   return {
     exposeId,
     stickyDiskKey,
     device,
-    mirrorPath: getMirrorPath(owner, repo)
+    mirrorPath: getMirrorPath(owner, repo),
+    hydrationInProgress: false,
+    performedHydration: false // Will be set by ensureMirror if we do initial clone
   }
 }
 
@@ -161,21 +198,23 @@ function getAuthConfigArgs(
 }
 
 /**
- * Ensure a bare git mirror exists and is up to date
- * If the mirror exists, fetch updates; otherwise clone a new mirror
+ * Ensure a bare git mirror exists and is up to date.
+ * If the mirror exists, fetch updates; otherwise clone a new mirror.
  *
- * Uses http.extraheader for authentication (same as upstream checkout action)
+ * Uses http.extraheader for authentication (same as upstream checkout action).
+ *
+ * @returns true if a new mirror was created (initial hydration), false if existing mirror was updated
  */
 export async function ensureMirror(
   mirrorPath: string,
   repoUrl: string,
   authToken: string
-): Promise<void> {
+): Promise<boolean> {
   const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
 
   if (fs.existsSync(mirrorPath)) {
     // Incremental update - fetch new refs and prune deleted ones
-    core.info(`Updating existing mirror at ${mirrorPath}`)
+    core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`)
     await exec.exec('git', [
       '-c',
       `${configKey}=${configValue}`,
@@ -185,9 +224,11 @@ export async function ensureMirror(
       '--prune',
       'origin'
     ])
+    core.info('[git-mirror] Mirror update complete')
+    return false // Not initial hydration
   } else {
-    // First time - create a bare mirror clone
-    core.info(`Creating new mirror at ${mirrorPath}`)
+    // First time - create a bare mirror clone (initial hydration)
+    core.info(`[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`)
     const mirrorDir = path.dirname(mirrorPath)
     await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
     // Change ownership so git can write to it
@@ -204,6 +245,8 @@ export async function ensureMirror(
       repoUrl,
       mirrorPath
     ])
+    core.info('[git-mirror] Initial mirror clone complete')
+    return true // Initial hydration performed
   }
 }
 
@@ -270,52 +313,75 @@ async function runMirrorGC(mirrorPath: string): Promise<void> {
   }
 }
 
+export interface CleanupOptions {
+  exposeId: string
+  stickyDiskKey: string
+  mirrorPath?: string
+  // shouldCommit indicates whether changes should be persisted.
+  // Set to false if the job failed/was cancelled to avoid committing bad state.
+  shouldCommit: boolean
+  // vmHydratedGitMirror indicates this job performed initial git mirror clone.
+  // Used by backend to mark hydration as complete.
+  vmHydratedGitMirror: boolean
+}
+
 /**
  * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
  * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
  */
-export async function cleanup(
-  exposeId: string,
-  stickyDiskKey: string,
-  mirrorPath?: string
-): Promise<void> {
+export async function cleanup(options: CleanupOptions): Promise<void> {
+  const {
+    exposeId,
+    stickyDiskKey,
+    mirrorPath,
+    shouldCommit,
+    vmHydratedGitMirror
+  } = options
+
+  core.info(
+    `[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
+  )
+
   // Run GC on the mirror before unmount to reduce disk size
   if (mirrorPath) {
     try {
       await runMirrorGC(mirrorPath)
     } catch {
-      core.warning('Mirror GC failed, continuing with cleanup')
+      core.warning('[git-mirror] Mirror GC failed, continuing with cleanup')
     }
   }
 
   // Sync filesystem before unmount to ensure all writes are flushed
-  core.debug('Syncing filesystem before unmount')
+  core.debug('[git-mirror] Syncing filesystem before unmount')
   try {
     await exec.exec('sync')
   } catch {
-    core.warning('Failed to sync filesystem')
+    core.warning('[git-mirror] Failed to sync filesystem')
   }
 
   // Unmount the sticky disk
-  core.debug(`Unmounting ${MOUNT_POINT}`)
+  core.debug(`[git-mirror] Unmounting ${MOUNT_POINT}`)
   try {
     await exec.exec('sudo', ['umount', MOUNT_POINT])
   } catch {
-    core.warning(`Failed to unmount ${MOUNT_POINT}`)
+    core.warning(`[git-mirror] Failed to unmount ${MOUNT_POINT}`)
   }
 
   // Commit the sticky disk to persist changes
-  core.info('Committing sticky disk')
+  core.info(
+    `[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
+  )
   const client = createBlacksmithClient()
 
   await client.commitStickyDisk({
     exposeId: exposeId,
     stickyDiskKey: stickyDiskKey,
     vmId: process.env.BLACKSMITH_VM_ID || '',
-    shouldCommit: true,
+    shouldCommit: shouldCommit,
     repoName: process.env.GITHUB_REPO_NAME || '',
-    stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
+    stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+    vmHydratedGitMirror: vmHydratedGitMirror
   })
 
-  core.info('Successfully committed sticky disk')
+  core.info('[git-mirror] Successfully committed sticky disk')
 }
