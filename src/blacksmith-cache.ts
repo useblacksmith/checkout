@@ -112,7 +112,7 @@ export async function setupCache(
   try {
     response = await client.getStickyDisk({
       stickyDiskKey: stickyDiskKey,
-      stickyDiskType: 'git-mirror',
+      stickyDiskType: 'git_mirror',
       region: process.env.BLACKSMITH_REGION || '',
       installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
       vmId: process.env.BLACKSMITH_VM_ID || '',
