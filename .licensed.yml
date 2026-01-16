@@ -12,3 +12,6 @@ allowed:
 
 reviewed:
   npm:
+    - "@buf/blacksmith_vm-agent.bufbuild_es"
+    - "@buf/blacksmith_vm-agent.connectrpc_es"
+    - "@bufbuild/protobuf"

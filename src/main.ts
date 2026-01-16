@@ -4,6 +4,8 @@ import * as gitSourceProvider from './git-source-provider'
 import * as inputHelper from './input-helper'
 import * as path from 'path'
 import * as stateHelper from './state-helper'
+import * as blacksmithCache from './blacksmith-cache'
+import {checkPreviousStepFailures} from './step-checker'
 
 async function run(): Promise<void> {
   try {
@@ -34,6 +36,67 @@ async function cleanup(): Promise<void> {
     await gitSourceProvider.cleanup(stateHelper.RepositoryPath)
   } catch (error) {
     core.warning(`${(error as any)?.message ?? error}`)
+  }
+
+  // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
+  const exposeId = stateHelper.BlacksmithCacheExposeId
+  const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey
+  const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
+  const performedHydration = stateHelper.BlacksmithCachePerformedHydration
+  if (exposeId && stickyDiskKey) {
+    try {
+      // Check for previous step failures by reading runner logs
+      // This is the same approach used by setup-docker-builder (BPA)
+      core.info(
+        '[git-mirror] Checking for previous step failures before committing'
+      )
+      const failureCheck = await checkPreviousStepFailures()
+
+      let shouldCommit = true
+      let skipReason = ''
+
+      if (failureCheck.error) {
+        // If we can't determine failure status, skip commit to be safe
+        shouldCommit = false
+        skipReason = `Unable to check for step failures: ${failureCheck.error}`
+      } else if (failureCheck.hasFailures) {
+        shouldCommit = false
+        skipReason = `Found ${failureCheck.failedCount} failed/cancelled steps`
+        if (failureCheck.failedSteps) {
+          for (const step of failureCheck.failedSteps) {
+            core.warning(
+              `[git-mirror]   - Step: ${step.stepName || step.action || 'unknown'} (${step.result})`
+            )
+          }
+        }
+      }
+
+      // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
+      const vmHydratedGitMirror = shouldCommit && performedHydration
+
+      if (!shouldCommit) {
+        core.warning(`[git-mirror] Skipping cache commit: ${skipReason}`)
+        if (performedHydration) {
+          core.warning(
+            '[git-mirror] Initial hydration was in progress but job failed - backend will delete entry for retry'
+          )
+        }
+      } else {
+        core.info('[git-mirror] No previous step failures detected')
+      }
+
+      await blacksmithCache.cleanup({
+        exposeId,
+        stickyDiskKey,
+        mirrorPath: mirrorPath || undefined,
+        shouldCommit,
+        vmHydratedGitMirror
+      })
+    } catch (error) {
+      core.warning(
+        `Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`
+      )
+    }
   }
 }
 

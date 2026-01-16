@@ -118,4 +118,11 @@ export interface IGitSourceSettings {
    * User override on the GitHub Server/Host URL that hosts the repository to be cloned
    */
   githubServerUrl: string | undefined
+
+  /**
+   * Indicates whether to dissociate from the Blacksmith git mirror cache.
+   * When true, copies objects from cache to make checkout independent.
+   * Needed for Docker-based actions that may not have access to the mirror mount.
+   */
+  dissociate: boolean
 }
