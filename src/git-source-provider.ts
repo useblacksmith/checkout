@@ -122,14 +122,16 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           cacheInfo = null
           core.endGroup()
         } else {
+          // Save state early so cleanup can call commitStickyDisk even if ensureMirror fails
+          stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+          stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
+          stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
+
           const performedHydration = await blacksmithCache.ensureMirror(
             cacheInfo.mirrorPath,
             repositoryUrl,
             settings.authToken
           )
-          stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
-          stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
-          stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
           stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
           core.endGroup()
         }
@@ -138,6 +140,8 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         core.warning(
           `Blacksmith cache setup failed, using standard checkout: ${error}`
         )
+        // Don't clear cacheInfo.exposeId/stickyDiskKey from state - they're already saved
+        // so cleanup can still call commitStickyDisk with shouldCommit: false
         cacheInfo = null
       }
     }

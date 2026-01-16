@@ -168,6 +168,9 @@ function setupCache(owner, repo) {
         if (!device) {
             throw new Error('No device found in sticky disk response');
         }
+        if (!exposeId) {
+            throw new Error('No exposeId found in sticky disk response');
+        }
         core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
         // Format if needed
         yield maybeFormatDevice(device);
@@ -1844,10 +1847,11 @@ function getSource(settings) {
                         core.endGroup();
                     }
                     else {
-                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken);
+                        // Save state early so cleanup can call commitStickyDisk even if ensureMirror fails
                         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
                         stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
+                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken);
                         stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
                         core.endGroup();
                     }
@@ -1855,6 +1859,8 @@ function getSource(settings) {
                 catch (error) {
                     core.endGroup();
                     core.warning(`Blacksmith cache setup failed, using standard checkout: ${error}`);
+                    // Don't clear cacheInfo.exposeId/stickyDiskKey from state - they're already saved
+                    // so cleanup can still call commitStickyDisk with shouldCommit: false
                     cacheInfo = null;
                 }
             }

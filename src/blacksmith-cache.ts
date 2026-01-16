@@ -151,6 +151,10 @@ export async function setupCache(
     throw new Error('No device found in sticky disk response')
   }
 
+  if (!exposeId) {
+    throw new Error('No exposeId found in sticky disk response')
+  }
+
   core.info(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
