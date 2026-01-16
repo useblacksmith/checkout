@@ -105,7 +105,10 @@ export function setBlacksmithCacheStickyDiskKey(stickyDiskKey: string) {
  * Used by POST action to notify backend so it can mark hydration as complete.
  */
 export function setBlacksmithCachePerformedHydration(performed: boolean) {
-  core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false')
+  core.saveState(
+    'blacksmithCachePerformedHydration',
+    performed ? 'true' : 'false'
+  )
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

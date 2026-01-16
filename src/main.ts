@@ -75,9 +75,7 @@ async function cleanup(): Promise<void> {
       const vmHydratedGitMirror = shouldCommit && performedHydration
 
       if (!shouldCommit) {
-        core.warning(
-          `[git-mirror] Skipping cache commit: ${skipReason}`
-        )
+        core.warning(`[git-mirror] Skipping cache commit: ${skipReason}`)
         if (performedHydration) {
           core.warning(
             '[git-mirror] Initial hydration was in progress but job failed - backend will delete entry for retry'

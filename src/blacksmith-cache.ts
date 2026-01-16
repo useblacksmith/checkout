@@ -122,7 +122,8 @@ export async function setupCache(
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
-      const hydrationMessage = error.message || 'Initial mirror clone is running'
+      const hydrationMessage =
+        error.message || 'Initial mirror clone is running'
       core.warning(
         `[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`
       )
@@ -150,7 +151,9 @@ export async function setupCache(
     throw new Error('No device found in sticky disk response')
   }
 
-  core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`)
+  core.info(
+    `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
+  )
 
   // Format if needed
   await maybeFormatDevice(device)
@@ -228,7 +231,9 @@ export async function ensureMirror(
     return false // Not initial hydration
   } else {
     // First time - create a bare mirror clone (initial hydration)
-    core.info(`[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`)
+    core.info(
+      `[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`
+    )
     const mirrorDir = path.dirname(mirrorPath)
     await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
     // Change ownership so git can write to it
