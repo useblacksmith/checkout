@@ -1,3 +1,39 @@
+# Blacksmith Checkout
+
+This is [Blacksmith's](https://blacksmith.sh) fork of the `actions/checkout` action, built on top of our [Sticky Disk](https://blacksmith.sh/docs/sticky-disks) primitive. The action is a drop-in replacement for `actions/checkout` and provides
+caching of git repositories to speed up large repository checkouts.
+
+## How It Works
+
+`useblacksmith/checkout` uses a persistent git mirror cache to speed up subsequent repository checkouts:
+
+1. **First Run (Hydration)**: On the very first checkout for a repository, the action creates a full git mirror of your repo on a Sticky Disk. This initial hydration may take longer as it mirrors your entire repository, but it only happens once for each repository.
+
+2. **Incremental Updates**: After the initial hydration, the git mirror is updated incrementally on each workflow run using `git fetch --prune` to fetch only new refs and objects. The mirror is always a complete clone, but your workspace respects the `fetch-depth` input — git's alternates mechanism allows the workspace to reference objects from the mirror without copying them, keeping shallow checkouts fast.
+
+3. **Concurrent Job Handling**: While the first hydration is in progress, any concurrent job runs will automatically fall back to the standard `actions/checkout` behavior. Once the mirror is fully hydrated, all subsequent jobs will use the cached mirror.
+
+## Why Use Blacksmith Checkout?
+
+This action is most beneficial for:
+
+- **Large repositories** (multiple GBs in size) where cloning from GitHub is slow
+- **Deep fetch depths** (`fetch-depth: 0` or large values) where you need extensive commit history
+- **Frequent CI runs** on the same repository where the mirror stays warm
+
+For these use cases, the persistent git mirror enables incremental updates rather than full clones, significantly reducing checkout times. For smaller repositories with shallow checkouts (`fetch-depth: 1`), checkout times will be comparable to the standard `actions/checkout`.
+
+**Key benefits:**
+
+- **Reduced Network Load**: Minimize traffic to GitHub by fetching only new changes incrementally
+- **Drop-in Replacement**: All `actions/checkout` options work exactly the same
+
+---
+
+> **Note**: This is a fork of [actions/checkout](https://github.com/actions/checkout). All options and behaviors from the upstream action are preserved. The documentation below is from the upstream project.
+
+---
+
 [![Build and Test](https://github.com/actions/checkout/actions/workflows/test.yml/badge.svg)](https://github.com/actions/checkout/actions/workflows/test.yml)
 
 # Checkout v6
