@@ -1,5 +1,7 @@
 # Blacksmith Checkout
 
+> **⚠️ Private Beta**: This action is currently in private beta. Please reach out to [support@blacksmith.sh](mailto:support@blacksmith.sh) before integrating it into your workflows. We encourage users to stay on the latest published release as we are rapidly fixing bugs and incorporating feedback.
+
 This is [Blacksmith's](https://blacksmith.sh) fork of the `actions/checkout` action, built on top of our [Sticky Disk](https://blacksmith.sh/docs/sticky-disks) primitive. The action is a drop-in replacement for `actions/checkout` and provides
 caching of git repositories to speed up large repository checkouts.
 
