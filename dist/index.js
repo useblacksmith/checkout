@@ -246,10 +246,11 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                     mirrorPath,
                     'fetch',
                     '--prune',
+                    '--progress',
                     'origin'
                 ];
                 if (verbose) {
-                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
+                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
                 }
                 yield exec.exec('git', fetchArgs, { env: gitEnv });
             }));

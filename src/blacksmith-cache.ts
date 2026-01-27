@@ -248,15 +248,11 @@ export async function ensureMirror(
         mirrorPath,
         'fetch',
         '--prune',
+        '--progress',
         'origin'
       ]
       if (verbose) {
-        fetchArgs.splice(
-          fetchArgs.indexOf('origin'),
-          0,
-          '--progress',
-          '--verbose'
-        )
+        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
       }
       await exec.exec('git', fetchArgs, {env: gitEnv})
     })
