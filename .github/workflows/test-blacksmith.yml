@@ -1,0 +1,41 @@
+name: Test Blacksmith Git Mirror
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-git-mirror:
+    runs-on: blacksmith
+    steps:
+      - name: Checkout action repo
+        uses: actions/checkout@v4
+
+      - name: Test checkout with git mirror (self)
+        uses: ./
+        with:
+          path: self-checkout
+
+      - name: Verify checkout succeeded
+        run: |
+          if [ ! -d "self-checkout/.git" ]; then
+            echo "Expected .git folder to exist"
+            exit 1
+          fi
+          echo "Checkout successful"
+          ls -la self-checkout/
+
+      - name: Test second checkout (should use cached mirror)
+        uses: ./
+        with:
+          path: second-checkout
+
+      - name: Verify second checkout succeeded
+        run: |
+          if [ ! -d "second-checkout/.git" ]; then
+            echo "Expected .git folder to exist"
+            exit 1
+          fi
+          echo "Second checkout successful (used cached mirror)"
