@@ -166,5 +166,10 @@ export async function getInputs(): Promise<IGitSourceSettings> {
     (core.getInput('dissociate') || 'false').toUpperCase() === 'TRUE'
   core.debug(`dissociate = ${result.dissociate}`)
 
+  // Verbose output for git mirror operations
+  result.verbose =
+    (core.getInput('verbose') || 'false').toUpperCase() === 'TRUE'
+  core.debug(`verbose = ${result.verbose}`)
+
   return result
 }

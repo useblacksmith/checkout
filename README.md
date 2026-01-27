@@ -154,6 +154,11 @@ For these use cases, the persistent git mirror enables incremental updates rathe
     # mount.
     # Default: false
     dissociate: ''
+
+    # Enable verbose output for git mirror operations. Outputs GIT_TRACE and
+    # GIT_CURL_VERBOSE for debugging connection and performance issues.
+    # Default: false
+    verbose: ''
 ```
 <!-- end usage -->
 

@@ -211,40 +211,50 @@ function getAuthConfigArgs(
  *
  * Uses http.extraheader for authentication (same as upstream checkout action).
  *
+ * @param mirrorPath - Path to the bare git mirror
+ * @param repoUrl - URL of the repository to mirror
+ * @param authToken - Authentication token for the repository
+ * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  * @returns true if a new mirror was created (initial hydration), false if existing mirror was updated
  */
 export async function ensureMirror(
   mirrorPath: string,
   repoUrl: string,
-  authToken: string
+  authToken: string,
+  verbose: boolean = false
 ): Promise<boolean> {
   const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
+
+  // Build environment with optional verbose flags
+  const gitEnv: {[key: string]: string} = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      gitEnv[key] = value
+    }
+  }
+  if (verbose) {
+    gitEnv['GIT_TRACE'] = '1'
+    gitEnv['GIT_CURL_VERBOSE'] = '1'
+  }
 
   if (fs.existsSync(mirrorPath)) {
     // Incremental update - fetch new refs and prune deleted ones
     core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`)
     await retryHelper.execute(async () => {
-      await exec.exec(
-        'git',
-        [
-          '-c',
-          `${configKey}=${configValue}`,
-          '-C',
-          mirrorPath,
-          'fetch',
-          '--prune',
-          '--progress',
-          '--verbose',
-          'origin'
-        ],
-        {
-          env: {
-            ...process.env,
-            GIT_TRACE: '1',
-            GIT_CURL_VERBOSE: '1'
-          }
-        }
-      )
+      const fetchArgs = [
+        '-c',
+        `${configKey}=${configValue}`,
+        '-C',
+        mirrorPath,
+        'fetch',
+        '--prune',
+        '--progress',
+        'origin'
+      ]
+      if (verbose) {
+        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+      }
+      await exec.exec('git', fetchArgs, {env: gitEnv})
     })
     core.info('[git-mirror] Mirror update complete')
     return false // Not initial hydration
@@ -267,26 +277,19 @@ export async function ensureMirror(
         )
         await fs.promises.rm(mirrorPath, {recursive: true, force: true})
       }
-      await exec.exec(
-        'git',
-        [
-          '-c',
-          `${configKey}=${configValue}`,
-          'clone',
-          '--mirror',
-          '--progress',
-          '--verbose',
-          repoUrl,
-          mirrorPath
-        ],
-        {
-          env: {
-            ...process.env,
-            GIT_TRACE: '1',
-            GIT_CURL_VERBOSE: '1'
-          }
-        }
-      )
+      const cloneArgs = [
+        '-c',
+        `${configKey}=${configValue}`,
+        'clone',
+        '--mirror',
+        '--progress',
+        repoUrl,
+        mirrorPath
+      ]
+      if (verbose) {
+        cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose')
+      }
+      await exec.exec('git', cloneArgs, {env: gitEnv})
     })
     core.info('[git-mirror] Initial mirror clone complete')
     return true // Initial hydration performed

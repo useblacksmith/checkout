@@ -1174,7 +1174,8 @@ async function setup(testName: string): Promise<void> {
     workflowOrganizationId: 123456,
     setSafeDirectory: true,
     githubServerUrl: githubServerUrl,
-    dissociate: false
+    dissociate: false,
+    verbose: false
   }
 }
 

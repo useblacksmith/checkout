@@ -130,7 +130,8 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           const performedHydration = await blacksmithCache.ensureMirror(
             cacheInfo.mirrorPath,
             repositoryUrl,
-            settings.authToken
+            settings.authToken,
+            settings.verbose
           )
           stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
           core.endGroup()
