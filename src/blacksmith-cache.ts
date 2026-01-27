@@ -206,26 +206,9 @@ function getAuthConfigArgs(
 }
 
 /**
- * Ensure a bare git mirror exists and is up to date.
- * If the mirror exists, fetch updates; otherwise clone a new mirror.
- *
- * Uses http.extraheader for authentication (same as upstream checkout action).
- *
- * @param mirrorPath - Path to the bare git mirror
- * @param repoUrl - URL of the repository to mirror
- * @param authToken - Authentication token for the repository
- * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
- * @returns true if a new mirror was created (initial hydration), false if existing mirror was updated
+ * Build git environment with optional verbose flags
  */
-export async function ensureMirror(
-  mirrorPath: string,
-  repoUrl: string,
-  authToken: string,
-  verbose: boolean = false
-): Promise<boolean> {
-  const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
-
-  // Build environment with optional verbose flags
+function buildGitEnv(verbose: boolean): {[key: string]: string} {
   const gitEnv: {[key: string]: string} = {}
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) {
@@ -236,64 +219,122 @@ export async function ensureMirror(
     gitEnv['GIT_TRACE'] = '1'
     gitEnv['GIT_CURL_VERBOSE'] = '1'
   }
+  return gitEnv
+}
 
+/**
+ * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
+ * If the mirror already exists, skip the fetch (it will be updated in the post step).
+ *
+ * This approach moves the mirror refresh to the post step to avoid step-level timeouts
+ * affecting checkout performance. The alternates mechanism allows checkout to work
+ * with a stale mirror - missing objects will be fetched from the network.
+ *
+ * Uses http.extraheader for authentication (same as upstream checkout action).
+ *
+ * @param mirrorPath - Path to the bare git mirror
+ * @param repoUrl - URL of the repository to mirror
+ * @param authToken - Authentication token for the repository
+ * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
+ * @returns true if a new mirror was created (initial hydration), false if mirror already existed
+ */
+export async function ensureMirror(
+  mirrorPath: string,
+  repoUrl: string,
+  authToken: string,
+  verbose: boolean = false
+): Promise<boolean> {
   if (fs.existsSync(mirrorPath)) {
-    // Incremental update - fetch new refs and prune deleted ones
-    core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`)
-    await retryHelper.execute(async () => {
-      const fetchArgs = [
-        '-c',
-        `${configKey}=${configValue}`,
-        '-C',
-        mirrorPath,
-        'fetch',
-        '--prune',
-        '--progress',
-        'origin'
-      ]
-      if (verbose) {
-        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
-      }
-      await exec.exec('git', fetchArgs, {env: gitEnv})
-    })
-    core.info('[git-mirror] Mirror update complete')
-    return false // Not initial hydration
-  } else {
-    // First time - create a bare mirror clone (initial hydration)
+    // Mirror exists - skip fetch here, it will be done in the post step
     core.info(
-      `[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`
+      `[git-mirror] Found existing mirror at ${mirrorPath}, deferring refresh to post step`
     )
-    const mirrorDir = path.dirname(mirrorPath)
-    await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
-    // Change ownership so git can write to it
-    const uid = process.getuid?.() ?? 1000
-    const gid = process.getgid?.() ?? 1000
-    await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
-    await retryHelper.execute(async () => {
-      // Clean up any partial clone from a previous failed attempt
-      if (fs.existsSync(mirrorPath)) {
-        core.info(
-          `[git-mirror] Removing partial mirror directory from failed attempt`
-        )
-        await fs.promises.rm(mirrorPath, {recursive: true, force: true})
-      }
-      const cloneArgs = [
-        '-c',
-        `${configKey}=${configValue}`,
-        'clone',
-        '--mirror',
-        '--progress',
-        repoUrl,
-        mirrorPath
-      ]
-      if (verbose) {
-        cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose')
-      }
-      await exec.exec('git', cloneArgs, {env: gitEnv})
-    })
-    core.info('[git-mirror] Initial mirror clone complete')
-    return true // Initial hydration performed
+    return false // Not initial hydration
   }
+
+  // First time - create a bare mirror clone (initial hydration)
+  core.info(
+    `[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`
+  )
+  const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
+  const gitEnv = buildGitEnv(verbose)
+
+  const mirrorDir = path.dirname(mirrorPath)
+  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
+  // Change ownership so git can write to it
+  const uid = process.getuid?.() ?? 1000
+  const gid = process.getgid?.() ?? 1000
+  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  await retryHelper.execute(async () => {
+    // Clean up any partial clone from a previous failed attempt
+    if (fs.existsSync(mirrorPath)) {
+      core.info(
+        `[git-mirror] Removing partial mirror directory from failed attempt`
+      )
+      await fs.promises.rm(mirrorPath, {recursive: true, force: true})
+    }
+    const cloneArgs = [
+      '-c',
+      `${configKey}=${configValue}`,
+      'clone',
+      '--mirror',
+      '--progress',
+      repoUrl,
+      mirrorPath
+    ]
+    if (verbose) {
+      cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose')
+    }
+    await exec.exec('git', cloneArgs, {env: gitEnv})
+  })
+  core.info('[git-mirror] Initial mirror clone complete')
+  return true // Initial hydration performed
+}
+
+/**
+ * Refresh an existing git mirror by fetching updates from the remote.
+ * This is called in the post step to update the mirror for future runs,
+ * outside of the critical checkout path.
+ *
+ * @param mirrorPath - Path to the bare git mirror
+ * @param repoUrl - URL of the repository to mirror
+ * @param authToken - Authentication token for the repository
+ * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
+ */
+export async function refreshMirror(
+  mirrorPath: string,
+  repoUrl: string,
+  authToken: string,
+  verbose: boolean = false
+): Promise<void> {
+  if (!fs.existsSync(mirrorPath)) {
+    core.debug(
+      `[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`
+    )
+    return
+  }
+
+  core.info(`[git-mirror] Refreshing mirror at ${mirrorPath}`)
+  const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
+  const gitEnv = buildGitEnv(verbose)
+
+  await retryHelper.execute(async () => {
+    const fetchArgs = [
+      '-c',
+      `${configKey}=${configValue}`,
+      '-C',
+      mirrorPath,
+      'fetch',
+      '--prune',
+      '--progress',
+      'origin'
+    ]
+    if (verbose) {
+      fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+    }
+    await exec.exec('git', fetchArgs, {env: gitEnv})
+  })
+  core.info('[git-mirror] Mirror refresh complete')
 }
 
 /**

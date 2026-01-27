@@ -52,6 +52,17 @@ export const BlacksmithCachePerformedHydration =
   core.getState('blacksmithCachePerformedHydration') === 'true'
 
 /**
+ * The repository URL for refreshing the git mirror in the POST action.
+ */
+export const BlacksmithCacheRepoUrl = core.getState('blacksmithCacheRepoUrl')
+
+/**
+ * Whether verbose output is enabled for git mirror operations in the POST action.
+ */
+export const BlacksmithCacheVerbose =
+  core.getState('blacksmithCacheVerbose') === 'true'
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -109,6 +120,20 @@ export function setBlacksmithCachePerformedHydration(performed: boolean) {
     'blacksmithCachePerformedHydration',
     performed ? 'true' : 'false'
   )
+}
+
+/**
+ * Save the repository URL so the POST action can refresh the git mirror.
+ */
+export function setBlacksmithCacheRepoUrl(repoUrl: string) {
+  core.saveState('blacksmithCacheRepoUrl', repoUrl)
+}
+
+/**
+ * Save whether verbose output is enabled for git mirror operations.
+ */
+export function setBlacksmithCacheVerbose(verbose: boolean) {
+  core.saveState('blacksmithCacheVerbose', verbose ? 'true' : 'false')
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

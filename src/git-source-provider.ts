@@ -126,6 +126,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
           stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
           stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
+          // Save repo URL and verbose flag for post step mirror refresh
+          stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
+          stateHelper.setBlacksmithCacheVerbose(settings.verbose)
 
           const performedHydration = await blacksmithCache.ensureMirror(
             cacheInfo.mirrorPath,

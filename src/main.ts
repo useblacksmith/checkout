@@ -38,12 +38,42 @@ async function cleanup(): Promise<void> {
     core.warning(`${(error as any)?.message ?? error}`)
   }
 
-  // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
+  // Cleanup Blacksmith git mirror cache (refresh mirror, run GC, unmount, and commit sticky disk)
   const exposeId = stateHelper.BlacksmithCacheExposeId
   const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey
   const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
   const performedHydration = stateHelper.BlacksmithCachePerformedHydration
+  const repoUrl = stateHelper.BlacksmithCacheRepoUrl
+  const verbose = stateHelper.BlacksmithCacheVerbose
   if (exposeId && stickyDiskKey) {
+    // Refresh the git mirror in the post step (outside the critical checkout path)
+    // This updates the mirror for future runs without blocking the workflow
+    if (mirrorPath && repoUrl && !performedHydration) {
+      try {
+        core.startGroup('Refreshing Blacksmith git mirror')
+        // Re-read auth token from input (don't store sensitive data in state)
+        const authToken = core.getInput('token', {required: false})
+        if (authToken) {
+          await blacksmithCache.refreshMirror(
+            mirrorPath,
+            repoUrl,
+            authToken,
+            verbose
+          )
+        } else {
+          core.warning(
+            '[git-mirror] No auth token available, skipping mirror refresh'
+          )
+        }
+        core.endGroup()
+      } catch (error) {
+        core.endGroup()
+        core.warning(
+          `[git-mirror] Failed to refresh mirror: ${(error as any)?.message ?? error}`
+        )
+      }
+    }
+
     try {
       // Check for previous step failures by reading runner logs
       // This is the same approach used by setup-docker-builder (BPA)

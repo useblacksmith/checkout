@@ -43,6 +43,7 @@ exports.isBlacksmithEnvironment = isBlacksmithEnvironment;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
+exports.refreshMirror = refreshMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
 exports.cleanup = cleanup;
@@ -209,8 +210,28 @@ function getAuthConfigArgs(repoUrl, authToken) {
     };
 }
 /**
- * Ensure a bare git mirror exists and is up to date.
- * If the mirror exists, fetch updates; otherwise clone a new mirror.
+ * Build git environment with optional verbose flags
+ */
+function buildGitEnv(verbose) {
+    const gitEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) {
+            gitEnv[key] = value;
+        }
+    }
+    if (verbose) {
+        gitEnv['GIT_TRACE'] = '1';
+        gitEnv['GIT_CURL_VERBOSE'] = '1';
+    }
+    return gitEnv;
+}
+/**
+ * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
+ * If the mirror already exists, skip the fetch (it will be updated in the post step).
+ *
+ * This approach moves the mirror refresh to the post step to avoid step-level timeouts
+ * affecting checkout performance. The alternates mechanism allows checkout to work
+ * with a stale mirror - missing objects will be fetched from the network.
  *
  * Uses http.extraheader for authentication (same as upstream checkout action).
  *
@@ -218,77 +239,86 @@ function getAuthConfigArgs(repoUrl, authToken) {
  * @param repoUrl - URL of the repository to mirror
  * @param authToken - Authentication token for the repository
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
- * @returns true if a new mirror was created (initial hydration), false if existing mirror was updated
+ * @returns true if a new mirror was created (initial hydration), false if mirror already existed
  */
 function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
         var _a, _b, _c, _d;
-        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
-        // Build environment with optional verbose flags
-        const gitEnv = {};
-        for (const [key, value] of Object.entries(process.env)) {
-            if (value !== undefined) {
-                gitEnv[key] = value;
-            }
-        }
-        if (verbose) {
-            gitEnv['GIT_TRACE'] = '1';
-            gitEnv['GIT_CURL_VERBOSE'] = '1';
-        }
         if (fs.existsSync(mirrorPath)) {
-            // Incremental update - fetch new refs and prune deleted ones
-            core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`);
-            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                const fetchArgs = [
-                    '-c',
-                    `${configKey}=${configValue}`,
-                    '-C',
-                    mirrorPath,
-                    'fetch',
-                    '--prune',
-                    '--progress',
-                    'origin'
-                ];
-                if (verbose) {
-                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
-                }
-                yield exec.exec('git', fetchArgs, { env: gitEnv });
-            }));
-            core.info('[git-mirror] Mirror update complete');
+            // Mirror exists - skip fetch here, it will be done in the post step
+            core.info(`[git-mirror] Found existing mirror at ${mirrorPath}, deferring refresh to post step`);
             return false; // Not initial hydration
         }
-        else {
-            // First time - create a bare mirror clone (initial hydration)
-            core.info(`[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`);
-            const mirrorDir = path.dirname(mirrorPath);
-            yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
-            // Change ownership so git can write to it
-            const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
-            const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
-            yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
-            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                // Clean up any partial clone from a previous failed attempt
-                if (fs.existsSync(mirrorPath)) {
-                    core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
-                    yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
-                }
-                const cloneArgs = [
-                    '-c',
-                    `${configKey}=${configValue}`,
-                    'clone',
-                    '--mirror',
-                    '--progress',
-                    repoUrl,
-                    mirrorPath
-                ];
-                if (verbose) {
-                    cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose');
-                }
-                yield exec.exec('git', cloneArgs, { env: gitEnv });
-            }));
-            core.info('[git-mirror] Initial mirror clone complete');
-            return true; // Initial hydration performed
+        // First time - create a bare mirror clone (initial hydration)
+        core.info(`[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`);
+        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
+        const gitEnv = buildGitEnv(verbose);
+        const mirrorDir = path.dirname(mirrorPath);
+        yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
+        // Change ownership so git can write to it
+        const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
+        const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
+        yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
+        yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+            // Clean up any partial clone from a previous failed attempt
+            if (fs.existsSync(mirrorPath)) {
+                core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
+                yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
+            }
+            const cloneArgs = [
+                '-c',
+                `${configKey}=${configValue}`,
+                'clone',
+                '--mirror',
+                '--progress',
+                repoUrl,
+                mirrorPath
+            ];
+            if (verbose) {
+                cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose');
+            }
+            yield exec.exec('git', cloneArgs, { env: gitEnv });
+        }));
+        core.info('[git-mirror] Initial mirror clone complete');
+        return true; // Initial hydration performed
+    });
+}
+/**
+ * Refresh an existing git mirror by fetching updates from the remote.
+ * This is called in the post step to update the mirror for future runs,
+ * outside of the critical checkout path.
+ *
+ * @param mirrorPath - Path to the bare git mirror
+ * @param repoUrl - URL of the repository to mirror
+ * @param authToken - Authentication token for the repository
+ * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
+ */
+function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
+        if (!fs.existsSync(mirrorPath)) {
+            core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`);
+            return;
         }
+        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath}`);
+        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
+        const gitEnv = buildGitEnv(verbose);
+        yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+            const fetchArgs = [
+                '-c',
+                `${configKey}=${configValue}`,
+                '-C',
+                mirrorPath,
+                'fetch',
+                '--prune',
+                '--progress',
+                'origin'
+            ];
+            if (verbose) {
+                fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
+            }
+            yield exec.exec('git', fetchArgs, { env: gitEnv });
+        }));
+        core.info('[git-mirror] Mirror refresh complete');
     });
 }
 /**
@@ -1884,6 +1914,9 @@ function getSource(settings) {
                         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
                         stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
+                        // Save repo URL and verbose flag for post step mirror refresh
+                        stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
+                        stateHelper.setBlacksmithCacheVerbose(settings.verbose);
                         const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
                         stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
                         core.endGroup();
@@ -2591,19 +2624,41 @@ function run() {
 }
 function cleanup() {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b;
+        var _a, _b, _c;
         try {
             yield gitSourceProvider.cleanup(stateHelper.RepositoryPath);
         }
         catch (error) {
             core.warning(`${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
         }
-        // Cleanup Blacksmith git mirror cache (run GC, unmount, and commit sticky disk)
+        // Cleanup Blacksmith git mirror cache (refresh mirror, run GC, unmount, and commit sticky disk)
         const exposeId = stateHelper.BlacksmithCacheExposeId;
         const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
         const performedHydration = stateHelper.BlacksmithCachePerformedHydration;
+        const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
+        const verbose = stateHelper.BlacksmithCacheVerbose;
         if (exposeId && stickyDiskKey) {
+            // Refresh the git mirror in the post step (outside the critical checkout path)
+            // This updates the mirror for future runs without blocking the workflow
+            if (mirrorPath && repoUrl && !performedHydration) {
+                try {
+                    core.startGroup('Refreshing Blacksmith git mirror');
+                    // Re-read auth token from input (don't store sensitive data in state)
+                    const authToken = core.getInput('token', { required: false });
+                    if (authToken) {
+                        yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
+                    }
+                    else {
+                        core.warning('[git-mirror] No auth token available, skipping mirror refresh');
+                    }
+                    core.endGroup();
+                }
+                catch (error) {
+                    core.endGroup();
+                    core.warning(`[git-mirror] Failed to refresh mirror: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
+                }
+            }
             try {
                 // Check for previous step failures by reading runner logs
                 // This is the same approach used by setup-docker-builder (BPA)
@@ -2645,7 +2700,7 @@ function cleanup() {
                 });
             }
             catch (error) {
-                core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
+                core.warning(`Failed to cleanup Blacksmith cache: ${(_c = error === null || error === void 0 ? void 0 : error.message) !== null && _c !== void 0 ? _c : error}`);
             }
         }
     });
@@ -3081,7 +3136,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -3090,6 +3145,8 @@ exports.setBlacksmithCacheExposeId = setBlacksmithCacheExposeId;
 exports.setBlacksmithCacheMirrorPath = setBlacksmithCacheMirrorPath;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
+exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
+exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 const core = __importStar(__nccwpck_require__(2186));
 /**
  * Indicates whether the POST action is running
@@ -3128,6 +3185,14 @@ exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskK
  * Used to notify the backend on commit so it can mark hydration as complete.
  */
 exports.BlacksmithCachePerformedHydration = core.getState('blacksmithCachePerformedHydration') === 'true';
+/**
+ * The repository URL for refreshing the git mirror in the POST action.
+ */
+exports.BlacksmithCacheRepoUrl = core.getState('blacksmithCacheRepoUrl');
+/**
+ * Whether verbose output is enabled for git mirror operations in the POST action.
+ */
+exports.BlacksmithCacheVerbose = core.getState('blacksmithCacheVerbose') === 'true';
 /**
  * Save the repository path so the POST action can retrieve the value.
  */
@@ -3176,6 +3241,18 @@ function setBlacksmithCacheStickyDiskKey(stickyDiskKey) {
  */
 function setBlacksmithCachePerformedHydration(performed) {
     core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false');
+}
+/**
+ * Save the repository URL so the POST action can refresh the git mirror.
+ */
+function setBlacksmithCacheRepoUrl(repoUrl) {
+    core.saveState('blacksmithCacheRepoUrl', repoUrl);
+}
+/**
+ * Save whether verbose output is enabled for git mirror operations.
+ */
+function setBlacksmithCacheVerbose(verbose) {
+    core.saveState('blacksmithCacheVerbose', verbose ? 'true' : 'false');
 }
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
 // This is necessary since we don't have a separate entry point.
