@@ -125,4 +125,10 @@ export interface IGitSourceSettings {
    * Needed for Docker-based actions that may not have access to the mirror mount.
    */
   dissociate: boolean
+
+  /**
+   * Indicates whether to enable verbose output for git mirror operations.
+   * When true, outputs GIT_TRACE and GIT_CURL_VERBOSE for debugging.
+   */
+  verbose: boolean
 }

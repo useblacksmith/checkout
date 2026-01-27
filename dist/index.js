@@ -214,29 +214,44 @@ function getAuthConfigArgs(repoUrl, authToken) {
  *
  * Uses http.extraheader for authentication (same as upstream checkout action).
  *
+ * @param mirrorPath - Path to the bare git mirror
+ * @param repoUrl - URL of the repository to mirror
+ * @param authToken - Authentication token for the repository
+ * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  * @returns true if a new mirror was created (initial hydration), false if existing mirror was updated
  */
-function ensureMirror(mirrorPath, repoUrl, authToken) {
-    return __awaiter(this, void 0, void 0, function* () {
+function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
         var _a, _b, _c, _d;
         const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
+        // Build environment with optional verbose flags
+        const gitEnv = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (value !== undefined) {
+                gitEnv[key] = value;
+            }
+        }
+        if (verbose) {
+            gitEnv['GIT_TRACE'] = '1';
+            gitEnv['GIT_CURL_VERBOSE'] = '1';
+        }
         if (fs.existsSync(mirrorPath)) {
             // Incremental update - fetch new refs and prune deleted ones
             core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`);
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                yield exec.exec('git', [
+                const fetchArgs = [
                     '-c',
                     `${configKey}=${configValue}`,
                     '-C',
                     mirrorPath,
                     'fetch',
                     '--prune',
-                    '--progress',
-                    '--verbose',
                     'origin'
-                ], {
-                    env: Object.assign(Object.assign({}, process.env), { GIT_TRACE: '1', GIT_CURL_VERBOSE: '1' })
-                });
+                ];
+                if (verbose) {
+                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
+                }
+                yield exec.exec('git', fetchArgs, { env: gitEnv });
             }));
             core.info('[git-mirror] Mirror update complete');
             return false; // Not initial hydration
@@ -256,18 +271,19 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
                     core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
                     yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
                 }
-                yield exec.exec('git', [
+                const cloneArgs = [
                     '-c',
                     `${configKey}=${configValue}`,
                     'clone',
                     '--mirror',
                     '--progress',
-                    '--verbose',
                     repoUrl,
                     mirrorPath
-                ], {
-                    env: Object.assign(Object.assign({}, process.env), { GIT_TRACE: '1', GIT_CURL_VERBOSE: '1' })
-                });
+                ];
+                if (verbose) {
+                    cloneArgs.splice(cloneArgs.indexOf('--progress') + 1, 0, '--verbose');
+                }
+                yield exec.exec('git', cloneArgs, { env: gitEnv });
             }));
             core.info('[git-mirror] Initial mirror clone complete');
             return true; // Initial hydration performed
@@ -1867,7 +1883,7 @@ function getSource(settings) {
                         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
                         stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
-                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken);
+                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
                         stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
                         core.endGroup();
                     }
@@ -2493,6 +2509,10 @@ function getInputs() {
         result.dissociate =
             (core.getInput('dissociate') || 'false').toUpperCase() === 'TRUE';
         core.debug(`dissociate = ${result.dissociate}`);
+        // Verbose output for git mirror operations
+        result.verbose =
+            (core.getInput('verbose') || 'false').toUpperCase() === 'TRUE';
+        core.debug(`verbose = ${result.verbose}`);
         return result;
     });
 }

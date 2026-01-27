@@ -103,6 +103,11 @@ inputs:
       Copy objects from Blacksmith git mirror cache to make checkout independent.
       Use this when running Docker-based actions that may not have access to the mirror mount.
     default: false
+  verbose:
+    description: >
+      Enable verbose output for git mirror operations. Outputs GIT_TRACE and GIT_CURL_VERBOSE
+      for debugging connection and performance issues.
+    default: false
 outputs:
   ref:
     description: 'The branch, tag or SHA that was checked out'
