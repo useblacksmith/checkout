@@ -5,6 +5,7 @@ import * as path from 'path'
 import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
 import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
+import * as retryHelper from './retry-helper'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
 const MOUNT_POINT = '/blacksmith-git-mirror'
@@ -222,15 +223,29 @@ export async function ensureMirror(
   if (fs.existsSync(mirrorPath)) {
     // Incremental update - fetch new refs and prune deleted ones
     core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`)
-    await exec.exec('git', [
-      '-c',
-      `${configKey}=${configValue}`,
-      '-C',
-      mirrorPath,
-      'fetch',
-      '--prune',
-      'origin'
-    ])
+    await retryHelper.execute(async () => {
+      await exec.exec(
+        'git',
+        [
+          '-c',
+          `${configKey}=${configValue}`,
+          '-C',
+          mirrorPath,
+          'fetch',
+          '--prune',
+          '--progress',
+          '--verbose',
+          'origin'
+        ],
+        {
+          env: {
+            ...process.env,
+            GIT_TRACE: '1',
+            GIT_CURL_VERBOSE: '1'
+          }
+        }
+      )
+    })
     core.info('[git-mirror] Mirror update complete')
     return false // Not initial hydration
   } else {
@@ -244,16 +259,18 @@ export async function ensureMirror(
     const uid = process.getuid?.() ?? 1000
     const gid = process.getgid?.() ?? 1000
     await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
-    await exec.exec('git', [
-      '-c',
-      `${configKey}=${configValue}`,
-      'clone',
-      '--mirror',
-      '--progress',
-      '--verbose',
-      repoUrl,
-      mirrorPath
-    ])
+    await retryHelper.execute(async () => {
+      await exec.exec('git', [
+        '-c',
+        `${configKey}=${configValue}`,
+        'clone',
+        '--mirror',
+        '--progress',
+        '--verbose',
+        repoUrl,
+        mirrorPath
+      ])
+    })
     core.info('[git-mirror] Initial mirror clone complete')
     return true // Initial hydration performed
   }

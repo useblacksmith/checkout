@@ -53,6 +53,7 @@ const path = __importStar(__nccwpck_require__(1017));
 const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
+const retryHelper = __importStar(__nccwpck_require__(2155));
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
 const MOUNT_POINT = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
@@ -222,15 +223,21 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
         if (fs.existsSync(mirrorPath)) {
             // Incremental update - fetch new refs and prune deleted ones
             core.info(`[git-mirror] Updating existing mirror at ${mirrorPath}`);
-            yield exec.exec('git', [
-                '-c',
-                `${configKey}=${configValue}`,
-                '-C',
-                mirrorPath,
-                'fetch',
-                '--prune',
-                'origin'
-            ]);
+            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                yield exec.exec('git', [
+                    '-c',
+                    `${configKey}=${configValue}`,
+                    '-C',
+                    mirrorPath,
+                    'fetch',
+                    '--prune',
+                    '--progress',
+                    '--verbose',
+                    'origin'
+                ], {
+                    env: Object.assign(Object.assign({}, process.env), { GIT_TRACE: '1', GIT_CURL_VERBOSE: '1' })
+                });
+            }));
             core.info('[git-mirror] Mirror update complete');
             return false; // Not initial hydration
         }
@@ -243,16 +250,18 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
             const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
             const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
             yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
-            yield exec.exec('git', [
-                '-c',
-                `${configKey}=${configValue}`,
-                'clone',
-                '--mirror',
-                '--progress',
-                '--verbose',
-                repoUrl,
-                mirrorPath
-            ]);
+            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                yield exec.exec('git', [
+                    '-c',
+                    `${configKey}=${configValue}`,
+                    'clone',
+                    '--mirror',
+                    '--progress',
+                    '--verbose',
+                    repoUrl,
+                    mirrorPath
+                ]);
+            }));
             core.info('[git-mirror] Initial mirror clone complete');
             return true; // Initial hydration performed
         }
