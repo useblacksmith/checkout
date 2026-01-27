@@ -251,6 +251,11 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
             const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
             yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                // Clean up any partial clone from a previous failed attempt
+                if (fs.existsSync(mirrorPath)) {
+                    core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
+                    yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
+                }
                 yield exec.exec('git', [
                     '-c',
                     `${configKey}=${configValue}`,
@@ -260,7 +265,9 @@ function ensureMirror(mirrorPath, repoUrl, authToken) {
                     '--verbose',
                     repoUrl,
                     mirrorPath
-                ]);
+                ], {
+                    env: Object.assign(Object.assign({}, process.env), { GIT_TRACE: '1', GIT_CURL_VERBOSE: '1' })
+                });
             }));
             core.info('[git-mirror] Initial mirror clone complete');
             return true; // Initial hydration performed

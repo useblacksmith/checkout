@@ -260,16 +260,33 @@ export async function ensureMirror(
     const gid = process.getgid?.() ?? 1000
     await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
     await retryHelper.execute(async () => {
-      await exec.exec('git', [
-        '-c',
-        `${configKey}=${configValue}`,
-        'clone',
-        '--mirror',
-        '--progress',
-        '--verbose',
-        repoUrl,
-        mirrorPath
-      ])
+      // Clean up any partial clone from a previous failed attempt
+      if (fs.existsSync(mirrorPath)) {
+        core.info(
+          `[git-mirror] Removing partial mirror directory from failed attempt`
+        )
+        await fs.promises.rm(mirrorPath, {recursive: true, force: true})
+      }
+      await exec.exec(
+        'git',
+        [
+          '-c',
+          `${configKey}=${configValue}`,
+          'clone',
+          '--mirror',
+          '--progress',
+          '--verbose',
+          repoUrl,
+          mirrorPath
+        ],
+        {
+          env: {
+            ...process.env,
+            GIT_TRACE: '1',
+            GIT_CURL_VERBOSE: '1'
+          }
+        }
+      )
     })
     core.info('[git-mirror] Initial mirror clone complete')
     return true // Initial hydration performed
