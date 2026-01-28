@@ -8,13 +8,23 @@ import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydi
 import * as retryHelper from './retry-helper'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
-const MOUNT_POINT = '/blacksmith-git-mirror'
+const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
+
+/**
+ * Get the mount point for a specific repository.
+ * Each repository gets its own mount point to support multiple checkouts.
+ */
+export function getMountPoint(owner: string, repo: string): string {
+  return `${MOUNT_BASE}-${owner}-${repo}`
+}
 
 export interface CacheInfo {
   exposeId: string
   stickyDiskKey: string
+  repoName: string
   device: string
+  mountPoint: string
   mirrorPath: string
   // hydrationInProgress indicates that another job is currently hydrating the git mirror.
   // When true, the caller should fall back to regular checkout without using the cache.
@@ -36,7 +46,8 @@ export function isBlacksmithEnvironment(): boolean {
  * Get the path where the bare git mirror will be stored
  */
 export function getMirrorPath(owner: string, repo: string): string {
-  return path.join(MOUNT_POINT, MIRROR_VERSION, `${owner}-${repo}.git`)
+  const mountPoint = getMountPoint(owner, repo)
+  return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`)
 }
 
 /**
@@ -109,6 +120,9 @@ export async function setupCache(
   core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`)
 
   // Request sticky disk from VM agent
+  // Use the actual repo being checked out (owner/repo), not GITHUB_REPO_NAME
+  // This ensures each repo gets its own isolated sticky disk
+  const repoName = `${owner}/${repo}`
   let response
   try {
     response = await client.getStickyDisk({
@@ -117,7 +131,7 @@ export async function setupCache(
       region: process.env.BLACKSMITH_REGION || '',
       installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
       vmId: process.env.BLACKSMITH_VM_ID || '',
-      repoName: process.env.GITHUB_REPO_NAME || '',
+      repoName: repoName,
       stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
     })
   } catch (error) {
@@ -134,7 +148,9 @@ export async function setupCache(
       return {
         exposeId: '',
         stickyDiskKey,
+        repoName,
         device: '',
+        mountPoint: '',
         mirrorPath: '',
         hydrationInProgress: true,
         hydrationMessage,
@@ -163,15 +179,18 @@ export async function setupCache(
   // Format if needed
   await maybeFormatDevice(device)
 
-  // Mount the device
-  await exec.exec('sudo', ['mkdir', '-p', MOUNT_POINT])
-  await exec.exec('sudo', ['mount', device, MOUNT_POINT])
-  core.info(`[git-mirror] Mounted ${device} at ${MOUNT_POINT}`)
+  // Mount the device at a unique path for this repository
+  const mountPoint = getMountPoint(owner, repo)
+  await exec.exec('sudo', ['mkdir', '-p', mountPoint])
+  await exec.exec('sudo', ['mount', device, mountPoint])
+  core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`)
 
   return {
     exposeId,
     stickyDiskKey,
+    repoName,
     device,
+    mountPoint,
     mirrorPath: getMirrorPath(owner, repo),
     hydrationInProgress: false,
     performedHydration: false // Will be set by ensureMirror if we do initial clone
@@ -403,6 +422,8 @@ async function runMirrorGC(mirrorPath: string): Promise<void> {
 export interface CleanupOptions {
   exposeId: string
   stickyDiskKey: string
+  repoName?: string
+  mountPoint?: string
   mirrorPath?: string
   // shouldCommit indicates whether changes should be persisted.
   // Set to false if the job failed/was cancelled to avoid committing bad state.
@@ -420,6 +441,8 @@ export async function cleanup(options: CleanupOptions): Promise<void> {
   const {
     exposeId,
     stickyDiskKey,
+    repoName,
+    mountPoint,
     mirrorPath,
     shouldCommit,
     vmHydratedGitMirror
@@ -447,11 +470,13 @@ export async function cleanup(options: CleanupOptions): Promise<void> {
   }
 
   // Unmount the sticky disk
-  core.debug(`[git-mirror] Unmounting ${MOUNT_POINT}`)
-  try {
-    await exec.exec('sudo', ['umount', MOUNT_POINT])
-  } catch {
-    core.warning(`[git-mirror] Failed to unmount ${MOUNT_POINT}`)
+  if (mountPoint) {
+    core.debug(`[git-mirror] Unmounting ${mountPoint}`)
+    try {
+      await exec.exec('sudo', ['umount', mountPoint])
+    } catch {
+      core.warning(`[git-mirror] Failed to unmount ${mountPoint}`)
+    }
   }
 
   // Commit the sticky disk to persist changes
@@ -465,7 +490,7 @@ export async function cleanup(options: CleanupOptions): Promise<void> {
     stickyDiskKey: stickyDiskKey,
     vmId: process.env.BLACKSMITH_VM_ID || '',
     shouldCommit: shouldCommit,
-    repoName: process.env.GITHUB_REPO_NAME || '',
+    repoName: repoName || process.env.GITHUB_REPO_NAME || '',
     stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
     vmHydratedGitMirror: vmHydratedGitMirror
   })
