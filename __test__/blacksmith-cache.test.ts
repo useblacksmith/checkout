@@ -82,7 +82,10 @@ describe('blacksmith-cache tests', () => {
     })
 
     it('returns expected full path format', () => {
-      const mirrorPath = blacksmithCache.getMirrorPath('descriptinc', 'descript')
+      const mirrorPath = blacksmithCache.getMirrorPath(
+        'descriptinc',
+        'descript'
+      )
 
       expect(mirrorPath).toBe(
         '/blacksmith-git-mirror-descriptinc-descript/v1/descriptinc-descript.git'
