@@ -41,6 +41,8 @@ async function cleanup(): Promise<void> {
   // Cleanup Blacksmith git mirror cache (refresh mirror, run GC, unmount, and commit sticky disk)
   const exposeId = stateHelper.BlacksmithCacheExposeId
   const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey
+  const repoName = stateHelper.BlacksmithCacheRepoName
+  const mountPoint = stateHelper.BlacksmithCacheMountPoint
   const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
   const performedHydration = stateHelper.BlacksmithCachePerformedHydration
   const repoUrl = stateHelper.BlacksmithCacheRepoUrl
@@ -118,6 +120,8 @@ async function cleanup(): Promise<void> {
       await blacksmithCache.cleanup({
         exposeId,
         stickyDiskKey,
+        repoName: repoName || undefined,
+        mountPoint: mountPoint || undefined,
         mirrorPath: mirrorPath || undefined,
         shouldCommit,
         vmHydratedGitMirror

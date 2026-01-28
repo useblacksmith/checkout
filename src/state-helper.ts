@@ -38,6 +38,18 @@ export const BlacksmithCacheMirrorPath = core.getState(
 )
 
 /**
+ * The Blacksmith cache mount point for the POST action. The value is empty during the MAIN action.
+ */
+export const BlacksmithCacheMountPoint = core.getState(
+  'blacksmithCacheMountPoint'
+)
+
+/**
+ * The repository name (owner/repo) for the Blacksmith cache. The value is empty during the MAIN action.
+ */
+export const BlacksmithCacheRepoName = core.getState('blacksmithCacheRepoName')
+
+/**
  * The Blacksmith cache sticky disk key for the POST action. The value is empty during the MAIN action.
  */
 export const BlacksmithCacheStickyDiskKey = core.getState(
@@ -102,6 +114,20 @@ export function setBlacksmithCacheExposeId(exposeId: string) {
  */
 export function setBlacksmithCacheMirrorPath(mirrorPath: string) {
   core.saveState('blacksmithCacheMirrorPath', mirrorPath)
+}
+
+/**
+ * Save the Blacksmith cache mount point so the POST action can unmount.
+ */
+export function setBlacksmithCacheMountPoint(mountPoint: string) {
+  core.saveState('blacksmithCacheMountPoint', mountPoint)
+}
+
+/**
+ * Save the repository name (owner/repo) so the POST action can use it for cleanup.
+ */
+export function setBlacksmithCacheRepoName(repoName: string) {
+  core.saveState('blacksmithCacheRepoName', repoName)
 }
 
 /**

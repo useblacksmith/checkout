@@ -39,6 +39,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getMountPoint = getMountPoint;
 exports.isBlacksmithEnvironment = isBlacksmithEnvironment;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
@@ -56,8 +57,17 @@ const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
-const MOUNT_POINT = '/blacksmith-git-mirror';
+const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
+/**
+ * Get the mount point for a specific repository.
+ * Each repository gets its own mount point to support multiple checkouts.
+ * Uses directory structure (owner/repo) to avoid collisions from hyphenated names
+ * (e.g., foo-bar/baz vs foo/bar-baz would collide with a flat naming scheme).
+ */
+function getMountPoint(owner, repo) {
+    return path.join(MOUNT_BASE, owner, repo);
+}
 /**
  * Check if running in a Blacksmith environment by detecting BLACKSMITH_VM_ID
  */
@@ -65,10 +75,12 @@ function isBlacksmithEnvironment() {
     return !!process.env.BLACKSMITH_VM_ID;
 }
 /**
- * Get the path where the bare git mirror will be stored
+ * Get the path where the bare git mirror will be stored.
+ * Uses owner-repo.git filename to maintain backward compatibility with existing sticky disks.
  */
 function getMirrorPath(owner, repo) {
-    return path.join(MOUNT_POINT, MIRROR_VERSION, `${owner}-${repo}.git`);
+    const mountPoint = getMountPoint(owner, repo);
+    return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`);
 }
 /**
  * Create a gRPC client for communicating with the Blacksmith VM agent
@@ -134,6 +146,9 @@ function setupCache(owner, repo) {
         }
         core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`);
         // Request sticky disk from VM agent
+        // Use the actual repo being checked out (owner/repo), not GITHUB_REPO_NAME
+        // This ensures each repo gets its own isolated sticky disk
+        const repoName = `${owner}/${repo}`;
         let response;
         try {
             response = yield client.getStickyDisk({
@@ -142,7 +157,7 @@ function setupCache(owner, repo) {
                 region: process.env.BLACKSMITH_REGION || '',
                 installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
                 vmId: process.env.BLACKSMITH_VM_ID || '',
-                repoName: process.env.GITHUB_REPO_NAME || '',
+                repoName: repoName,
                 stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
             });
         }
@@ -155,7 +170,9 @@ function setupCache(owner, repo) {
                 return {
                     exposeId: '',
                     stickyDiskKey,
+                    repoName,
                     device: '',
+                    mountPoint: '',
                     mirrorPath: '',
                     hydrationInProgress: true,
                     hydrationMessage,
@@ -176,14 +193,17 @@ function setupCache(owner, repo) {
         core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
         // Format if needed
         yield maybeFormatDevice(device);
-        // Mount the device
-        yield exec.exec('sudo', ['mkdir', '-p', MOUNT_POINT]);
-        yield exec.exec('sudo', ['mount', device, MOUNT_POINT]);
-        core.info(`[git-mirror] Mounted ${device} at ${MOUNT_POINT}`);
+        // Mount the device at a unique path for this repository
+        const mountPoint = getMountPoint(owner, repo);
+        yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
+        yield exec.exec('sudo', ['mount', device, mountPoint]);
+        core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
         return {
             exposeId,
             stickyDiskKey,
+            repoName,
             device,
+            mountPoint,
             mirrorPath: getMirrorPath(owner, repo),
             hydrationInProgress: false,
             performedHydration: false // Will be set by ensureMirror if we do initial clone
@@ -382,7 +402,7 @@ function runMirrorGC(mirrorPath) {
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
-        const { exposeId, stickyDiskKey, mirrorPath, shouldCommit, vmHydratedGitMirror } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, shouldCommit, vmHydratedGitMirror } = options;
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
         // Run GC on the mirror before unmount to reduce disk size
         if (mirrorPath) {
@@ -402,12 +422,14 @@ function cleanup(options) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
         // Unmount the sticky disk
-        core.debug(`[git-mirror] Unmounting ${MOUNT_POINT}`);
-        try {
-            yield exec.exec('sudo', ['umount', MOUNT_POINT]);
-        }
-        catch (_c) {
-            core.warning(`[git-mirror] Failed to unmount ${MOUNT_POINT}`);
+        if (mountPoint) {
+            core.debug(`[git-mirror] Unmounting ${mountPoint}`);
+            try {
+                yield exec.exec('sudo', ['umount', mountPoint]);
+            }
+            catch (_c) {
+                core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
+            }
         }
         // Commit the sticky disk to persist changes
         core.info(`[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
@@ -417,7 +439,7 @@ function cleanup(options) {
             stickyDiskKey: stickyDiskKey,
             vmId: process.env.BLACKSMITH_VM_ID || '',
             shouldCommit: shouldCommit,
-            repoName: process.env.GITHUB_REPO_NAME || '',
+            repoName: repoName || process.env.GITHUB_REPO_NAME || '',
             stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
             vmHydratedGitMirror: vmHydratedGitMirror
         });
@@ -1913,7 +1935,9 @@ function getSource(settings) {
                         // Save state early so cleanup can call commitStickyDisk even if ensureMirror fails
                         stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
                         stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
+                        stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
+                        stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint);
                         // Save repo URL and verbose flag for post step mirror refresh
                         stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
                         stateHelper.setBlacksmithCacheVerbose(settings.verbose);
@@ -2634,6 +2658,8 @@ function cleanup() {
         // Cleanup Blacksmith git mirror cache (refresh mirror, run GC, unmount, and commit sticky disk)
         const exposeId = stateHelper.BlacksmithCacheExposeId;
         const stickyDiskKey = stateHelper.BlacksmithCacheStickyDiskKey;
+        const repoName = stateHelper.BlacksmithCacheRepoName;
+        const mountPoint = stateHelper.BlacksmithCacheMountPoint;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
         const performedHydration = stateHelper.BlacksmithCachePerformedHydration;
         const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
@@ -2694,6 +2720,8 @@ function cleanup() {
                 yield blacksmithCache.cleanup({
                     exposeId,
                     stickyDiskKey,
+                    repoName: repoName || undefined,
+                    mountPoint: mountPoint || undefined,
                     mirrorPath: mirrorPath || undefined,
                     shouldCommit,
                     vmHydratedGitMirror
@@ -3136,13 +3164,15 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
 exports.setSafeDirectory = setSafeDirectory;
 exports.setBlacksmithCacheExposeId = setBlacksmithCacheExposeId;
 exports.setBlacksmithCacheMirrorPath = setBlacksmithCacheMirrorPath;
+exports.setBlacksmithCacheMountPoint = setBlacksmithCacheMountPoint;
+exports.setBlacksmithCacheRepoName = setBlacksmithCacheRepoName;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
 exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
@@ -3176,6 +3206,14 @@ exports.BlacksmithCacheExposeId = core.getState('blacksmithCacheExposeId');
  * The Blacksmith cache mirror path for the POST action. The value is empty during the MAIN action.
  */
 exports.BlacksmithCacheMirrorPath = core.getState('blacksmithCacheMirrorPath');
+/**
+ * The Blacksmith cache mount point for the POST action. The value is empty during the MAIN action.
+ */
+exports.BlacksmithCacheMountPoint = core.getState('blacksmithCacheMountPoint');
+/**
+ * The repository name (owner/repo) for the Blacksmith cache. The value is empty during the MAIN action.
+ */
+exports.BlacksmithCacheRepoName = core.getState('blacksmithCacheRepoName');
 /**
  * The Blacksmith cache sticky disk key for the POST action. The value is empty during the MAIN action.
  */
@@ -3228,6 +3266,18 @@ function setBlacksmithCacheExposeId(exposeId) {
  */
 function setBlacksmithCacheMirrorPath(mirrorPath) {
     core.saveState('blacksmithCacheMirrorPath', mirrorPath);
+}
+/**
+ * Save the Blacksmith cache mount point so the POST action can unmount.
+ */
+function setBlacksmithCacheMountPoint(mountPoint) {
+    core.saveState('blacksmithCacheMountPoint', mountPoint);
+}
+/**
+ * Save the repository name (owner/repo) so the POST action can use it for cleanup.
+ */
+function setBlacksmithCacheRepoName(repoName) {
+    core.saveState('blacksmithCacheRepoName', repoName);
 }
 /**
  * Save the Blacksmith cache sticky disk key so the POST action can commit the sticky disk.

@@ -125,7 +125,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           // Save state early so cleanup can call commitStickyDisk even if ensureMirror fails
           stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
           stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
+          stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName)
           stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
+          stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint)
           // Save repo URL and verbose flag for post step mirror refresh
           stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
           stateHelper.setBlacksmithCacheVerbose(settings.verbose)
