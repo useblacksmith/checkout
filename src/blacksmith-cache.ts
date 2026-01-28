@@ -14,9 +14,11 @@ const MIRROR_VERSION = 'v1'
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
+ * Uses directory structure (owner/repo) to avoid collisions from hyphenated names
+ * (e.g., foo-bar/baz vs foo/bar-baz would collide with a flat naming scheme).
  */
 export function getMountPoint(owner: string, repo: string): string {
-  return `${MOUNT_BASE}-${owner}-${repo}`
+  return path.join(MOUNT_BASE, owner, repo)
 }
 
 export interface CacheInfo {
@@ -47,7 +49,7 @@ export function isBlacksmithEnvironment(): boolean {
  */
 export function getMirrorPath(owner: string, repo: string): string {
   const mountPoint = getMountPoint(owner, repo)
-  return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`)
+  return path.join(mountPoint, MIRROR_VERSION, 'mirror.git')
 }
 
 /**

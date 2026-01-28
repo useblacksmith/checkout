@@ -46,7 +46,18 @@ describe('blacksmith-cache tests', () => {
 
       expect(mountPoint).toContain('descriptinc')
       expect(mountPoint).toContain('descript')
-      expect(mountPoint).toBe('/blacksmith-git-mirror-descriptinc-descript')
+      expect(mountPoint).toBe('/blacksmith-git-mirror/descriptinc/descript')
+    })
+
+    it('avoids collisions from hyphenated names', () => {
+      // These would collide with a flat naming scheme like -owner-repo
+      // but are unique with directory structure /owner/repo
+      const mountPoint1 = blacksmithCache.getMountPoint('foo-bar', 'baz')
+      const mountPoint2 = blacksmithCache.getMountPoint('foo', 'bar-baz')
+
+      expect(mountPoint1).toBe('/blacksmith-git-mirror/foo-bar/baz')
+      expect(mountPoint2).toBe('/blacksmith-git-mirror/foo/bar-baz')
+      expect(mountPoint1).not.toBe(mountPoint2)
     })
   })
 
@@ -88,7 +99,7 @@ describe('blacksmith-cache tests', () => {
       )
 
       expect(mirrorPath).toBe(
-        '/blacksmith-git-mirror-descriptinc-descript/v1/descriptinc-descript.git'
+        '/blacksmith-git-mirror/descriptinc/descript/v1/mirror.git'
       )
     })
   })
@@ -137,9 +148,9 @@ describe('blacksmith-cache tests', () => {
       const mirrorPath2 = blacksmithCache.getMirrorPath(repo2.owner, repo2.repo)
 
       // Mount points should be different
-      expect(mountPoint1).toBe('/blacksmith-git-mirror-descriptinc-descript')
+      expect(mountPoint1).toBe('/blacksmith-git-mirror/descriptinc/descript')
       expect(mountPoint2).toBe(
-        '/blacksmith-git-mirror-descriptinc-shared-actions'
+        '/blacksmith-git-mirror/descriptinc/shared-actions'
       )
       expect(mountPoint1).not.toBe(mountPoint2)
 
