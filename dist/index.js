@@ -75,11 +75,12 @@ function isBlacksmithEnvironment() {
     return !!process.env.BLACKSMITH_VM_ID;
 }
 /**
- * Get the path where the bare git mirror will be stored
+ * Get the path where the bare git mirror will be stored.
+ * Uses owner-repo.git filename to maintain backward compatibility with existing sticky disks.
  */
 function getMirrorPath(owner, repo) {
     const mountPoint = getMountPoint(owner, repo);
-    return path.join(mountPoint, MIRROR_VERSION, 'mirror.git');
+    return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`);
 }
 /**
  * Create a gRPC client for communicating with the Blacksmith VM agent

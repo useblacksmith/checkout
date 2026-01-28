@@ -99,7 +99,7 @@ describe('blacksmith-cache tests', () => {
       )
 
       expect(mirrorPath).toBe(
-        '/blacksmith-git-mirror/descriptinc/descript/v1/mirror.git'
+        '/blacksmith-git-mirror/descriptinc/descript/v1/descriptinc-descript.git'
       )
     })
   })

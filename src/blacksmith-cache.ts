@@ -45,11 +45,12 @@ export function isBlacksmithEnvironment(): boolean {
 }
 
 /**
- * Get the path where the bare git mirror will be stored
+ * Get the path where the bare git mirror will be stored.
+ * Uses owner-repo.git filename to maintain backward compatibility with existing sticky disks.
  */
 export function getMirrorPath(owner: string, repo: string): string {
   const mountPoint = getMountPoint(owner, repo)
-  return path.join(mountPoint, MIRROR_VERSION, 'mirror.git')
+  return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`)
 }
 
 /**
