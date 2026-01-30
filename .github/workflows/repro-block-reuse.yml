@@ -48,10 +48,13 @@ jobs:
           # Each shard verifies whatever data the winning shard wrote last time,
           # then writes new data (one of these 25 commits will win for next time).
           #
-          # Find the git mirror directory (writable by runner)
-          MIRROR_DIR=$(find "$MOUNT" -name '*.git' -type d 2>/dev/null | head -1)
-          if [ -z "$MIRROR_DIR" ]; then
-            echo "ERROR: No git mirror found under $MOUNT"
+          # The mirror path follows: $MOUNT/v1/$OWNER-$REPO.git
+          REPO_SLUG=$(echo "$GITHUB_REPOSITORY" | tr '/' '-')
+          MIRROR_DIR="$MOUNT/v1/${REPO_SLUG}.git"
+          if [ ! -d "$MIRROR_DIR" ]; then
+            echo "ERROR: Mirror not found at $MIRROR_DIR"
+            ls -la "$MOUNT/" || true
+            ls -la "$MOUNT/v1/" 2>/dev/null || true
             exit 1
           fi
           echo "Mirror dir: $MIRROR_DIR"
