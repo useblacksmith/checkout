@@ -69,12 +69,32 @@ jobs:
           echo "========================================"
           echo ""
 
-          TESTDIR="$MOUNT/block_reuse_test"
-          sudo mkdir -p "$TESTDIR"
-          sudo chown runner:runner "$TESTDIR"
+          # Write test data INSIDE the .git mirror dir (we know mirror content survives).
+          # Also write at mount root to compare. If mirror-internal survives but
+          # mount-root doesn't, the backend is selectively preserving only mirror content.
+          MIRROR_DIR="$MOUNT/v1/useblacksmith-checkout.git"
+          TESTDIR="$MIRROR_DIR/block_reuse_test"
+          TESTDIR_ROOT="$MOUNT/block_reuse_test"
+
+          mkdir -p "$TESTDIR"
+          sudo mkdir -p "$TESTDIR_ROOT"
+          sudo chown runner:runner "$TESTDIR_ROOT"
+
           MANIFEST="$TESTDIR/manifest"
           RUNFILE="$TESTDIR/run_id"
           PHASE_FILE="$TESTDIR/phase"
+
+          # Also write a parallel marker at mount root for comparison
+          MANIFEST_ROOT="$TESTDIR_ROOT/manifest"
+          RUNFILE_ROOT="$TESTDIR_ROOT/run_id"
+          PHASE_FILE_ROOT="$TESTDIR_ROOT/phase"
+
+          echo "Test dir (inside mirror): $TESTDIR"
+          echo "Test dir (mount root):    $TESTDIR_ROOT"
+          echo "Mirror-internal test dir exists? $(test -d "$TESTDIR" && echo 'YES' || echo 'NO')"
+          echo "Mirror-internal phase file? $(test -f "$PHASE_FILE" && echo 'YES: '$(cat "$PHASE_FILE") || echo 'NO')"
+          echo "Root test dir exists? $(test -d "$TESTDIR_ROOT" && echo 'YES' || echo 'NO')"
+          echo "Root phase file? $(test -f "$PHASE_FILE_ROOT" && echo 'YES: '$(cat "$PHASE_FILE_ROOT") || echo 'NO')"
 
           # ---- PHASE 2: Verify previous run (if exists) ----
           if [ -f "$PHASE_FILE" ] && grep -q "ready" "$PHASE_FILE"; then
@@ -141,12 +161,16 @@ jobs:
           echo "  PHASE 1: WRITING TEST DATA"
           echo "========================================"
 
-          sudo rm -rf "$TESTDIR"
-          sudo mkdir -p "$TESTDIR"
-          sudo chown runner:runner "$TESTDIR"
+          # Clean and recreate both test directories
+          rm -rf "$TESTDIR"
+          mkdir -p "$TESTDIR"
+          sudo rm -rf "$TESTDIR_ROOT"
+          sudo mkdir -p "$TESTDIR_ROOT"
+          sudo chown runner:runner "$TESTDIR_ROOT"
 
           RUN_ID="shard${SHARD}-$(date +%Y%m%d-%H%M%S)-$$"
           echo "$RUN_ID" > "$RUNFILE"
+          echo "$RUN_ID" > "$RUNFILE_ROOT"
           echo "Run ID: $RUN_ID"
 
           # Write large file to occupy blocks, then delete to free them
@@ -162,13 +186,21 @@ jobs:
           sync
 
           # Write small files (simulate git refs) to reuse freed blocks
-          echo "Writing 200 small files (41 bytes)..."
+          echo "Writing 200 small files (41 bytes) to BOTH locations..."
           > "$MANIFEST"
+          > "$MANIFEST_ROOT"
           for i in $(seq 1 200); do
-            FNAME="$TESTDIR/ref_$(printf '%04d' $i)"
             CONTENT=$(printf 'OK_%s_%04d' "$RUN_ID" "$i" | sha1sum | head -c 40)
+
+            # Inside mirror
+            FNAME="$TESTDIR/ref_$(printf '%04d' $i)"
             printf '%s\n' "$CONTENT" > "$FNAME"
             echo "$FNAME|$(md5sum "$FNAME" | awk '{print $1}')" >> "$MANIFEST"
+
+            # At mount root
+            FNAME_ROOT="$TESTDIR_ROOT/ref_$(printf '%04d' $i)"
+            printf '%s\n' "$CONTENT" > "$FNAME_ROOT"
+            echo "$FNAME_ROOT|$(md5sum "$FNAME_ROOT" | awk '{print $1}')" >> "$MANIFEST_ROOT"
           done
 
           # Write medium files (simulate pack files)
@@ -181,10 +213,12 @@ jobs:
 
           sync
           echo "ready" > "$PHASE_FILE"
+          echo "ready" > "$PHASE_FILE_ROOT"
           sync
 
           TOTAL_FILES=$(wc -l < "$MANIFEST")
+          TOTAL_FILES_ROOT=$(wc -l < "$MANIFEST_ROOT")
           echo ""
-          echo "Phase 1 complete: $TOTAL_FILES files written."
+          echo "Phase 1 complete: $TOTAL_FILES files (mirror), $TOTAL_FILES_ROOT files (root)."
           echo "Post step will sync -> umount -> commit snapshot."
           echo "Next run on this sticky disk will verify."
