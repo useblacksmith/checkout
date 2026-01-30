@@ -47,7 +47,16 @@ jobs:
           # Only one shard's commit wins as the new parent for the next run.
           # Each shard verifies whatever data the winning shard wrote last time,
           # then writes new data (one of these 25 commits will win for next time).
-          TESTDIR="$MOUNT/.block_reuse_test"
+          #
+          # Find the git mirror directory (writable by runner)
+          MIRROR_DIR=$(find "$MOUNT" -name '*.git' -type d | head -1)
+          if [ -z "$MIRROR_DIR" ]; then
+            echo "ERROR: No git mirror found under $MOUNT"
+            exit 1
+          fi
+          echo "Mirror dir: $MIRROR_DIR"
+
+          TESTDIR="$MIRROR_DIR/.block_reuse_test"
           MANIFEST="$TESTDIR/manifest"
           RUNFILE="$TESTDIR/run_id"
           PHASE_FILE="$TESTDIR/phase"
