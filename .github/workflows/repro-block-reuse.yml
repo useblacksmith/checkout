@@ -48,18 +48,11 @@ jobs:
           # Each shard verifies whatever data the winning shard wrote last time,
           # then writes new data (one of these 25 commits will win for next time).
           #
-          # The mirror path follows: $MOUNT/v1/$OWNER-$REPO.git
-          REPO_SLUG=$(echo "$GITHUB_REPOSITORY" | tr '/' '-')
-          MIRROR_DIR="$MOUNT/v1/${REPO_SLUG}.git"
-          if [ ! -d "$MIRROR_DIR" ]; then
-            echo "ERROR: Mirror not found at $MIRROR_DIR"
-            ls -la "$MOUNT/" || true
-            ls -la "$MOUNT/v1/" 2>/dev/null || true
-            exit 1
-          fi
-          echo "Mirror dir: $MIRROR_DIR"
-
-          TESTDIR="$MIRROR_DIR/.block_reuse_test"
+          # Write test data in a sibling directory next to the mirror,
+          # NOT inside the .git dir (git gc/fetch may clean unknown files).
+          TESTDIR="$MOUNT/block_reuse_test"
+          sudo mkdir -p "$TESTDIR"
+          sudo chown runner:runner "$TESTDIR"
           MANIFEST="$TESTDIR/manifest"
           RUNFILE="$TESTDIR/run_id"
           PHASE_FILE="$TESTDIR/phase"
