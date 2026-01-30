@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]
+        shard: [1,2,3,4,5]
     steps:
       # First checkout gets the action source code (standard GH action)
       - name: Checkout action code
@@ -43,13 +43,32 @@ jobs:
           echo "Device: $DEV"
           echo "Data mode: $(cat /proc/fs/ext4/$(basename $DEV)/options 2>/dev/null | grep data)"
 
-          # All shards see the same snapshot content (cloned from same parent).
-          # Only one shard's commit wins as the new parent for the next run.
-          # Each shard verifies whatever data the winning shard wrote last time,
-          # then writes new data (one of these 25 commits will win for next time).
-          #
-          # Write test data in a sibling directory next to the mirror,
-          # NOT inside the .git dir (git gc/fetch may clean unknown files).
+          # ---- DIAGNOSTIC: What's on the sticky disk? ----
+          echo ""
+          echo "========================================"
+          echo "  DIAGNOSTICS: STICKY DISK CONTENTS"
+          echo "========================================"
+          echo "Mount root contents (ls -la):"
+          ls -la "$MOUNT" || true
+          echo ""
+          echo "Mount root contents (recursive, max depth 2):"
+          sudo find "$MOUNT" -maxdepth 2 -ls 2>/dev/null || true
+          echo ""
+          echo "Disk usage:"
+          df -h "$MOUNT"
+          echo ""
+          echo "Mount count (tune2fs):"
+          sudo tune2fs -l "$DEV" 2>/dev/null | grep -i "mount count" || true
+          echo ""
+          echo "Mirror exists? $(test -d "$MOUNT/v1" && echo 'YES (v1/ dir found)' || echo 'NO (v1/ dir missing - fresh disk!)')"
+          echo "Test dir exists? $(test -d "$MOUNT/block_reuse_test" && echo 'YES' || echo 'NO')"
+          echo "Phase file exists? $(test -f "$MOUNT/block_reuse_test/phase" && echo 'YES' || echo 'NO')"
+          if [ -f "$MOUNT/block_reuse_test/phase" ]; then
+            echo "Phase file content: $(cat "$MOUNT/block_reuse_test/phase")"
+          fi
+          echo "========================================"
+          echo ""
+
           TESTDIR="$MOUNT/block_reuse_test"
           sudo mkdir -p "$TESTDIR"
           sudo chown runner:runner "$TESTDIR"
