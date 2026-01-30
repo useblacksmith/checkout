@@ -122,8 +122,9 @@ jobs:
           echo "  PHASE 1: WRITING TEST DATA"
           echo "========================================"
 
-          rm -rf "$TESTDIR"
-          mkdir -p "$TESTDIR"
+          sudo rm -rf "$TESTDIR"
+          sudo mkdir -p "$TESTDIR"
+          sudo chown runner:runner "$TESTDIR"
 
           RUN_ID="shard${SHARD}-$(date +%Y%m%d-%H%M%S)-$$"
           echo "$RUN_ID" > "$RUNFILE"
