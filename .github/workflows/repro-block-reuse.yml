@@ -49,7 +49,7 @@ jobs:
           # then writes new data (one of these 25 commits will win for next time).
           #
           # Find the git mirror directory (writable by runner)
-          MIRROR_DIR=$(find "$MOUNT" -name '*.git' -type d | head -1)
+          MIRROR_DIR=$(find "$MOUNT" -name '*.git' -type d 2>/dev/null | head -1)
           if [ -z "$MIRROR_DIR" ]; then
             echo "ERROR: No git mirror found under $MOUNT"
             exit 1
