@@ -2,6 +2,9 @@ name: Repro Block Reuse
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - adityamaru/fix-pack-idx-corruption
 
 jobs:
   block-reuse-test:
