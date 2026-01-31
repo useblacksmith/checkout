@@ -492,6 +492,7 @@ function runMirrorFsck(mirrorPath_1) {
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
+        var _a;
         const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, vmHydratedGitMirror, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
         let { shouldCommit } = options;
         const result = {
@@ -524,7 +525,7 @@ function cleanup(options) {
         try {
             yield exec.exec('sync');
         }
-        catch (_a) {
+        catch (_b) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
         // Unmount the sticky disk
@@ -533,23 +534,28 @@ function cleanup(options) {
             try {
                 yield exec.exec('sudo', ['umount', mountPoint]);
             }
-            catch (_b) {
+            catch (_c) {
                 core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
             }
         }
         // Commit the sticky disk to persist changes
         core.info(`[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
-        const client = createBlacksmithClient();
-        yield client.commitStickyDisk({
-            exposeId: exposeId,
-            stickyDiskKey: stickyDiskKey,
-            vmId: process.env.BLACKSMITH_VM_ID || '',
-            shouldCommit: shouldCommit,
-            repoName: repoName || process.env.GITHUB_REPO_NAME || '',
-            stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
-            vmHydratedGitMirror: vmHydratedGitMirror
-        });
-        core.info('[git-mirror] Successfully committed sticky disk');
+        try {
+            const client = createBlacksmithClient();
+            yield client.commitStickyDisk({
+                exposeId: exposeId,
+                stickyDiskKey: stickyDiskKey,
+                vmId: process.env.BLACKSMITH_VM_ID || '',
+                shouldCommit: shouldCommit,
+                repoName: repoName || process.env.GITHUB_REPO_NAME || '',
+                stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+                vmHydratedGitMirror: vmHydratedGitMirror
+            });
+            core.info('[git-mirror] Successfully committed sticky disk');
+        }
+        catch (error) {
+            core.warning(`[git-mirror] Failed to commit sticky disk: ${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
+        }
         return result;
     });
 }

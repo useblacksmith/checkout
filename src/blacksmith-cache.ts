@@ -647,18 +647,25 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   core.info(
     `[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
   )
-  const client = createBlacksmithClient()
+  try {
+    const client = createBlacksmithClient()
 
-  await client.commitStickyDisk({
-    exposeId: exposeId,
-    stickyDiskKey: stickyDiskKey,
-    vmId: process.env.BLACKSMITH_VM_ID || '',
-    shouldCommit: shouldCommit,
-    repoName: repoName || process.env.GITHUB_REPO_NAME || '',
-    stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
-    vmHydratedGitMirror: vmHydratedGitMirror
-  })
+    await client.commitStickyDisk({
+      exposeId: exposeId,
+      stickyDiskKey: stickyDiskKey,
+      vmId: process.env.BLACKSMITH_VM_ID || '',
+      shouldCommit: shouldCommit,
+      repoName: repoName || process.env.GITHUB_REPO_NAME || '',
+      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+      vmHydratedGitMirror: vmHydratedGitMirror
+    })
 
-  core.info('[git-mirror] Successfully committed sticky disk')
+    core.info('[git-mirror] Successfully committed sticky disk')
+  } catch (error) {
+    core.warning(
+      `[git-mirror] Failed to commit sticky disk: ${(error as any)?.message ?? error}`
+    )
+  }
+
   return result
 }
