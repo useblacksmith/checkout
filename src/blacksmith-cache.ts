@@ -364,10 +364,10 @@ export async function refreshMirror(
   core.info(
     `[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`
   )
-  const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
-  const gitEnv = buildGitEnv(verbose)
 
   try {
+    const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
+    const gitEnv = buildGitEnv(verbose)
     await retryHelper.execute(async () => {
       const fetchArgs = [
         '-c',

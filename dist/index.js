@@ -325,9 +325,9 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
             return { success: true, timedOut: false };
         }
         core.info(`[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`);
-        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
-        const gitEnv = buildGitEnv(verbose);
         try {
+            const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
+            const gitEnv = buildGitEnv(verbose);
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
                 const fetchArgs = [
                     '-c',
