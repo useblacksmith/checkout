@@ -59,6 +59,11 @@ const retryHelper = __importStar(__nccwpck_require__(2155));
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
+const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
+const GC_TIMEOUT_SECS = 60; // 60 seconds
+const FSCK_TIMEOUT_SECS = 30; // 30 seconds
+// Exit code returned by the `timeout` command when the child is killed.
+const TIMEOUT_EXIT_CODE = 124;
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
@@ -314,31 +319,51 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  */
 function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
-    return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false, timeoutSecs = REFRESH_TIMEOUT_SECS) {
         if (!fs.existsSync(mirrorPath)) {
             core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`);
-            return;
+            return { success: true, timedOut: false };
         }
-        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath}`);
-        const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
-        const gitEnv = buildGitEnv(verbose);
-        yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-            const fetchArgs = [
-                '-c',
-                `${configKey}=${configValue}`,
-                '-C',
-                mirrorPath,
-                'fetch',
-                '--prune',
-                '--progress',
-                'origin'
-            ];
-            if (verbose) {
-                fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
+        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`);
+        try {
+            const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
+            const gitEnv = buildGitEnv(verbose);
+            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                const fetchArgs = [
+                    '-c',
+                    `${configKey}=${configValue}`,
+                    '-C',
+                    mirrorPath,
+                    'fetch',
+                    '--prune',
+                    '--progress',
+                    'origin'
+                ];
+                if (verbose) {
+                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
+                }
+                const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true });
+                if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                    throw new Error(`git fetch timed out after ${timeoutSecs}s`);
+                }
+                if (result.exitCode !== 0) {
+                    throw new Error(`git fetch failed with exit code ${result.exitCode}`);
+                }
+            }));
+            core.info('[git-mirror] Mirror refresh complete');
+            return { success: true, timedOut: false };
+        }
+        catch (error) {
+            const msg = error.message || String(error);
+            const timedOut = msg.includes('timed out');
+            if (timedOut) {
+                core.warning(`[git-mirror] Mirror refresh timed out: ${msg}`);
             }
-            yield exec.exec('git', fetchArgs, { env: gitEnv });
-        }));
-        core.info('[git-mirror] Mirror refresh complete');
+            else {
+                core.warning(`[git-mirror] Mirror refresh failed: ${msg}`);
+            }
+            return { success: false, timedOut, error: msg };
+        }
     });
 }
 /**
@@ -380,37 +405,118 @@ function dissociate(workspacePath) {
  * Uses --auto to only run GC when git determines it's needed (based on loose object count).
  * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
  */
-function runMirrorGC(mirrorPath) {
-    return __awaiter(this, void 0, void 0, function* () {
-        core.info('Running auto garbage collection on git mirror');
+function runMirrorGC(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
+        core.info(`[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`);
         try {
             // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
             // This is much faster than a full gc when not needed
-            yield exec.exec('git', ['-C', mirrorPath, 'gc', '--auto'], {
-                ignoreReturnCode: true // Don't fail cleanup if gc fails
-            });
-            core.debug('Completed git gc --auto');
+            const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', '-C', mirrorPath, 'gc', '--auto'], { ignoreReturnCode: true });
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                core.warning(`[git-mirror] GC timed out after ${timeoutSecs}s`);
+                return {
+                    success: false,
+                    timedOut: true,
+                    error: `git gc timed out after ${timeoutSecs}s`
+                };
+            }
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] GC failed with exit code ${result.exitCode}`);
+                return {
+                    success: false,
+                    timedOut: false,
+                    error: `git gc failed with exit code ${result.exitCode}`
+                };
+            }
+            core.debug('[git-mirror] Completed git gc --auto');
+            return { success: true, timedOut: false };
         }
-        catch (_a) {
-            core.warning('Failed to run git gc on mirror');
+        catch (error) {
+            const msg = error.message || String(error);
+            core.warning(`[git-mirror] GC failed: ${msg}`);
+            return { success: false, timedOut: false, error: msg };
         }
     });
 }
 /**
- * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
- * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
+ * Run git fsck on the mirror to verify object integrity.
+ * This is the final integrity gate before committing the sticky disk.
+ * --no-dangling: skip reporting dangling objects (expected in a mirror with pruned refs)
+ * --no-progress: suppress progress output for cleaner logs
+ */
+function runMirrorFsck(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = FSCK_TIMEOUT_SECS) {
+        core.info(`[git-mirror] Running fsck integrity check (timeout: ${timeoutSecs}s)`);
+        try {
+            const result = yield exec.getExecOutput('timeout', [
+                String(timeoutSecs),
+                'git',
+                '-C',
+                mirrorPath,
+                'fsck',
+                '--no-dangling',
+                '--no-progress'
+            ], { ignoreReturnCode: true });
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                core.warning(`[git-mirror] Fsck timed out after ${timeoutSecs}s`);
+                return {
+                    success: false,
+                    timedOut: true,
+                    error: `git fsck timed out after ${timeoutSecs}s`
+                };
+            }
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] Fsck failed with exit code ${result.exitCode}`);
+                return {
+                    success: false,
+                    timedOut: false,
+                    error: `git fsck failed with exit code ${result.exitCode}`
+                };
+            }
+            core.info('[git-mirror] Fsck passed — mirror integrity verified');
+            return { success: true, timedOut: false };
+        }
+        catch (error) {
+            const msg = error.message || String(error);
+            core.warning(`[git-mirror] Fsck failed: ${msg}`);
+            return { success: false, timedOut: false, error: msg };
+        }
+    });
+}
+/**
+ * Cleanup: run GC, fsck, sync, unmount, and commit the sticky disk.
+ *
+ * Execution order: GC → fsck → sync → unmount → commit
+ * Fsck runs last (before unmount) as the final integrity gate.
+ * If any of mirror refresh / GC / fsck fail or time out, shouldCommit is set to false.
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
-        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, shouldCommit, vmHydratedGitMirror } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, vmHydratedGitMirror, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
+        let { shouldCommit } = options;
+        const result = {
+            gcResult: { success: true, timedOut: false },
+            fsckResult: { success: true, timedOut: false }
+        };
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
-        // Run GC on the mirror before unmount to reduce disk size
+        // If mirror refresh failed or timed out, don't commit
+        if (mirrorRefreshFailed || mirrorRefreshTimedOut) {
+            const reason = mirrorRefreshTimedOut ? 'timed out' : 'failed';
+            core.warning(`[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`);
+            shouldCommit = false;
+        }
         if (mirrorPath) {
-            try {
-                yield runMirrorGC(mirrorPath);
+            // Run GC on the mirror before fsck
+            result.gcResult = yield runMirrorGC(mirrorPath);
+            if (!result.gcResult.success) {
+                core.warning('[git-mirror] GC failed or timed out, will not commit sticky disk');
+                shouldCommit = false;
             }
-            catch (_a) {
-                core.warning('[git-mirror] Mirror GC failed, continuing with cleanup');
+            // Run fsck as final integrity gate
+            result.fsckResult = yield runMirrorFsck(mirrorPath);
+            if (!result.fsckResult.success) {
+                core.warning('[git-mirror] Fsck failed or timed out, will not commit sticky disk');
+                shouldCommit = false;
             }
         }
         // Sync filesystem before unmount to ensure all writes are flushed
@@ -418,7 +524,7 @@ function cleanup(options) {
         try {
             yield exec.exec('sync');
         }
-        catch (_b) {
+        catch (_a) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
         // Unmount the sticky disk
@@ -427,7 +533,7 @@ function cleanup(options) {
             try {
                 yield exec.exec('sudo', ['umount', mountPoint]);
             }
-            catch (_c) {
+            catch (_b) {
                 core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
             }
         }
@@ -444,6 +550,7 @@ function cleanup(options) {
             vmHydratedGitMirror: vmHydratedGitMirror
         });
         core.info('[git-mirror] Successfully committed sticky disk');
+        return result;
     });
 }
 
@@ -2578,6 +2685,102 @@ function getInputs() {
 
 /***/ }),
 
+/***/ 7753:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reportInternalMetric = reportInternalMetric;
+const core = __importStar(__nccwpck_require__(2186));
+const http = __importStar(__nccwpck_require__(3685));
+const METRICS_PORT = process.env.BLACKSMITH_METRICS_HTTP_PORT || '';
+const VM_ID = process.env.BLACKSMITH_VM_ID || '';
+const AGENT_IP = '192.168.127.1';
+/**
+ * Report an internal metric to the Blacksmith agent.
+ * Fire-and-forget: errors are logged but never thrown.
+ */
+function reportInternalMetric(metricType, value, attributes) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!METRICS_PORT) {
+            core.debug('[metrics] BLACKSMITH_METRICS_HTTP_PORT not set, skipping metric');
+            return;
+        }
+        const payload = JSON.stringify({
+            metric_type: metricType,
+            value,
+            vm_id: VM_ID,
+            attributes
+        });
+        try {
+            yield new Promise((resolve, reject) => {
+                const req = http.request({
+                    hostname: AGENT_IP,
+                    port: Number(METRICS_PORT),
+                    path: '/internal',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(payload)
+                    },
+                    timeout: 5000
+                }, res => {
+                    // Drain response
+                    res.resume();
+                    res.on('end', () => resolve());
+                });
+                req.on('error', reject);
+                req.on('timeout', () => {
+                    req.destroy();
+                    reject(new Error('metrics request timed out'));
+                });
+                req.write(payload);
+                req.end();
+            });
+            core.debug(`[metrics] Reported ${metricType} metric`);
+        }
+        catch (error) {
+            core.debug(`[metrics] Failed to report ${metricType}: ${error.message}`);
+        }
+    });
+}
+
+
+/***/ }),
+
 /***/ 3109:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -2624,6 +2827,7 @@ const path = __importStar(__nccwpck_require__(1017));
 const stateHelper = __importStar(__nccwpck_require__(4866));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
 const step_checker_1 = __nccwpck_require__(9716);
+const internal_metrics_1 = __nccwpck_require__(7753);
 function run() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
@@ -2648,7 +2852,7 @@ function run() {
 }
 function cleanup() {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b, _c;
+        var _a, _b;
         try {
             yield gitSourceProvider.cleanup(stateHelper.RepositoryPath);
         }
@@ -2665,26 +2869,26 @@ function cleanup() {
         const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
         const verbose = stateHelper.BlacksmithCacheVerbose;
         if (exposeId && stickyDiskKey) {
+            // Track mirror refresh outcome for metrics and commit decision
+            let refreshResult = {
+                success: true,
+                timedOut: false
+            };
             // Refresh the git mirror in the post step (outside the critical checkout path)
             // This updates the mirror for future runs without blocking the workflow
             if (mirrorPath && repoUrl && !performedHydration) {
-                try {
-                    core.startGroup('Refreshing Blacksmith git mirror');
-                    // Re-read auth token from input (don't store sensitive data in state)
-                    const authToken = core.getInput('token', { required: false });
-                    if (authToken) {
-                        yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
-                    }
-                    else {
-                        core.warning('[git-mirror] No auth token available, skipping mirror refresh');
-                    }
-                    core.endGroup();
+                core.startGroup('Refreshing Blacksmith git mirror');
+                // Re-read auth token from input (don't store sensitive data in state)
+                const authToken = core.getInput('token', { required: false });
+                if (authToken) {
+                    refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
                 }
-                catch (error) {
-                    core.endGroup();
-                    core.warning(`[git-mirror] Failed to refresh mirror: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
+                else {
+                    core.warning('[git-mirror] No auth token available, skipping mirror refresh');
                 }
+                core.endGroup();
             }
+            let cleanupResult;
             try {
                 // Check for previous step failures by reading runner logs
                 // This is the same approach used by setup-docker-builder (BPA)
@@ -2717,18 +2921,38 @@ function cleanup() {
                 else {
                     core.info('[git-mirror] No previous step failures detected');
                 }
-                yield blacksmithCache.cleanup({
+                cleanupResult = yield blacksmithCache.cleanup({
                     exposeId,
                     stickyDiskKey,
                     repoName: repoName || undefined,
                     mountPoint: mountPoint || undefined,
                     mirrorPath: mirrorPath || undefined,
                     shouldCommit,
-                    vmHydratedGitMirror
+                    vmHydratedGitMirror,
+                    mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
+                    mirrorRefreshTimedOut: refreshResult.timedOut
                 });
             }
             catch (error) {
-                core.warning(`Failed to cleanup Blacksmith cache: ${(_c = error === null || error === void 0 ? void 0 : error.message) !== null && _c !== void 0 ? _c : error}`);
+                core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
+            }
+            // Report metrics for any failures/timeouts (fire-and-forget)
+            if (!refreshResult.success) {
+                yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_refresh_failure', 1, {
+                    reason: refreshResult.timedOut ? 'timeout' : 'failure'
+                });
+            }
+            if (cleanupResult) {
+                if (!cleanupResult.gcResult.success) {
+                    yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_gc_failure', 1, {
+                        reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
+                    });
+                }
+                if (!cleanupResult.fsckResult.success) {
+                    yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_fsck_failure', 1, {
+                        reason: cleanupResult.fsckResult.timedOut ? 'timeout' : 'failure'
+                    });
+                }
             }
         }
     });
