@@ -11,6 +11,30 @@ const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
 const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
+const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
+const GC_TIMEOUT_SECS = 60 // 60 seconds
+const FSCK_TIMEOUT_SECS = 30 // 30 seconds
+
+// Exit code returned by the `timeout` command when the child is killed.
+const TIMEOUT_EXIT_CODE = 124
+
+/**
+ * Result of a git mirror operation that may fail or time out.
+ */
+export interface OperationResult {
+  success: boolean
+  timedOut: boolean
+  error?: string
+}
+
+/**
+ * Result of the cleanup phase, used for metric reporting.
+ */
+export interface CleanupResult {
+  gcResult: OperationResult
+  fsckResult: OperationResult
+}
+
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
@@ -327,36 +351,65 @@ export async function refreshMirror(
   mirrorPath: string,
   repoUrl: string,
   authToken: string,
-  verbose: boolean = false
-): Promise<void> {
+  verbose: boolean = false,
+  timeoutSecs: number = REFRESH_TIMEOUT_SECS
+): Promise<OperationResult> {
   if (!fs.existsSync(mirrorPath)) {
     core.debug(
       `[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`
     )
-    return
+    return {success: true, timedOut: false}
   }
 
-  core.info(`[git-mirror] Refreshing mirror at ${mirrorPath}`)
+  core.info(
+    `[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`
+  )
   const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
   const gitEnv = buildGitEnv(verbose)
 
-  await retryHelper.execute(async () => {
-    const fetchArgs = [
-      '-c',
-      `${configKey}=${configValue}`,
-      '-C',
-      mirrorPath,
-      'fetch',
-      '--prune',
-      '--progress',
-      'origin'
-    ]
-    if (verbose) {
-      fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+  try {
+    await retryHelper.execute(async () => {
+      const fetchArgs = [
+        '-c',
+        `${configKey}=${configValue}`,
+        '-C',
+        mirrorPath,
+        'fetch',
+        '--prune',
+        '--progress',
+        'origin'
+      ]
+      if (verbose) {
+        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+      }
+      const result = await exec.getExecOutput(
+        'timeout',
+        [String(timeoutSecs), 'git', ...fetchArgs],
+        {env: gitEnv, ignoreReturnCode: true}
+      )
+      if (result.exitCode === TIMEOUT_EXIT_CODE) {
+        throw new Error(
+          `git fetch timed out after ${timeoutSecs}s`
+        )
+      }
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `git fetch failed with exit code ${result.exitCode}`
+        )
+      }
+    })
+    core.info('[git-mirror] Mirror refresh complete')
+    return {success: true, timedOut: false}
+  } catch (error) {
+    const msg = (error as Error).message || String(error)
+    const timedOut = msg.includes('timed out')
+    if (timedOut) {
+      core.warning(`[git-mirror] Mirror refresh timed out: ${msg}`)
+    } else {
+      core.warning(`[git-mirror] Mirror refresh failed: ${msg}`)
     }
-    await exec.exec('git', fetchArgs, {env: gitEnv})
-  })
-  core.info('[git-mirror] Mirror refresh complete')
+    return {success: false, timedOut, error: msg}
+  }
 }
 
 /**
@@ -407,18 +460,105 @@ export async function dissociate(workspacePath: string): Promise<void> {
  * Uses --auto to only run GC when git determines it's needed (based on loose object count).
  * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
  */
-async function runMirrorGC(mirrorPath: string): Promise<void> {
-  core.info('Running auto garbage collection on git mirror')
+async function runMirrorGC(
+  mirrorPath: string,
+  timeoutSecs: number = GC_TIMEOUT_SECS
+): Promise<OperationResult> {
+  core.info(
+    `[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`
+  )
 
   try {
     // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
     // This is much faster than a full gc when not needed
-    await exec.exec('git', ['-C', mirrorPath, 'gc', '--auto'], {
-      ignoreReturnCode: true // Don't fail cleanup if gc fails
-    })
-    core.debug('Completed git gc --auto')
-  } catch {
-    core.warning('Failed to run git gc on mirror')
+    const result = await exec.getExecOutput(
+      'timeout',
+      [String(timeoutSecs), 'git', '-C', mirrorPath, 'gc', '--auto'],
+      {ignoreReturnCode: true}
+    )
+    if (result.exitCode === TIMEOUT_EXIT_CODE) {
+      core.warning(
+        `[git-mirror] GC timed out after ${timeoutSecs}s`
+      )
+      return {
+        success: false,
+        timedOut: true,
+        error: `git gc timed out after ${timeoutSecs}s`
+      }
+    }
+    if (result.exitCode !== 0) {
+      core.warning(
+        `[git-mirror] GC failed with exit code ${result.exitCode}`
+      )
+      return {
+        success: false,
+        timedOut: false,
+        error: `git gc failed with exit code ${result.exitCode}`
+      }
+    }
+    core.debug('[git-mirror] Completed git gc --auto')
+    return {success: true, timedOut: false}
+  } catch (error) {
+    const msg = (error as Error).message || String(error)
+    core.warning(`[git-mirror] GC failed: ${msg}`)
+    return {success: false, timedOut: false, error: msg}
+  }
+}
+
+/**
+ * Run git fsck on the mirror to verify object integrity.
+ * This is the final integrity gate before committing the sticky disk.
+ * --no-dangling: skip reporting dangling objects (expected in a mirror with pruned refs)
+ * --no-progress: suppress progress output for cleaner logs
+ */
+async function runMirrorFsck(
+  mirrorPath: string,
+  timeoutSecs: number = FSCK_TIMEOUT_SECS
+): Promise<OperationResult> {
+  core.info(
+    `[git-mirror] Running fsck integrity check (timeout: ${timeoutSecs}s)`
+  )
+
+  try {
+    const result = await exec.getExecOutput(
+      'timeout',
+      [
+        String(timeoutSecs),
+        'git',
+        '-C',
+        mirrorPath,
+        'fsck',
+        '--no-dangling',
+        '--no-progress'
+      ],
+      {ignoreReturnCode: true}
+    )
+    if (result.exitCode === TIMEOUT_EXIT_CODE) {
+      core.warning(
+        `[git-mirror] Fsck timed out after ${timeoutSecs}s`
+      )
+      return {
+        success: false,
+        timedOut: true,
+        error: `git fsck timed out after ${timeoutSecs}s`
+      }
+    }
+    if (result.exitCode !== 0) {
+      core.warning(
+        `[git-mirror] Fsck failed with exit code ${result.exitCode}`
+      )
+      return {
+        success: false,
+        timedOut: false,
+        error: `git fsck failed with exit code ${result.exitCode}`
+      }
+    }
+    core.info('[git-mirror] Fsck passed — mirror integrity verified')
+    return {success: true, timedOut: false}
+  } catch (error) {
+    const msg = (error as Error).message || String(error)
+    core.warning(`[git-mirror] Fsck failed: ${msg}`)
+    return {success: false, timedOut: false, error: msg}
   }
 }
 
@@ -434,33 +574,66 @@ export interface CleanupOptions {
   // vmHydratedGitMirror indicates this job performed initial git mirror clone.
   // Used by backend to mark hydration as complete.
   vmHydratedGitMirror: boolean
+  // Mirror refresh outcome from the post step (run before cleanup is called).
+  mirrorRefreshFailed?: boolean
+  mirrorRefreshTimedOut?: boolean
 }
 
 /**
- * Cleanup: run GC on mirror, sync, unmount, and commit the sticky disk.
- * GC runs here (post-job) to avoid impacting VM boot or checkout performance.
+ * Cleanup: run GC, fsck, sync, unmount, and commit the sticky disk.
+ *
+ * Execution order: GC → fsck → sync → unmount → commit
+ * Fsck runs last (before unmount) as the final integrity gate.
+ * If any of mirror refresh / GC / fsck fail or time out, shouldCommit is set to false.
  */
-export async function cleanup(options: CleanupOptions): Promise<void> {
+export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   const {
     exposeId,
     stickyDiskKey,
     repoName,
     mountPoint,
     mirrorPath,
-    shouldCommit,
-    vmHydratedGitMirror
+    vmHydratedGitMirror,
+    mirrorRefreshFailed,
+    mirrorRefreshTimedOut
   } = options
+  let {shouldCommit} = options
+
+  const result: CleanupResult = {
+    gcResult: {success: true, timedOut: false},
+    fsckResult: {success: true, timedOut: false}
+  }
 
   core.info(
     `[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
   )
 
-  // Run GC on the mirror before unmount to reduce disk size
+  // If mirror refresh failed or timed out, don't commit
+  if (mirrorRefreshFailed || mirrorRefreshTimedOut) {
+    const reason = mirrorRefreshTimedOut ? 'timed out' : 'failed'
+    core.warning(
+      `[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`
+    )
+    shouldCommit = false
+  }
+
   if (mirrorPath) {
-    try {
-      await runMirrorGC(mirrorPath)
-    } catch {
-      core.warning('[git-mirror] Mirror GC failed, continuing with cleanup')
+    // Run GC on the mirror before fsck
+    result.gcResult = await runMirrorGC(mirrorPath)
+    if (!result.gcResult.success) {
+      core.warning(
+        '[git-mirror] GC failed or timed out, will not commit sticky disk'
+      )
+      shouldCommit = false
+    }
+
+    // Run fsck as final integrity gate
+    result.fsckResult = await runMirrorFsck(mirrorPath)
+    if (!result.fsckResult.success) {
+      core.warning(
+        '[git-mirror] Fsck failed or timed out, will not commit sticky disk'
+      )
+      shouldCommit = false
     }
   }
 
@@ -499,4 +672,5 @@ export async function cleanup(options: CleanupOptions): Promise<void> {
   })
 
   core.info('[git-mirror] Successfully committed sticky disk')
+  return result
 }
