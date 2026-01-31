@@ -388,14 +388,10 @@ export async function refreshMirror(
         {env: gitEnv, ignoreReturnCode: true}
       )
       if (result.exitCode === TIMEOUT_EXIT_CODE) {
-        throw new Error(
-          `git fetch timed out after ${timeoutSecs}s`
-        )
+        throw new Error(`git fetch timed out after ${timeoutSecs}s`)
       }
       if (result.exitCode !== 0) {
-        throw new Error(
-          `git fetch failed with exit code ${result.exitCode}`
-        )
+        throw new Error(`git fetch failed with exit code ${result.exitCode}`)
       }
     })
     core.info('[git-mirror] Mirror refresh complete')
@@ -477,9 +473,7 @@ async function runMirrorGC(
       {ignoreReturnCode: true}
     )
     if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.warning(
-        `[git-mirror] GC timed out after ${timeoutSecs}s`
-      )
+      core.warning(`[git-mirror] GC timed out after ${timeoutSecs}s`)
       return {
         success: false,
         timedOut: true,
@@ -487,9 +481,7 @@ async function runMirrorGC(
       }
     }
     if (result.exitCode !== 0) {
-      core.warning(
-        `[git-mirror] GC failed with exit code ${result.exitCode}`
-      )
+      core.warning(`[git-mirror] GC failed with exit code ${result.exitCode}`)
       return {
         success: false,
         timedOut: false,
@@ -534,9 +526,7 @@ async function runMirrorFsck(
       {ignoreReturnCode: true}
     )
     if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.warning(
-        `[git-mirror] Fsck timed out after ${timeoutSecs}s`
-      )
+      core.warning(`[git-mirror] Fsck timed out after ${timeoutSecs}s`)
       return {
         success: false,
         timedOut: true,
@@ -544,9 +534,7 @@ async function runMirrorFsck(
       }
     }
     if (result.exitCode !== 0) {
-      core.warning(
-        `[git-mirror] Fsck failed with exit code ${result.exitCode}`
-      )
+      core.warning(`[git-mirror] Fsck failed with exit code ${result.exitCode}`)
       return {
         success: false,
         timedOut: false,
