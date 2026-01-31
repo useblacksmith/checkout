@@ -493,8 +493,13 @@ function runMirrorFsck(mirrorPath_1) {
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
-        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, vmHydratedGitMirror, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
         let { shouldCommit } = options;
+        // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
+        // (due to GC/fsck/refresh failure), we must not tell the backend that
+        // hydration completed, otherwise it marks the entry as ready despite no
+        // valid disk being persisted.
+        let vmHydratedGitMirror = options.vmHydratedGitMirror;
         const result = {
             gcResult: { success: true, timedOut: false },
             fsckResult: { success: true, timedOut: false }
@@ -505,6 +510,7 @@ function cleanup(options) {
             const reason = mirrorRefreshTimedOut ? 'timed out' : 'failed';
             core.warning(`[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`);
             shouldCommit = false;
+            vmHydratedGitMirror = false;
         }
         if (mirrorPath) {
             // Run GC on the mirror before fsck
@@ -512,12 +518,14 @@ function cleanup(options) {
             if (!result.gcResult.success) {
                 core.warning('[git-mirror] GC failed or timed out, will not commit sticky disk');
                 shouldCommit = false;
+                vmHydratedGitMirror = false;
             }
             // Run fsck as final integrity gate
             result.fsckResult = yield runMirrorFsck(mirrorPath);
             if (!result.fsckResult.success) {
                 core.warning('[git-mirror] Fsck failed or timed out, will not commit sticky disk');
                 shouldCommit = false;
+                vmHydratedGitMirror = false;
             }
         }
         // Sync filesystem before unmount to ensure all writes are flushed

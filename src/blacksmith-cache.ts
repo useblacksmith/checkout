@@ -581,11 +581,15 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     repoName,
     mountPoint,
     mirrorPath,
-    vmHydratedGitMirror,
     mirrorRefreshFailed,
     mirrorRefreshTimedOut
   } = options
   let {shouldCommit} = options
+  // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
+  // (due to GC/fsck/refresh failure), we must not tell the backend that
+  // hydration completed, otherwise it marks the entry as ready despite no
+  // valid disk being persisted.
+  let vmHydratedGitMirror = options.vmHydratedGitMirror
 
   const result: CleanupResult = {
     gcResult: {success: true, timedOut: false},
@@ -603,6 +607,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       `[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`
     )
     shouldCommit = false
+    vmHydratedGitMirror = false
   }
 
   if (mirrorPath) {
@@ -613,6 +618,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
         '[git-mirror] GC failed or timed out, will not commit sticky disk'
       )
       shouldCommit = false
+      vmHydratedGitMirror = false
     }
 
     // Run fsck as final integrity gate
@@ -622,6 +628,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
         '[git-mirror] Fsck failed or timed out, will not commit sticky disk'
       )
       shouldCommit = false
+      vmHydratedGitMirror = false
     }
   }
 
