@@ -6,6 +6,7 @@ import * as path from 'path'
 import * as stateHelper from './state-helper'
 import * as blacksmithCache from './blacksmith-cache'
 import {checkPreviousStepFailures} from './step-checker'
+import {reportInternalMetric} from './internal-metrics'
 
 async function run(): Promise<void> {
   try {
@@ -48,33 +49,34 @@ async function cleanup(): Promise<void> {
   const repoUrl = stateHelper.BlacksmithCacheRepoUrl
   const verbose = stateHelper.BlacksmithCacheVerbose
   if (exposeId && stickyDiskKey) {
+    // Track mirror refresh outcome for metrics and commit decision
+    let refreshResult: blacksmithCache.OperationResult = {
+      success: true,
+      timedOut: false
+    }
+
     // Refresh the git mirror in the post step (outside the critical checkout path)
     // This updates the mirror for future runs without blocking the workflow
     if (mirrorPath && repoUrl && !performedHydration) {
-      try {
-        core.startGroup('Refreshing Blacksmith git mirror')
-        // Re-read auth token from input (don't store sensitive data in state)
-        const authToken = core.getInput('token', {required: false})
-        if (authToken) {
-          await blacksmithCache.refreshMirror(
-            mirrorPath,
-            repoUrl,
-            authToken,
-            verbose
-          )
-        } else {
-          core.warning(
-            '[git-mirror] No auth token available, skipping mirror refresh'
-          )
-        }
-        core.endGroup()
-      } catch (error) {
-        core.endGroup()
+      core.startGroup('Refreshing Blacksmith git mirror')
+      // Re-read auth token from input (don't store sensitive data in state)
+      const authToken = core.getInput('token', {required: false})
+      if (authToken) {
+        refreshResult = await blacksmithCache.refreshMirror(
+          mirrorPath,
+          repoUrl,
+          authToken,
+          verbose
+        )
+      } else {
         core.warning(
-          `[git-mirror] Failed to refresh mirror: ${(error as any)?.message ?? error}`
+          '[git-mirror] No auth token available, skipping mirror refresh'
         )
       }
+      core.endGroup()
     }
+
+    let cleanupResult: blacksmithCache.CleanupResult | undefined
 
     try {
       // Check for previous step failures by reading runner logs
@@ -117,19 +119,40 @@ async function cleanup(): Promise<void> {
         core.info('[git-mirror] No previous step failures detected')
       }
 
-      await blacksmithCache.cleanup({
+      cleanupResult = await blacksmithCache.cleanup({
         exposeId,
         stickyDiskKey,
         repoName: repoName || undefined,
         mountPoint: mountPoint || undefined,
         mirrorPath: mirrorPath || undefined,
         shouldCommit,
-        vmHydratedGitMirror
+        vmHydratedGitMirror,
+        mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
+        mirrorRefreshTimedOut: refreshResult.timedOut
       })
     } catch (error) {
       core.warning(
         `Failed to cleanup Blacksmith cache: ${(error as any)?.message ?? error}`
       )
+    }
+
+    // Report metrics for any failures/timeouts (fire-and-forget)
+    if (!refreshResult.success) {
+      await reportInternalMetric('git_mirror_refresh_failure', 1, {
+        reason: refreshResult.timedOut ? 'timeout' : 'failure'
+      })
+    }
+    if (cleanupResult) {
+      if (!cleanupResult.gcResult.success) {
+        await reportInternalMetric('git_mirror_gc_failure', 1, {
+          reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
+        })
+      }
+      if (!cleanupResult.fsckResult.success) {
+        await reportInternalMetric('git_mirror_fsck_failure', 1, {
+          reason: cleanupResult.fsckResult.timedOut ? 'timeout' : 'failure'
+        })
+      }
     }
   }
 }
