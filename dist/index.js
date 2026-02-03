@@ -62,7 +62,7 @@ const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
 const GC_TIMEOUT_SECS = 60; // 60 seconds
 const FSCK_TIMEOUT_SECS = 30; // 30 seconds
-const FLUSH_TIMEOUT_SECS = 30; // 30 seconds for durability flush
+const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
 /**
@@ -452,7 +452,7 @@ function getDeviceFromMount(mountPoint) {
             }
         }
         catch (_a) {
-            core.debug(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`);
+            core.info(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`);
         }
         try {
             const result = yield exec.getExecOutput('mount', [], {
@@ -472,7 +472,7 @@ function getDeviceFromMount(mountPoint) {
             }
         }
         catch (_b) {
-            core.debug(`[git-mirror] mount command failed for ${mountPoint}`);
+            core.info(`[git-mirror] mount command failed for ${mountPoint}`);
         }
         return null;
     });
@@ -483,14 +483,9 @@ function getDeviceFromMount(mountPoint) {
  */
 function flushBlockDevice(devicePath) {
     return __awaiter(this, void 0, void 0, function* () {
-        const enableFlush = process.env.ENABLE_DURABILITY_FLUSH !== 'false';
-        if (!enableFlush) {
-            core.debug('[git-mirror] Durability flush disabled via ENABLE_DURABILITY_FLUSH=false');
-            return;
-        }
         const deviceName = devicePath.replace('/dev/', '');
         if (!deviceName) {
-            core.warning(`[git-mirror] Could not extract device name from ${devicePath}`);
+            core.info(`[git-mirror] Could not extract device name from ${devicePath}`);
             return;
         }
         const statPath = `/sys/block/${deviceName}/stat`;
@@ -499,7 +494,7 @@ function flushBlockDevice(devicePath) {
             beforeStats = fs.readFileSync(statPath, 'utf8').trim();
         }
         catch (_a) {
-            core.debug(`[git-mirror] Could not read block device stats before flush: ${statPath}`);
+            core.info(`[git-mirror] Could not read block device stats before flush: ${statPath}`);
         }
         const startTime = Date.now();
         try {
@@ -524,7 +519,7 @@ function flushBlockDevice(devicePath) {
                 afterStats = fs.readFileSync(statPath, 'utf8').trim();
             }
             catch (_b) {
-                core.debug(`[git-mirror] Could not read block device stats after flush: ${statPath}`);
+                core.info(`[git-mirror] Could not read block device stats after flush: ${statPath}`);
             }
             core.info(`[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`);
         }
@@ -633,17 +628,17 @@ function cleanup(options) {
         catch (_b) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
-        // BLA-3202: Get device path before unmount for durability flush
+        // Get device path before unmount for durability flush
         let devicePath = null;
         if (mountPoint) {
             try {
                 devicePath = yield getDeviceFromMount(mountPoint);
                 if (devicePath) {
-                    core.debug(`[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`);
+                    core.info(`[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`);
                 }
             }
             catch (_c) {
-                core.debug(`[git-mirror] Could not determine device for ${mountPoint}`);
+                core.info(`[git-mirror] Could not determine device for ${mountPoint}`);
             }
         }
         // Unmount the sticky disk
@@ -656,13 +651,13 @@ function cleanup(options) {
                 core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
             }
         }
-        // BLA-3202: Flush block device buffers after unmount to ensure data durability
+        // Flush block device buffers after unmount to ensure data durability
         // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
         if (devicePath) {
             yield flushBlockDevice(devicePath);
         }
         else {
-            core.debug('[git-mirror] Skipping durability flush: device path not found for mount point');
+            core.info('[git-mirror] Skipping durability flush: device path not found for mount point');
         }
         // Commit the sticky disk to persist changes
         core.info(`[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
