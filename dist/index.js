@@ -62,6 +62,7 @@ const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
 const GC_TIMEOUT_SECS = 60; // 60 seconds
 const FSCK_TIMEOUT_SECS = 30; // 30 seconds
+const FLUSH_TIMEOUT_SECS = 30; // 30 seconds for durability flush
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
 /**
@@ -439,6 +440,102 @@ function runMirrorGC(mirrorPath_1) {
     });
 }
 /**
+ * Get the block device path for a mount point.
+ * Tries findmnt first, then falls back to parsing mount output.
+ */
+function getDeviceFromMount(mountPoint) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('findmnt', ['-n', '-o', 'SOURCE', mountPoint], { ignoreReturnCode: true, silent: true });
+            if (result.exitCode === 0 && result.stdout.trim()) {
+                return result.stdout.trim();
+            }
+        }
+        catch (_a) {
+            core.debug(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`);
+        }
+        try {
+            const result = yield exec.getExecOutput('mount', [], {
+                ignoreReturnCode: true,
+                silent: true
+            });
+            if (result.exitCode === 0) {
+                const lines = result.stdout.split('\n');
+                for (const line of lines) {
+                    if (line.includes(` ${mountPoint} `)) {
+                        const match = line.match(/^(\/dev\/\S+)/);
+                        if (match) {
+                            return match[1];
+                        }
+                    }
+                }
+            }
+        }
+        catch (_b) {
+            core.debug(`[git-mirror] mount command failed for ${mountPoint}`);
+        }
+        return null;
+    });
+}
+/**
+ * Flush block device buffers to ensure data durability before Ceph RBD snapshot.
+ * This is a best-effort operation - failures are logged but don't fail the cleanup.
+ */
+function flushBlockDevice(devicePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const enableFlush = process.env.ENABLE_DURABILITY_FLUSH !== 'false';
+        if (!enableFlush) {
+            core.debug('[git-mirror] Durability flush disabled via ENABLE_DURABILITY_FLUSH=false');
+            return;
+        }
+        const deviceName = devicePath.replace('/dev/', '');
+        if (!deviceName) {
+            core.warning(`[git-mirror] Could not extract device name from ${devicePath}`);
+            return;
+        }
+        const statPath = `/sys/block/${deviceName}/stat`;
+        let beforeStats = '';
+        try {
+            beforeStats = fs.readFileSync(statPath, 'utf8').trim();
+        }
+        catch (_a) {
+            core.debug(`[git-mirror] Could not read block device stats before flush: ${statPath}`);
+        }
+        const startTime = Date.now();
+        try {
+            const result = yield exec.getExecOutput('timeout', [
+                String(FLUSH_TIMEOUT_SECS),
+                'sudo',
+                'blockdev',
+                '--flushbufs',
+                devicePath
+            ], { ignoreReturnCode: true });
+            const duration = Date.now() - startTime;
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                core.warning(`[git-mirror] Flush timed out for ${devicePath} after ${FLUSH_TIMEOUT_SECS}s`);
+                return;
+            }
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: exit code ${result.exitCode}`);
+                return;
+            }
+            let afterStats = '';
+            try {
+                afterStats = fs.readFileSync(statPath, 'utf8').trim();
+            }
+            catch (_b) {
+                core.debug(`[git-mirror] Could not read block device stats after flush: ${statPath}`);
+            }
+            core.info(`[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`);
+        }
+        catch (error) {
+            const duration = Date.now() - startTime;
+            const msg = error.message || String(error);
+            core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`);
+        }
+    });
+}
+/**
  * Run git fsck on the mirror to verify object integrity.
  * This is the final integrity gate before committing the sticky disk.
  * --no-dangling: skip reporting dangling objects (expected in a mirror with pruned refs)
@@ -536,15 +633,36 @@ function cleanup(options) {
         catch (_b) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
+        // BLA-3202: Get device path before unmount for durability flush
+        let devicePath = null;
+        if (mountPoint) {
+            try {
+                devicePath = yield getDeviceFromMount(mountPoint);
+                if (devicePath) {
+                    core.debug(`[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`);
+                }
+            }
+            catch (_c) {
+                core.debug(`[git-mirror] Could not determine device for ${mountPoint}`);
+            }
+        }
         // Unmount the sticky disk
         if (mountPoint) {
             core.debug(`[git-mirror] Unmounting ${mountPoint}`);
             try {
                 yield exec.exec('sudo', ['umount', mountPoint]);
             }
-            catch (_c) {
+            catch (_d) {
                 core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
             }
+        }
+        // BLA-3202: Flush block device buffers after unmount to ensure data durability
+        // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
+        if (devicePath) {
+            yield flushBlockDevice(devicePath);
+        }
+        else {
+            core.debug('[git-mirror] Skipping durability flush: device path not found for mount point');
         }
         // Commit the sticky disk to persist changes
         core.info(`[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);

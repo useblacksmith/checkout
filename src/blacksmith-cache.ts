@@ -513,7 +513,9 @@ async function getDeviceFromMount(mountPoint: string): Promise<string | null> {
       return result.stdout.trim()
     }
   } catch {
-    core.debug(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`)
+    core.debug(
+      `[git-mirror] findmnt failed for ${mountPoint}, trying mount command`
+    )
   }
 
   try {
@@ -575,7 +577,13 @@ async function flushBlockDevice(devicePath: string): Promise<void> {
   try {
     const result = await exec.getExecOutput(
       'timeout',
-      [String(FLUSH_TIMEOUT_SECS), 'sudo', 'blockdev', '--flushbufs', devicePath],
+      [
+        String(FLUSH_TIMEOUT_SECS),
+        'sudo',
+        'blockdev',
+        '--flushbufs',
+        devicePath
+      ],
       {ignoreReturnCode: true}
     )
 
@@ -610,7 +618,9 @@ async function flushBlockDevice(devicePath: string): Promise<void> {
   } catch (error) {
     const duration = Date.now() - startTime
     const msg = (error as Error).message || String(error)
-    core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`)
+    core.warning(
+      `[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`
+    )
   }
 }
 
