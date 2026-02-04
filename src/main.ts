@@ -148,11 +148,6 @@ async function cleanup(): Promise<void> {
           reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
         })
       }
-      if (!cleanupResult.fsckResult.success) {
-        await reportInternalMetric('git_mirror_fsck_failure', 1, {
-          reason: cleanupResult.fsckResult.timedOut ? 'timeout' : 'failure'
-        })
-      }
     }
   }
 }

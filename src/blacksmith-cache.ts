@@ -13,7 +13,11 @@ const MIRROR_VERSION = 'v1'
 
 const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
 const GC_TIMEOUT_SECS = 60 // 60 seconds
-const FSCK_TIMEOUT_SECS = 30 // 30 seconds
+const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
+const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
+const UMOUNT_MAX_RETRIES = 3 // Number of unmount retry attempts
+const UMOUNT_INITIAL_DELAY_MS = 1000 // Initial delay between retries (1 second)
+const UMOUNT_BACKOFF_MULTIPLIER = 2 // Exponential backoff multiplier
 
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124
@@ -32,7 +36,6 @@ export interface OperationResult {
  */
 export interface CleanupResult {
   gcResult: OperationResult
-  fsckResult: OperationResult
 }
 
 /**
@@ -507,55 +510,118 @@ async function runMirrorGC(
 }
 
 /**
- * Run git fsck on the mirror to verify object integrity.
- * This is the final integrity gate before committing the sticky disk.
- * --no-dangling: skip reporting dangling objects (expected in a mirror with pruned refs)
- * --no-progress: suppress progress output for cleaner logs
+ * Get the block device path for a mount point.
+ * Tries findmnt first, then falls back to parsing mount output.
  */
-async function runMirrorFsck(
-  mirrorPath: string,
-  timeoutSecs: number = FSCK_TIMEOUT_SECS
-): Promise<OperationResult> {
-  core.info(
-    `[git-mirror] Running fsck integrity check (timeout: ${timeoutSecs}s)`
-  )
+async function getDeviceFromMount(mountPoint: string): Promise<string | null> {
+  try {
+    const result = await exec.getExecOutput(
+      'findmnt',
+      ['-n', '-o', 'SOURCE', mountPoint],
+      {ignoreReturnCode: true, silent: true}
+    )
+    if (result.exitCode === 0 && result.stdout.trim()) {
+      return result.stdout.trim()
+    }
+  } catch {
+    core.info(
+      `[git-mirror] findmnt failed for ${mountPoint}, trying mount command`
+    )
+  }
 
+  try {
+    const result = await exec.getExecOutput('mount', [], {
+      ignoreReturnCode: true,
+      silent: true
+    })
+    if (result.exitCode === 0) {
+      const lines = result.stdout.split('\n')
+      for (const line of lines) {
+        if (line.includes(` ${mountPoint} `)) {
+          const match = line.match(/^(\/dev\/\S+)/)
+          if (match) {
+            return match[1]
+          }
+        }
+      }
+    }
+  } catch {
+    core.info(`[git-mirror] mount command failed for ${mountPoint}`)
+  }
+
+  return null
+}
+
+/**
+ * Flush block device buffers to ensure data durability before Ceph RBD snapshot.
+ * This is a best-effort operation - failures are logged but don't fail the cleanup.
+ */
+async function flushBlockDevice(devicePath: string): Promise<void> {
+  const deviceName = devicePath.replace('/dev/', '')
+  if (!deviceName) {
+    core.info(`[git-mirror] Could not extract device name from ${devicePath}`)
+    return
+  }
+
+  const statPath = `/sys/block/${deviceName}/stat`
+
+  let beforeStats = ''
+  try {
+    beforeStats = fs.readFileSync(statPath, 'utf8').trim()
+  } catch {
+    core.info(
+      `[git-mirror] Could not read block device stats before flush: ${statPath}`
+    )
+  }
+
+  const startTime = Date.now()
   try {
     const result = await exec.getExecOutput(
       'timeout',
       [
-        String(timeoutSecs),
-        'git',
-        '-C',
-        mirrorPath,
-        'fsck',
-        '--no-dangling',
-        '--no-progress'
+        String(FLUSH_TIMEOUT_SECS),
+        'sudo',
+        'blockdev',
+        '--flushbufs',
+        devicePath
       ],
       {ignoreReturnCode: true}
     )
+
+    const duration = Date.now() - startTime
+
     if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.warning(`[git-mirror] Fsck timed out after ${timeoutSecs}s`)
-      return {
-        success: false,
-        timedOut: true,
-        error: `git fsck timed out after ${timeoutSecs}s`
-      }
+      core.warning(
+        `[git-mirror] Flush timed out for ${devicePath} after ${FLUSH_TIMEOUT_SECS}s`
+      )
+      return
     }
+
     if (result.exitCode !== 0) {
-      core.warning(`[git-mirror] Fsck failed with exit code ${result.exitCode}`)
-      return {
-        success: false,
-        timedOut: false,
-        error: `git fsck failed with exit code ${result.exitCode}`
-      }
+      core.warning(
+        `[git-mirror] Flush failed for ${devicePath} after ${duration}ms: exit code ${result.exitCode}`
+      )
+      return
     }
-    core.info('[git-mirror] Fsck passed — mirror integrity verified')
-    return {success: true, timedOut: false}
+
+    let afterStats = ''
+    try {
+      afterStats = fs.readFileSync(statPath, 'utf8').trim()
+    } catch {
+      core.info(
+        `[git-mirror] Could not read block device stats after flush: ${statPath}`
+      )
+    }
+
+    core.info(
+      `[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`
+    )
   } catch (error) {
+    const duration = Date.now() - startTime
     const msg = (error as Error).message || String(error)
-    core.warning(`[git-mirror] Fsck failed: ${msg}`)
-    return {success: false, timedOut: false, error: msg}
+    core.warning(
+      `[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`
+    )
   }
 }
 
@@ -577,11 +643,10 @@ export interface CleanupOptions {
 }
 
 /**
- * Cleanup: run GC, fsck, sync, unmount, and commit the sticky disk.
+ * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
- * Execution order: GC → fsck → sync → unmount → commit
- * Fsck runs last (before unmount) as the final integrity gate.
- * If any of mirror refresh / GC / fsck fail or time out, shouldCommit is set to false.
+ * Execution order: GC → sync → unmount (with retry) → flush → commit
+ * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
  */
 export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   const {
@@ -595,14 +660,13 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   } = options
   let {shouldCommit} = options
   // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
-  // (due to GC/fsck/refresh failure), we must not tell the backend that
+  // (due to GC/refresh failure), we must not tell the backend that
   // hydration completed, otherwise it marks the entry as ready despite no
   // valid disk being persisted.
   let vmHydratedGitMirror = options.vmHydratedGitMirror
 
   const result: CleanupResult = {
-    gcResult: {success: true, timedOut: false},
-    fsckResult: {success: true, timedOut: false}
+    gcResult: {success: true, timedOut: false}
   }
 
   core.info(
@@ -620,21 +684,11 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   }
 
   if (mirrorPath) {
-    // Run GC on the mirror before fsck
+    // Run GC on the mirror
     result.gcResult = await runMirrorGC(mirrorPath)
     if (!result.gcResult.success) {
       core.warning(
         '[git-mirror] GC failed or timed out, will not commit sticky disk'
-      )
-      shouldCommit = false
-      vmHydratedGitMirror = false
-    }
-
-    // Run fsck as final integrity gate
-    result.fsckResult = await runMirrorFsck(mirrorPath)
-    if (!result.fsckResult.success) {
-      core.warning(
-        '[git-mirror] Fsck failed or timed out, will not commit sticky disk'
       )
       shouldCommit = false
       vmHydratedGitMirror = false
@@ -649,14 +703,125 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     core.warning('[git-mirror] Failed to sync filesystem')
   }
 
-  // Unmount the sticky disk
+  // Get device path before unmount for durability flush
+  let devicePath: string | null = null
   if (mountPoint) {
-    core.debug(`[git-mirror] Unmounting ${mountPoint}`)
     try {
-      await exec.exec('sudo', ['umount', mountPoint])
+      devicePath = await getDeviceFromMount(mountPoint)
+      if (devicePath) {
+        core.info(
+          `[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`
+        )
+      }
     } catch {
-      core.warning(`[git-mirror] Failed to unmount ${mountPoint}`)
+      core.info(`[git-mirror] Could not determine device for ${mountPoint}`)
     }
+  }
+
+  // Unmount the sticky disk with retry and backoff
+  if (mountPoint) {
+    let unmountSuccess = false
+    let delayMs = UMOUNT_INITIAL_DELAY_MS
+
+    for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
+      core.info(
+        `[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`
+      )
+      try {
+        const umountResult = await exec.getExecOutput(
+          'timeout',
+          [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
+          {ignoreReturnCode: true}
+        )
+        if (umountResult.exitCode === 0) {
+          unmountSuccess = true
+          core.info(`[git-mirror] Successfully unmounted ${mountPoint}`)
+          break
+        }
+
+        if (umountResult.exitCode === TIMEOUT_EXIT_CODE) {
+          core.warning(
+            `[git-mirror] Unmount attempt ${attempt} timed out after ${UMOUNT_TIMEOUT_SECS}s`
+          )
+        } else {
+          core.warning(
+            `[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`
+          )
+        }
+
+        // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
+        core.info(`[git-mirror] Checking for processes using ${mountPoint}...`)
+        try {
+          const lsofResult = await exec.getExecOutput(
+            'timeout',
+            ['5', 'lsof', '+D', mountPoint],
+            {ignoreReturnCode: true, silent: true}
+          )
+          if (lsofResult.exitCode === TIMEOUT_EXIT_CODE) {
+            core.info(`[git-mirror] lsof timed out after 5s`)
+          } else if (lsofResult.stdout.trim()) {
+            core.warning(
+              `[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`
+            )
+          } else {
+            core.info(`[git-mirror] No processes found using ${mountPoint}`)
+          }
+        } catch {
+          // lsof may not be available, try fuser as fallback
+          try {
+            const fuserResult = await exec.getExecOutput(
+              'timeout',
+              ['5', 'fuser', '-vm', mountPoint],
+              {ignoreReturnCode: true, silent: true}
+            )
+            if (fuserResult.exitCode === TIMEOUT_EXIT_CODE) {
+              core.info(`[git-mirror] fuser timed out after 5s`)
+            } else if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
+              core.warning(
+                `[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`
+              )
+            }
+          } catch {
+            core.info(
+              `[git-mirror] Could not determine processes using ${mountPoint}`
+            )
+          }
+        }
+
+        if (attempt < UMOUNT_MAX_RETRIES) {
+          core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`)
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+          delayMs *= UMOUNT_BACKOFF_MULTIPLIER
+        }
+      } catch (error) {
+        core.warning(
+          `[git-mirror] Unmount attempt ${attempt} threw error: ${(error as Error).message}`
+        )
+        if (attempt < UMOUNT_MAX_RETRIES) {
+          core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`)
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+          delayMs *= UMOUNT_BACKOFF_MULTIPLIER
+        }
+      }
+    }
+
+    if (!unmountSuccess) {
+      core.warning(
+        `[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`
+      )
+      shouldCommit = false
+      vmHydratedGitMirror = false
+    }
+  }
+
+  // Flush block device buffers after unmount to ensure data durability
+  // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
+  if (devicePath) {
+    await flushBlockDevice(devicePath)
+  } else if (mountPoint) {
+    core.info(
+      '[git-mirror] Skipping durability flush: device path not found for mount point'
+    )
   }
 
   // Commit the sticky disk to persist changes
