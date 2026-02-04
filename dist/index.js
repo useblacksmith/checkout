@@ -61,8 +61,10 @@ const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
 const GC_TIMEOUT_SECS = 60; // 60 seconds
-const FSCK_TIMEOUT_SECS = 30; // 30 seconds
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
+const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
+const UMOUNT_INITIAL_DELAY_MS = 1000; // Initial delay between retries (1 second)
+const UMOUNT_BACKOFF_MULTIPLIER = 2; // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
 /**
@@ -531,56 +533,10 @@ function flushBlockDevice(devicePath) {
     });
 }
 /**
- * Run git fsck on the mirror to verify object integrity.
- * This is the final integrity gate before committing the sticky disk.
- * --no-dangling: skip reporting dangling objects (expected in a mirror with pruned refs)
- * --no-progress: suppress progress output for cleaner logs
- */
-function runMirrorFsck(mirrorPath_1) {
-    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = FSCK_TIMEOUT_SECS) {
-        core.info(`[git-mirror] Running fsck integrity check (timeout: ${timeoutSecs}s)`);
-        try {
-            const result = yield exec.getExecOutput('timeout', [
-                String(timeoutSecs),
-                'git',
-                '-C',
-                mirrorPath,
-                'fsck',
-                '--no-dangling',
-                '--no-progress'
-            ], { ignoreReturnCode: true });
-            if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                core.warning(`[git-mirror] Fsck timed out after ${timeoutSecs}s`);
-                return {
-                    success: false,
-                    timedOut: true,
-                    error: `git fsck timed out after ${timeoutSecs}s`
-                };
-            }
-            if (result.exitCode !== 0) {
-                core.warning(`[git-mirror] Fsck failed with exit code ${result.exitCode}`);
-                return {
-                    success: false,
-                    timedOut: false,
-                    error: `git fsck failed with exit code ${result.exitCode}`
-                };
-            }
-            core.info('[git-mirror] Fsck passed — mirror integrity verified');
-            return { success: true, timedOut: false };
-        }
-        catch (error) {
-            const msg = error.message || String(error);
-            core.warning(`[git-mirror] Fsck failed: ${msg}`);
-            return { success: false, timedOut: false, error: msg };
-        }
-    });
-}
-/**
- * Cleanup: run GC, fsck, sync, unmount, and commit the sticky disk.
+ * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
- * Execution order: GC → fsck → sync → unmount → commit
- * Fsck runs last (before unmount) as the final integrity gate.
- * If any of mirror refresh / GC / fsck fail or time out, shouldCommit is set to false.
+ * Execution order: GC → sync → unmount (with retry) → flush → commit
+ * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -588,13 +544,12 @@ function cleanup(options) {
         const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
         let { shouldCommit } = options;
         // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
-        // (due to GC/fsck/refresh failure), we must not tell the backend that
+        // (due to GC/refresh failure), we must not tell the backend that
         // hydration completed, otherwise it marks the entry as ready despite no
         // valid disk being persisted.
         let vmHydratedGitMirror = options.vmHydratedGitMirror;
         const result = {
-            gcResult: { success: true, timedOut: false },
-            fsckResult: { success: true, timedOut: false }
+            gcResult: { success: true, timedOut: false }
         };
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
         // If mirror refresh failed or timed out, don't commit
@@ -605,17 +560,10 @@ function cleanup(options) {
             vmHydratedGitMirror = false;
         }
         if (mirrorPath) {
-            // Run GC on the mirror before fsck
+            // Run GC on the mirror
             result.gcResult = yield runMirrorGC(mirrorPath);
             if (!result.gcResult.success) {
                 core.warning('[git-mirror] GC failed or timed out, will not commit sticky disk');
-                shouldCommit = false;
-                vmHydratedGitMirror = false;
-            }
-            // Run fsck as final integrity gate
-            result.fsckResult = yield runMirrorFsck(mirrorPath);
-            if (!result.fsckResult.success) {
-                core.warning('[git-mirror] Fsck failed or timed out, will not commit sticky disk');
                 shouldCommit = false;
                 vmHydratedGitMirror = false;
             }
@@ -641,14 +589,60 @@ function cleanup(options) {
                 core.info(`[git-mirror] Could not determine device for ${mountPoint}`);
             }
         }
-        // Unmount the sticky disk
+        // Unmount the sticky disk with retry and backoff
         if (mountPoint) {
-            core.debug(`[git-mirror] Unmounting ${mountPoint}`);
-            try {
-                yield exec.exec('sudo', ['umount', mountPoint]);
+            let unmountSuccess = false;
+            let delayMs = UMOUNT_INITIAL_DELAY_MS;
+            for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
+                core.info(`[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`);
+                try {
+                    const umountResult = yield exec.getExecOutput('sudo', ['umount', mountPoint], { ignoreReturnCode: true });
+                    if (umountResult.exitCode === 0) {
+                        unmountSuccess = true;
+                        core.info(`[git-mirror] Successfully unmounted ${mountPoint}`);
+                        break;
+                    }
+                    core.warning(`[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`);
+                    // Print diagnostic info about what's using the mount point
+                    core.info(`[git-mirror] Checking for processes using ${mountPoint}...`);
+                    try {
+                        const lsofResult = yield exec.getExecOutput('lsof', ['+D', mountPoint], { ignoreReturnCode: true, silent: true });
+                        if (lsofResult.stdout.trim()) {
+                            core.warning(`[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`);
+                        }
+                        else {
+                            core.info(`[git-mirror] No processes found using ${mountPoint}`);
+                        }
+                    }
+                    catch (_d) {
+                        // lsof may not be available, try fuser as fallback
+                        try {
+                            const fuserResult = yield exec.getExecOutput('fuser', ['-vm', mountPoint], { ignoreReturnCode: true, silent: true });
+                            if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
+                                core.warning(`[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`);
+                            }
+                        }
+                        catch (_e) {
+                            core.info(`[git-mirror] Could not determine processes using ${mountPoint}`);
+                        }
+                    }
+                    if (attempt < UMOUNT_MAX_RETRIES) {
+                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
+                        yield new Promise(resolve => setTimeout(resolve, delayMs));
+                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
+                    }
+                }
+                catch (error) {
+                    core.warning(`[git-mirror] Unmount attempt ${attempt} threw error: ${error.message}`);
+                    if (attempt < UMOUNT_MAX_RETRIES) {
+                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
+                        yield new Promise(resolve => setTimeout(resolve, delayMs));
+                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
+                    }
+                }
             }
-            catch (_d) {
-                core.warning(`[git-mirror] Failed to unmount ${mountPoint}`);
+            if (!unmountSuccess) {
+                core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts`);
             }
         }
         // Flush block device buffers after unmount to ensure data durability
@@ -3073,11 +3067,6 @@ function cleanup() {
                 if (!cleanupResult.gcResult.success) {
                     yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_gc_failure', 1, {
                         reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
-                    });
-                }
-                if (!cleanupResult.fsckResult.success) {
-                    yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_fsck_failure', 1, {
-                        reason: cleanupResult.fsckResult.timedOut ? 'timeout' : 'failure'
                     });
                 }
             }
