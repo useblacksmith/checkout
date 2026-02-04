@@ -1,0 +1,36 @@
+name: Release v1
+run-name: Bump v1.0.0-beta and v1 to main
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Git config
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update v1.0.0-beta tag
+        run: |
+          git tag -f v1.0.0-beta HEAD
+          git push origin v1.0.0-beta --force
+
+      - name: Update v1 tag
+        run: |
+          git tag -f v1 HEAD
+          git push origin v1 --force
+
+      - name: Summary
+        run: |
+          echo "### Tags updated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- \`v1.0.0-beta\` → \`$(git rev-parse --short HEAD)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`v1\` → \`$(git rev-parse --short HEAD)\`" >> $GITHUB_STEP_SUMMARY
