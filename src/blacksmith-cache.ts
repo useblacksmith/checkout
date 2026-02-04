@@ -376,22 +376,31 @@ export async function refreshMirror(
         mirrorPath,
         'fetch',
         '--prune',
-        '--progress',
         'origin'
       ]
       if (verbose) {
-        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+        fetchArgs.splice(
+          fetchArgs.indexOf('origin'),
+          0,
+          '--progress',
+          '--verbose'
+        )
       }
       const result = await exec.getExecOutput(
         'timeout',
         [String(timeoutSecs), 'git', ...fetchArgs],
-        {env: gitEnv, ignoreReturnCode: true}
+        {env: gitEnv, ignoreReturnCode: true, silent: !verbose}
       )
       if (result.exitCode === TIMEOUT_EXIT_CODE) {
         throw new Error(`git fetch timed out after ${timeoutSecs}s`)
       }
       if (result.exitCode !== 0) {
-        throw new Error(`git fetch failed with exit code ${result.exitCode}`)
+        // Include stderr in error message so failure details are visible even when silent
+        const stderr = result.stderr.trim()
+        const details = stderr ? `: ${stderr}` : ''
+        throw new Error(
+          `git fetch failed with exit code ${result.exitCode}${details}`
+        )
       }
     })
     core.info('[git-mirror] Mirror refresh complete')
