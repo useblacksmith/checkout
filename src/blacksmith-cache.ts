@@ -379,7 +379,12 @@ export async function refreshMirror(
         'origin'
       ]
       if (verbose) {
-        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose')
+        fetchArgs.splice(
+          fetchArgs.indexOf('origin'),
+          0,
+          '--progress',
+          '--verbose'
+        )
       }
       const result = await exec.getExecOutput(
         'timeout',
