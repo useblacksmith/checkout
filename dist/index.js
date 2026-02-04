@@ -346,7 +346,10 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                     throw new Error(`git fetch timed out after ${timeoutSecs}s`);
                 }
                 if (result.exitCode !== 0) {
-                    throw new Error(`git fetch failed with exit code ${result.exitCode}`);
+                    // Include stderr in error message so failure details are visible even when silent
+                    const stderr = result.stderr.trim();
+                    const details = stderr ? `: ${stderr}` : '';
+                    throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
                 }
             }));
             core.info('[git-mirror] Mirror refresh complete');
