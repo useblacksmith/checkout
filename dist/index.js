@@ -336,13 +336,12 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                     mirrorPath,
                     'fetch',
                     '--prune',
-                    '--progress',
                     'origin'
                 ];
                 if (verbose) {
-                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose');
+                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
                 }
-                const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true });
+                const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true, silent: !verbose });
                 if (result.exitCode === TIMEOUT_EXIT_CODE) {
                     throw new Error(`git fetch timed out after ${timeoutSecs}s`);
                 }

@@ -376,16 +376,15 @@ export async function refreshMirror(
         mirrorPath,
         'fetch',
         '--prune',
-        '--progress',
         'origin'
       ]
       if (verbose) {
-        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--verbose')
+        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose')
       }
       const result = await exec.getExecOutput(
         'timeout',
         [String(timeoutSecs), 'git', ...fetchArgs],
-        {env: gitEnv, ignoreReturnCode: true}
+        {env: gitEnv, ignoreReturnCode: true, silent: !verbose}
       )
       if (result.exitCode === TIMEOUT_EXIT_CODE) {
         throw new Error(`git fetch timed out after ${timeoutSecs}s`)
