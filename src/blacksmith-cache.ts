@@ -14,6 +14,7 @@ const MIRROR_VERSION = 'v1'
 const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
 const GC_TIMEOUT_SECS = 60 // 60 seconds
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
+const UMOUNT_TIMEOUT_SECS = 30 // 30 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3 // Number of unmount retry attempts
 const UMOUNT_INITIAL_DELAY_MS = 1000 // Initial delay between retries (1 second)
 const UMOUNT_BACKOFF_MULTIPLIER = 2 // Exponential backoff multiplier
@@ -719,8 +720,8 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       )
       try {
         const umountResult = await exec.getExecOutput(
-          'sudo',
-          ['umount', mountPoint],
+          'timeout',
+          [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
           {ignoreReturnCode: true}
         )
         if (umountResult.exitCode === 0) {
@@ -729,9 +730,15 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
           break
         }
 
-        core.warning(
-          `[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`
-        )
+        if (umountResult.exitCode === TIMEOUT_EXIT_CODE) {
+          core.warning(
+            `[git-mirror] Unmount attempt ${attempt} timed out after ${UMOUNT_TIMEOUT_SECS}s`
+          )
+        } else {
+          core.warning(
+            `[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`
+          )
+        }
 
         // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
         core.info(`[git-mirror] Checking for processes using ${mountPoint}...`)
@@ -802,7 +809,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
   if (devicePath) {
     await flushBlockDevice(devicePath)
-  } else {
+  } else if (mountPoint) {
     core.info(
       '[git-mirror] Skipping durability flush: device path not found for mount point'
     )
