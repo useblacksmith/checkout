@@ -787,8 +787,10 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
 
     if (!unmountSuccess) {
       core.warning(
-        `[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts`
+        `[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`
       )
+      shouldCommit = false
+      vmHydratedGitMirror = false
     }
   }
 

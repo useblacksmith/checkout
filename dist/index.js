@@ -642,7 +642,9 @@ function cleanup(options) {
                 }
             }
             if (!unmountSuccess) {
-                core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts`);
+                core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`);
+                shouldCommit = false;
+                vmHydratedGitMirror = false;
             }
         }
         // Flush block device buffers after unmount to ensure data durability
