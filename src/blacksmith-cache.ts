@@ -733,15 +733,17 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
           `[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`
         )
 
-        // Print diagnostic info about what's using the mount point
+        // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
         core.info(`[git-mirror] Checking for processes using ${mountPoint}...`)
         try {
           const lsofResult = await exec.getExecOutput(
-            'lsof',
-            ['+D', mountPoint],
+            'timeout',
+            ['5', 'lsof', '+D', mountPoint],
             {ignoreReturnCode: true, silent: true}
           )
-          if (lsofResult.stdout.trim()) {
+          if (lsofResult.exitCode === TIMEOUT_EXIT_CODE) {
+            core.info(`[git-mirror] lsof timed out after 5s`)
+          } else if (lsofResult.stdout.trim()) {
             core.warning(
               `[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`
             )
@@ -752,11 +754,13 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
           // lsof may not be available, try fuser as fallback
           try {
             const fuserResult = await exec.getExecOutput(
-              'fuser',
-              ['-vm', mountPoint],
+              'timeout',
+              ['5', 'fuser', '-vm', mountPoint],
               {ignoreReturnCode: true, silent: true}
             )
-            if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
+            if (fuserResult.exitCode === TIMEOUT_EXIT_CODE) {
+              core.info(`[git-mirror] fuser timed out after 5s`)
+            } else if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
               core.warning(
                 `[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`
               )
