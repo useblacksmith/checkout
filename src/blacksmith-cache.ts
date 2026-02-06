@@ -12,7 +12,7 @@ const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
 const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
-const GC_TIMEOUT_SECS = 60 // 60 seconds
+const GC_TIMEOUT_SECS = 120 // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3 // Number of unmount retry attempts
@@ -479,9 +479,22 @@ async function runMirrorGC(
   try {
     // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
     // This is much faster than a full gc when not needed
+    // gc.autoDetach=false: prevent git from forking a background daemon for GC.
+    // Without this, the parent `git gc --auto` returns immediately while the
+    // daemonized child keeps running with cwd and mmap'd pack files on the
+    // mirror mount, causing the subsequent `umount` to fail with EBUSY.
     const result = await exec.getExecOutput(
       'timeout',
-      [String(timeoutSecs), 'git', '-C', mirrorPath, 'gc', '--auto'],
+      [
+        String(timeoutSecs),
+        'git',
+        '-c',
+        'gc.autoDetach=false',
+        '-C',
+        mirrorPath,
+        'gc',
+        '--auto'
+      ],
       {ignoreReturnCode: true}
     )
     if (result.exitCode === TIMEOUT_EXIT_CODE) {
