@@ -322,9 +322,12 @@ export async function ensureMirror(
       )
       await fs.promises.rm(mirrorPath, {recursive: true, force: true})
     }
+    // gc.auto=0: disable auto-gc during clone (see comment in refreshMirror)
     const cloneArgs = [
       '-c',
       `${configKey}=${configValue}`,
+      '-c',
+      'gc.auto=0',
       'clone',
       '--mirror',
       '--progress',
@@ -372,9 +375,16 @@ export async function refreshMirror(
     const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
     const gitEnv = buildGitEnv(verbose)
     await retryHelper.execute(async () => {
+      // gc.auto=0: disable git's internal auto-gc that porcelain commands like
+      // fetch run after completing. Without this, fetch can spawn a background
+      // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
+      // files on the mirror mount, causing the subsequent umount to fail with
+      // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
       const fetchArgs = [
         '-c',
         `${configKey}=${configValue}`,
+        '-c',
+        'gc.auto=0',
         '-C',
         mirrorPath,
         'fetch',

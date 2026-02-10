@@ -294,9 +294,12 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                 core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
                 yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
             }
+            // gc.auto=0: disable auto-gc during clone (see comment in refreshMirror)
             const cloneArgs = [
                 '-c',
                 `${configKey}=${configValue}`,
+                '-c',
+                'gc.auto=0',
                 'clone',
                 '--mirror',
                 '--progress',
@@ -333,9 +336,16 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
             const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
             const gitEnv = buildGitEnv(verbose);
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                // gc.auto=0: disable git's internal auto-gc that porcelain commands like
+                // fetch run after completing. Without this, fetch can spawn a background
+                // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
+                // files on the mirror mount, causing the subsequent umount to fail with
+                // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
                 const fetchArgs = [
                     '-c',
                     `${configKey}=${configValue}`,
+                    '-c',
+                    'gc.auto=0',
                     '-C',
                     mirrorPath,
                     'fetch',
