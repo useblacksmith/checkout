@@ -175,7 +175,7 @@ function setupCache(owner, repo) {
             if (error instanceof connect_1.ConnectError && error.code === connect_1.Code.Aborted) {
                 const hydrationMessage = error.message || 'Initial mirror clone is running';
                 core.warning(`[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`);
-                core.warning('[git-mirror] Falling back to standard checkout. Cache will be available once hydration completes.');
+                core.warning('[git-mirror] No sticky disk will be mounted for this run; checkout will clone directly from GitHub onto the runner disk (no mirror cache). The mirror cache will be available on subsequent runs once hydration completes.');
                 return {
                     exposeId: '',
                     stickyDiskKey,

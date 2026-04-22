@@ -173,7 +173,7 @@ export async function setupCache(
         `[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`
       )
       core.warning(
-        '[git-mirror] Falling back to standard checkout. Cache will be available once hydration completes.'
+        '[git-mirror] No sticky disk will be mounted for this run; checkout will clone directly from GitHub onto the runner disk (no mirror cache). The mirror cache will be available on subsequent runs once hydration completes.'
       )
       return {
         exposeId: '',
