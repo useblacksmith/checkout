@@ -106,9 +106,13 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // Save state for POST action
     stateHelper.setRepositoryPath(settings.repositoryPath)
 
-    // Setup Blacksmith git mirror cache if in Blacksmith environment
+    // Setup Blacksmith git mirror cache if in Blacksmith environment.
+    // shouldUseBlacksmithCache() honors the BLACKSMITH_BYPASS_CHECKOUT
+    // kill switch (driven by the per-installation flag in the control plane),
+    // so flipping that flag disables the entire Blacksmith code path here
+    // and in the post step.
     let cacheInfo: blacksmithCache.CacheInfo | null = null
-    if (blacksmithCache.isBlacksmithEnvironment()) {
+    if (blacksmithCache.shouldUseBlacksmithCache()) {
       try {
         core.startGroup('Setting up Blacksmith git mirror cache')
         cacheInfo = await blacksmithCache.setupCache(

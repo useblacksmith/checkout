@@ -72,6 +72,27 @@ export function isBlacksmithEnvironment(): boolean {
 }
 
 /**
+ * Control plane short circuit: when an installation has the
+ * `bypass_blacksmith_checkout` flag flipped on, the agent exports
+ * BLACKSMITH_BYPASS_CHECKOUT=true into the runner environment. We
+ * use that as a kill switch to skip every Blacksmith-specific code path
+ * (mirror cache setup, alternates, dissociate, post-step commit). The
+ * action then behaves identically to upstream actions/checkout.
+ */
+export function shouldUseBlacksmithCache(): boolean {
+  if (!isBlacksmithEnvironment()) {
+    return false
+  }
+  if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
+    core.info(
+      '[blacksmith] BLACKSMITH_BYPASS_CHECKOUT=true — skipping Blacksmith git mirror cache and falling back to actions/checkout behavior'
+    )
+    return false
+  }
+  return true
+}
+
+/**
  * Get the path where the bare git mirror will be stored.
  * Uses owner-repo.git filename to maintain backward compatibility with existing sticky disks.
  */
