@@ -132,6 +132,49 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('shouldUseBlacksmithCache', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {...originalEnv}
+    })
+
+    afterAll(() => {
+      process.env = originalEnv
+    })
+
+    it('returns true when in Blacksmith env and kill switch is unset', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      delete process.env['BLACKSMITH_BYPASS_CHECKOUT']
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('returns false outside of a Blacksmith env regardless of kill switch', () => {
+      delete process.env['BLACKSMITH_VM_ID']
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns false when BLACKSMITH_BYPASS_CHECKOUT=true (control-plane kill switch)', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns true when BLACKSMITH_BYPASS_CHECKOUT is any value other than "true"', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'false'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = '1'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = ''
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+  })
+
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:

@@ -41,6 +41,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getMountPoint = getMountPoint;
 exports.isBlacksmithEnvironment = isBlacksmithEnvironment;
+exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
@@ -82,6 +83,24 @@ function getMountPoint(owner, repo) {
  */
 function isBlacksmithEnvironment() {
     return !!process.env.BLACKSMITH_VM_ID;
+}
+/**
+ * Control plane short circuit: when an installation has the
+ * `bypass_blacksmith_checkout` flag flipped on, the agent exports
+ * BLACKSMITH_BYPASS_CHECKOUT=true into the runner environment. We
+ * use that as a kill switch to skip every Blacksmith-specific code path
+ * (mirror cache setup, alternates, dissociate, post-step commit). The
+ * action then behaves identically to upstream actions/checkout.
+ */
+function shouldUseBlacksmithCache() {
+    if (!isBlacksmithEnvironment()) {
+        return false;
+    }
+    if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
+        core.info('[blacksmith] BLACKSMITH_BYPASS_CHECKOUT=true — skipping Blacksmith git mirror cache and falling back to actions/checkout behavior');
+        return false;
+    }
+    return true;
 }
 /**
  * Get the path where the bare git mirror will be stored.
@@ -2186,9 +2205,13 @@ function getSource(settings) {
             }
             // Save state for POST action
             stateHelper.setRepositoryPath(settings.repositoryPath);
-            // Setup Blacksmith git mirror cache if in Blacksmith environment
+            // Setup Blacksmith git mirror cache if in Blacksmith environment.
+            // shouldUseBlacksmithCache() honors the BLACKSMITH_BYPASS_CHECKOUT
+            // kill switch (driven by the per-installation flag in the control plane),
+            // so flipping that flag disables the entire Blacksmith code path here
+            // and in the post step.
             let cacheInfo = null;
-            if (blacksmithCache.isBlacksmithEnvironment()) {
+            if (blacksmithCache.shouldUseBlacksmithCache()) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
