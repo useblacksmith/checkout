@@ -37,7 +37,7 @@ jobs:
   test:
     strategy:
       matrix:
-        runs-on: [ubuntu-latest, macos-latest, blacksmith-4vcpu-windows-2025]
+        runs-on: [blacksmith-4vcpu-ubuntu-2404, macos-latest, blacksmith-4vcpu-windows-2025]
     runs-on: ${{ matrix.runs-on }}
 
     steps:
