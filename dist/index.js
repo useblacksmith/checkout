@@ -124,12 +124,13 @@ function createBlacksmithClient() {
 /**
  * Format the block device with ext4 if not already formatted
  */
-function maybeFormatDevice(device) {
+function maybeFormatDevice(device, signal) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Check if already formatted
+        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
         const result = yield exec.getExecOutput('sudo', ['blkid', device], {
             ignoreReturnCode: true
         });
+        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
         if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
             core.debug(`Device ${device} is already formatted`);
             // Resize to use full block device
@@ -159,14 +160,14 @@ function maybeFormatDevice(device) {
  * Returns CacheInfo with hydrationInProgress=true if another job is hydrating,
  * allowing the caller to fall back to regular checkout.
  */
-function setupCache(owner, repo) {
+function setupCache(owner, repo, signal) {
     return __awaiter(this, void 0, void 0, function* () {
         const client = createBlacksmithClient();
         const stickyDiskKey = `${owner}-${repo}`;
         // Test connection
         core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`);
         try {
-            yield client.up({});
+            yield client.up({}, {signal});
             core.debug('[git-mirror] Successfully connected to Blacksmith agent');
         }
         catch (error) {
@@ -187,7 +188,7 @@ function setupCache(owner, repo) {
                 vmId: process.env.BLACKSMITH_VM_ID || '',
                 repoName: repoName,
                 stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-            });
+            }, {signal});
         }
         catch (error) {
             // Check if this is a gRPC Aborted error indicating hydration in progress
@@ -219,8 +220,9 @@ function setupCache(owner, repo) {
             throw new Error('No exposeId found in sticky disk response');
         }
         core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
-        // Format if needed
-        yield maybeFormatDevice(device);
+        // Format if needed — checks signal before mkfs.ext4
+        yield maybeFormatDevice(device, signal);
+        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
         // Mount the device at a unique path for this repository
         const mountPoint = getMountPoint(owner, repo);
         yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
@@ -2212,13 +2214,16 @@ function getSource(settings) {
             if (blacksmithCache.shouldUseBlacksmithCache()) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
-                    const setupCachePromise = blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
-                    cacheInfo = yield (settings.cacheTimeoutSeconds > 0
-                        ? Promise.race([
-                            setupCachePromise,
-                            new Promise((_, reject) => setTimeout(() => reject(new Error(`[git-mirror] setupCache timed out after ${settings.cacheTimeoutSeconds}s — falling back to standard checkout`)), settings.cacheTimeoutSeconds * 1000))
-                        ])
-                        : setupCachePromise);
+                    const controller = new AbortController();
+                    const timeoutId = settings.cacheTimeoutSeconds > 0
+                        ? setTimeout(() => controller.abort(new Error(`[git-mirror] setupCache timed out after ${settings.cacheTimeoutSeconds}s — falling back to standard checkout`)), settings.cacheTimeoutSeconds * 1000)
+                        : null;
+                    try {
+                        cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName, controller.signal);
+                    }
+                    finally {
+                        if (timeoutId !== null) clearTimeout(timeoutId);
+                    }
                     // Check if hydration is in progress - another job is doing the initial git clone --mirror
                     if (cacheInfo.hydrationInProgress) {
                         // Warning already logged by setupCache, just fall back to standard checkout

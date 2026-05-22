@@ -117,15 +117,20 @@ function createBlacksmithClient() {
 /**
  * Format the block device with ext4 if not already formatted
  */
-async function maybeFormatDevice(device: string): Promise<void> {
-  // Check if already formatted
+async function maybeFormatDevice(
+  device: string,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted()
+
   const result = await exec.getExecOutput('sudo', ['blkid', device], {
     ignoreReturnCode: true
   })
 
+  signal?.throwIfAborted()
+
   if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
     core.debug(`Device ${device} is already formatted`)
-    // Resize to use full block device
     try {
       await exec.exec('sudo', ['resize2fs', '-f', device])
       core.debug(`Resized filesystem on ${device}`)
@@ -154,7 +159,8 @@ async function maybeFormatDevice(device: string): Promise<void> {
  */
 export async function setupCache(
   owner: string,
-  repo: string
+  repo: string,
+  signal?: AbortSignal
 ): Promise<CacheInfo> {
   const client = createBlacksmithClient()
   const stickyDiskKey = `${owner}-${repo}`
@@ -162,7 +168,7 @@ export async function setupCache(
   // Test connection
   core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`)
   try {
-    await client.up({})
+    await client.up({}, {signal})
     core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
     throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
@@ -184,7 +190,7 @@ export async function setupCache(
       vmId: process.env.BLACKSMITH_VM_ID || '',
       repoName: repoName,
       stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-    })
+    }, {signal})
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
@@ -227,8 +233,10 @@ export async function setupCache(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
 
-  // Format if needed
-  await maybeFormatDevice(device)
+  // Format if needed — checks signal before mkfs.ext4
+  await maybeFormatDevice(device, signal)
+
+  signal?.throwIfAborted()
 
   // Mount the device at a unique path for this repository
   const mountPoint = getMountPoint(owner, repo)
