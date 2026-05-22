@@ -60,7 +60,7 @@ const retryHelper = __importStar(__nccwpck_require__(2155));
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
-const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
+const REFRESH_TIMEOUT_SECS = 90; // 90 seconds, single attempt
 const GC_TIMEOUT_SECS = 120; // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
@@ -350,41 +350,39 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
             core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`);
             return { success: true, timedOut: false };
         }
-        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`);
+        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s)`);
         try {
             const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
             const gitEnv = buildGitEnv(verbose);
-            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                // gc.auto=0: disable git's internal auto-gc that porcelain commands like
-                // fetch run after completing. Without this, fetch can spawn a background
-                // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
-                // files on the mirror mount, causing the subsequent umount to fail with
-                // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
-                const fetchArgs = [
-                    '-c',
-                    `${configKey}=${configValue}`,
-                    '-c',
-                    'gc.auto=0',
-                    '-C',
-                    mirrorPath,
-                    'fetch',
-                    '--prune',
-                    'origin'
-                ];
-                if (verbose) {
-                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
-                }
-                const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true, silent: !verbose });
-                if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                    throw new Error(`git fetch timed out after ${timeoutSecs}s`);
-                }
-                if (result.exitCode !== 0) {
-                    // Include stderr in error message so failure details are visible even when silent
-                    const stderr = result.stderr.trim();
-                    const details = stderr ? `: ${stderr}` : '';
-                    throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
-                }
-            }));
+            // gc.auto=0: disable git's internal auto-gc that porcelain commands like
+            // fetch run after completing. Without this, fetch can spawn a background
+            // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
+            // files on the mirror mount, causing the subsequent umount to fail with
+            // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
+            const fetchArgs = [
+                '-c',
+                `${configKey}=${configValue}`,
+                '-c',
+                'gc.auto=0',
+                '-C',
+                mirrorPath,
+                'fetch',
+                '--prune',
+                'origin'
+            ];
+            if (verbose) {
+                fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
+            }
+            const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true, silent: !verbose });
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                throw new Error(`git fetch timed out after ${timeoutSecs}s`);
+            }
+            if (result.exitCode !== 0) {
+                // Include stderr in error message so failure details are visible even when silent
+                const stderr = result.stderr.trim();
+                const details = stderr ? `: ${stderr}` : '';
+                throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
+            }
             core.info('[git-mirror] Mirror refresh complete');
             return { success: true, timedOut: false };
         }
@@ -2214,7 +2212,13 @@ function getSource(settings) {
             if (blacksmithCache.shouldUseBlacksmithCache()) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
-                    cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
+                    const setupCachePromise = blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
+                    cacheInfo = yield (settings.cacheTimeoutSeconds > 0
+                        ? Promise.race([
+                            setupCachePromise,
+                            new Promise((_, reject) => setTimeout(() => reject(new Error(`[git-mirror] setupCache timed out after ${settings.cacheTimeoutSeconds}s — falling back to standard checkout`)), settings.cacheTimeoutSeconds * 1000))
+                        ])
+                        : setupCachePromise);
                     // Check if hydration is in progress - another job is doing the initial git clone --mirror
                     if (cacheInfo.hydrationInProgress) {
                         // Warning already logged by setupCache, just fall back to standard checkout
@@ -2861,6 +2865,12 @@ function getInputs() {
         result.verbose =
             (core.getInput('verbose') || 'false').toUpperCase() === 'TRUE';
         core.debug(`verbose = ${result.verbose}`);
+        // Timeout for setupCache (sticky disk gRPC + mount); 0 disables
+        result.cacheTimeoutSeconds = parseInt(core.getInput('cache-timeout-seconds') || '180', 10);
+        if (isNaN(result.cacheTimeoutSeconds) || result.cacheTimeoutSeconds < 0) {
+            result.cacheTimeoutSeconds = 180;
+        }
+        core.debug(`cacheTimeoutSeconds = ${result.cacheTimeoutSeconds}`);
         return result;
     });
 }
