@@ -131,4 +131,10 @@ export interface IGitSourceSettings {
    * When true, outputs GIT_TRACE and GIT_CURL_VERBOSE for debugging.
    */
   verbose: boolean
+
+  /**
+   * Timeout in seconds for setupCache (gRPC + sticky disk mount).
+   * If exceeded, falls back to standard checkout. 0 disables the timeout.
+   */
+  cacheTimeoutSeconds: number
 }

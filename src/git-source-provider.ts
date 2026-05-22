@@ -115,10 +115,26 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     if (blacksmithCache.shouldUseBlacksmithCache()) {
       try {
         core.startGroup('Setting up Blacksmith git mirror cache')
-        cacheInfo = await blacksmithCache.setupCache(
+        const setupCachePromise = blacksmithCache.setupCache(
           settings.repositoryOwner,
           settings.repositoryName
         )
+        cacheInfo = await (settings.cacheTimeoutSeconds > 0
+          ? Promise.race([
+              setupCachePromise,
+              new Promise<never>((_, reject) =>
+                setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        `[git-mirror] setupCache timed out after ${settings.cacheTimeoutSeconds}s — falling back to standard checkout`
+                      )
+                    ),
+                  settings.cacheTimeoutSeconds * 1000
+                )
+              )
+            ])
+          : setupCachePromise)
 
         // Check if hydration is in progress - another job is doing the initial git clone --mirror
         if (cacheInfo.hydrationInProgress) {

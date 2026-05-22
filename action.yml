@@ -108,6 +108,11 @@ inputs:
       Enable verbose output for git mirror operations. Outputs GIT_TRACE and GIT_CURL_VERBOSE
       for debugging connection and performance issues.
     default: false
+  cache-timeout-seconds:
+    description: >
+      Timeout in seconds for the sticky disk setup (gRPC + mount). If exceeded, falls back
+      to standard checkout. Set to 0 to disable the timeout.
+    default: '180'
 outputs:
   ref:
     description: 'The branch, tag or SHA that was checked out'

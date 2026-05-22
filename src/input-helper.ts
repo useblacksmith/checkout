@@ -171,5 +171,15 @@ export async function getInputs(): Promise<IGitSourceSettings> {
     (core.getInput('verbose') || 'false').toUpperCase() === 'TRUE'
   core.debug(`verbose = ${result.verbose}`)
 
+  // Timeout for setupCache (sticky disk gRPC + mount); 0 disables
+  result.cacheTimeoutSeconds = parseInt(
+    core.getInput('cache-timeout-seconds') || '180',
+    10
+  )
+  if (isNaN(result.cacheTimeoutSeconds) || result.cacheTimeoutSeconds < 0) {
+    result.cacheTimeoutSeconds = 180
+  }
+  core.debug(`cacheTimeoutSeconds = ${result.cacheTimeoutSeconds}`)
+
   return result
 }
