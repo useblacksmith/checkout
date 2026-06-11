@@ -1559,7 +1559,15 @@ class GitCommandManager {
     }
     fetch(refSpec, options) {
         return __awaiter(this, void 0, void 0, function* () {
-            const args = ['-c', 'protocol.version=2', 'fetch'];
+            const args = [
+                '-c',
+                'protocol.version=2',
+                '-c',
+                'http.lowSpeedLimit=1000',
+                '-c',
+                'http.lowSpeedTime=15',
+                'fetch'
+            ];
             if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
                 args.push('--no-tags');
             }
@@ -1581,7 +1589,8 @@ class GitCommandManager {
                 args.push(arg);
             }
             const that = this;
-            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+            const fetchRetryHelper = new retryHelper.RetryHelper(3, 1, 5);
+            yield fetchRetryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
                 yield that.execGit(args);
             }));
         });
