@@ -37,7 +37,7 @@ jobs:
   test:
     strategy:
       matrix:
-        runs-on: [blacksmith-4vcpu-ubuntu-2404, macos-latest, blacksmith-4vcpu-windows-2025]
+        runs-on: [ubuntu-latest, macos-latest, blacksmith-4vcpu-windows-2025]
     runs-on: ${{ matrix.runs-on }}
 
     steps:
@@ -95,7 +95,6 @@ jobs:
           path: fetch-filter
 
       - name: Verify fetch filter
-        shell: bash
         run: __test__/verify-fetch-filter.sh
 
       # Sparse checkout
@@ -109,7 +108,6 @@ jobs:
           path: sparse-checkout
 
       - name: Verify sparse checkout
-        shell: bash
         run: __test__/verify-sparse-checkout.sh
 
       # Disabled sparse checkout in existing checkout
@@ -134,7 +132,6 @@ jobs:
           path: sparse-checkout-non-cone-mode
 
       - name: Verify sparse checkout (non-cone mode)
-        shell: bash
         run: __test__/verify-sparse-checkout-non-cone-mode.sh
 
       # LFS
@@ -157,7 +154,6 @@ jobs:
           ref: test-data/v2/submodule-ssh-url
           path: submodules-false
       - name: Verify submodules false
-        shell: bash
         run: __test__/verify-submodules-false.sh
 
       # Submodules one level
@@ -169,7 +165,6 @@ jobs:
           path: submodules-true
           submodules: true
       - name: Verify submodules true
-        shell: bash
         run: __test__/verify-submodules-true.sh
 
       # Submodules recursive
@@ -181,7 +176,6 @@ jobs:
           path: submodules-recursive
           submodules: recursive
       - name: Verify submodules recursive
-        shell: bash
         run: __test__/verify-submodules-recursive.sh
 
       # Basic checkout using REST API
@@ -205,7 +199,6 @@ jobs:
           ref: test-data/v2/basic
           path: basic
       - name: Verify basic
-        shell: bash
         run: __test__/verify-basic.sh --archive
 
   test-proxy:
