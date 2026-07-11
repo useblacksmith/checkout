@@ -6,6 +6,7 @@ import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
 import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
 import * as retryHelper from './retry-helper'
+import {isRunningInContainer} from './container-detector'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
 const MOUNT_BASE = '/blacksmith-git-mirror'
@@ -86,6 +87,17 @@ export function shouldUseBlacksmithCache(): boolean {
   if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
     core.info(
       '[blacksmith] BLACKSMITH_BYPASS_CHECKOUT=true — skipping Blacksmith git mirror cache and falling back to actions/checkout behavior'
+    )
+    return false
+  }
+  // Container jobs cannot mount the sticky disk block device (it is only
+  // visible to the runner VM, not inside the container), so skip the git
+  // mirror cache entirely before requesting a sticky disk. Requesting one
+  // and failing would leave the git mirror hydration lock held, causing
+  // spurious 409s for concurrent jobs on the same repository.
+  if (isRunningInContainer()) {
+    core.info(
+      '[blacksmith] Running inside a container — the git mirror sticky disk cannot be mounted here, falling back to actions/checkout behavior'
     )
     return false
   }
