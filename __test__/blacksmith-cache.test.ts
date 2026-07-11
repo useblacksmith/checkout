@@ -16,7 +16,16 @@ jest.mock(
   })
 )
 
+jest.mock('../src/container-detector', () => ({
+  isRunningInContainer: jest.fn(() => false)
+}))
+
 import * as blacksmithCache from '../src/blacksmith-cache'
+import {isRunningInContainer} from '../src/container-detector'
+
+const mockIsRunningInContainer = isRunningInContainer as jest.MockedFunction<
+  typeof isRunningInContainer
+>
 
 describe('blacksmith-cache tests', () => {
   describe('getMountPoint', () => {
@@ -138,6 +147,7 @@ describe('blacksmith-cache tests', () => {
     beforeEach(() => {
       jest.resetModules()
       process.env = {...originalEnv}
+      mockIsRunningInContainer.mockReturnValue(false)
     })
 
     afterAll(() => {
@@ -172,6 +182,13 @@ describe('blacksmith-cache tests', () => {
 
       process.env['BLACKSMITH_BYPASS_CHECKOUT'] = ''
       expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('returns false when running inside a container', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      delete process.env['BLACKSMITH_BYPASS_CHECKOUT']
+      mockIsRunningInContainer.mockReturnValue(true)
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
     })
   })
 

@@ -57,6 +57,7 @@ const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
 const retryHelper = __importStar(__nccwpck_require__(2155));
+const container_detector_1 = __nccwpck_require__(6424);
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
@@ -98,6 +99,15 @@ function shouldUseBlacksmithCache() {
     }
     if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
         core.info('[blacksmith] BLACKSMITH_BYPASS_CHECKOUT=true — skipping Blacksmith git mirror cache and falling back to actions/checkout behavior');
+        return false;
+    }
+    // Container jobs cannot mount the sticky disk block device (it is only
+    // visible to the runner VM, not inside the container), so skip the git
+    // mirror cache entirely before requesting a sticky disk. Requesting one
+    // and failing would leave the git mirror hydration lock held, causing
+    // spurious 409s for concurrent jobs on the same repository.
+    if ((0, container_detector_1.isRunningInContainer)()) {
+        core.info('[blacksmith] Running inside a container — the git mirror sticky disk cannot be mounted here, falling back to actions/checkout behavior');
         return false;
     }
     return true;
@@ -731,6 +741,72 @@ function cleanup(options) {
         }
         return result;
     });
+}
+
+
+/***/ }),
+
+/***/ 6424:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.isRunningInContainer = isRunningInContainer;
+const fs = __importStar(__nccwpck_require__(7147));
+/**
+ * Detect whether we are running inside a container (e.g. a workflow job
+ * with `container:` set). In container jobs the runner VM's block devices
+ * and the runner's _diag directory are not accessible.
+ */
+function isRunningInContainer() {
+    // Check for /.dockerenv file (docker-specific).
+    try {
+        fs.accessSync('/.dockerenv');
+        return true;
+    }
+    catch (_a) {
+        // Not a docker container, continue checking.
+    }
+    // Check cgroup for container indicators (works with cgroup v1).
+    try {
+        const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf-8');
+        if (cgroup.includes('docker') || cgroup.includes('containerd')) {
+            return true;
+        }
+    }
+    catch (_b) {
+        // /proc/1/cgroup unreadable or doesn't exist, continue checking.
+    }
+    // For cgroup v2, check if working directory starts with /__w/.
+    // This is GitHub Actions container-specific workspace mount.
+    if (process.cwd().startsWith('/__w/')) {
+        return true;
+    }
+    return false;
 }
 
 
@@ -3758,6 +3834,7 @@ exports.hasAnyStepFailed = hasAnyStepFailed;
 const fs_1 = __nccwpck_require__(7147);
 const path = __importStar(__nccwpck_require__(1017));
 const core = __importStar(__nccwpck_require__(2186));
+const container_detector_1 = __nccwpck_require__(6424);
 /**
  * Checks GitHub Actions runner logs for failed or cancelled steps.
  * This reads the Worker_*.log files from the runner's _diag directory.
@@ -3769,34 +3846,7 @@ function checkPreviousStepFailures(runnerBasePath) {
         try {
             // Check if we're running inside a container.
             // In container jobs, _diag is not mounted and not accessible.
-            const isContainer = yield (() => __awaiter(this, void 0, void 0, function* () {
-                // Check for /.dockerenv file (docker-specific).
-                try {
-                    yield fs_1.promises.access('/.dockerenv');
-                    return true;
-                }
-                catch (_a) {
-                    // Not a docker container, continue checking.
-                }
-                // Check cgroup for container indicators (works with cgroup v1).
-                try {
-                    const cgroup = yield fs_1.promises.readFile('/proc/1/cgroup', 'utf-8');
-                    if (cgroup.includes('docker') || cgroup.includes('containerd')) {
-                        return true;
-                    }
-                }
-                catch (_b) {
-                    // /proc/1/cgroup unreadable or doesn't exist, continue checking.
-                }
-                // For cgroup v2, check if working directory starts with /__w/.
-                // This is GitHub Actions container-specific workspace mount.
-                const cwd = process.cwd();
-                if (cwd.startsWith('/__w/')) {
-                    return true;
-                }
-                return false;
-            }))();
-            if (isContainer) {
+            if ((0, container_detector_1.isRunningInContainer)()) {
                 core.debug('Running inside container - _diag directory not accessible, skipping step failure check');
                 return {
                     hasFailures: false,
