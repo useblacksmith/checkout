@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -37,7 +37,7 @@ jobs:
   test:
     strategy:
       matrix:
-        runs-on: [ubuntu-latest, macos-latest, windows-latest]
+        runs-on: [ubuntu-latest, macos-latest, blacksmith-4vcpu-windows-2025]
     runs-on: ${{ matrix.runs-on }}
 
     steps:
@@ -202,7 +202,7 @@ jobs:
         run: __test__/verify-basic.sh --archive
 
   test-proxy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: ghcr.io/actions/test-ubuntu-git:main.20240221.114913.703z
       options: --dns 127.0.0.1
@@ -243,7 +243,7 @@ jobs:
         run: __test__/verify-basic.sh --archive
 
   test-bypass-proxy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       https_proxy: http://no-such-proxy:3128
       no_proxy: api.github.com,github.com
@@ -277,7 +277,7 @@ jobs:
         run: __test__/verify-basic.sh --archive
 
   test-git-container:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container: bitnami/git:latest
     steps:
       # Clone this repo
@@ -316,7 +316,7 @@ jobs:
           path: localClone
 
   test-output:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       # Clone this repo
       - name: Checkout
