@@ -132,6 +132,31 @@ function createBlacksmithClient() {
     return (0, connect_1.createClient)(stickydisk_connect_1.StickyDiskService, transport);
 }
 /**
+ * The VM agent's sticky-disk response can arrive before the guest kernel has
+ * processed the virtio config-change interrupt that publishes the drive's real
+ * capacity (the drive is hot-attached/hydrated in place), so the device can
+ * transiently report a size of zero. Wait for a non-zero size before touching
+ * the device.
+ */
+function waitForNonZeroDeviceSize(device, timeoutMs) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            const result = yield exec.getExecOutput('sudo', ['blockdev', '--getsize64', device], { ignoreReturnCode: true, silent: true });
+            if (result.exitCode === 0) {
+                const size = parseInt(result.stdout.trim(), 10);
+                if (!isNaN(size) && size > 0) {
+                    return;
+                }
+            }
+            if (Date.now() >= deadline) {
+                throw new Error(`Device ${device} still reports zero size after ${timeoutMs}ms`);
+            }
+            yield new Promise(resolve => setTimeout(resolve, 100));
+        }
+    });
+}
+/**
  * Format the block device with ext4 if not already formatted
  */
 function maybeFormatDevice(device) {
@@ -230,6 +255,7 @@ function setupCache(owner, repo) {
         }
         core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
         // Format if needed
+        yield waitForNonZeroDeviceSize(device, 10000);
         yield maybeFormatDevice(device);
         // Mount the device at a unique path for this repository
         const mountPoint = getMountPoint(owner, repo);

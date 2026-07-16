@@ -127,6 +127,39 @@ function createBlacksmithClient() {
 }
 
 /**
+ * The VM agent's sticky-disk response can arrive before the guest kernel has
+ * processed the virtio config-change interrupt that publishes the drive's real
+ * capacity (the drive is hot-attached/hydrated in place), so the device can
+ * transiently report a size of zero. Wait for a non-zero size before touching
+ * the device.
+ */
+async function waitForNonZeroDeviceSize(
+  device: string,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const result = await exec.getExecOutput(
+      'sudo',
+      ['blockdev', '--getsize64', device],
+      {ignoreReturnCode: true, silent: true}
+    )
+    if (result.exitCode === 0) {
+      const size = parseInt(result.stdout.trim(), 10)
+      if (!isNaN(size) && size > 0) {
+        return
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Device ${device} still reports zero size after ${timeoutMs}ms`
+      )
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+}
+
+/**
  * Format the block device with ext4 if not already formatted
  */
 async function maybeFormatDevice(device: string): Promise<void> {
@@ -240,6 +273,7 @@ export async function setupCache(
   )
 
   // Format if needed
+  await waitForNonZeroDeviceSize(device, 10000)
   await maybeFormatDevice(device)
 
   // Mount the device at a unique path for this repository
