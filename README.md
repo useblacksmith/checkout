@@ -155,6 +155,15 @@ For these use cases, the persistent git mirror enables incremental updates rathe
     # Default: false
     dissociate: ''
 
+    # Allow using the Blacksmith git mirror cache inside container jobs. By default,
+    # container jobs skip the git mirror because the sticky disk block device is not
+    # visible inside the container. Set this to true when the container is started
+    # with the runner's devices passed through (e.g. `options: --privileged -v
+    # /dev:/dev`). Can also be enabled via the BLACKSMITH_ALLOW_INSIDE_CONTAINER=true
+    # environment variable.
+    # Default: false
+    allow-inside-container: ''
+
     # Enable verbose output for git mirror operations. Outputs GIT_TRACE and
     # GIT_CURL_VERBOSE for debugging connection and performance issues.
     # Default: false

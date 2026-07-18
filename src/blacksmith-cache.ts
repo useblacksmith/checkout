@@ -73,6 +73,24 @@ export function isBlacksmithEnvironment(): boolean {
 }
 
 /**
+ * Escape hatch for container jobs that deliberately pass the runner's
+ * block devices through to the container (e.g. `options:
+ * --privileged -v /dev:/dev`). Enabled via the `allow-inside-container`
+ * action input or the BLACKSMITH_ALLOW_INSIDE_CONTAINER environment
+ * variable. When enabled, the container guard in shouldUseBlacksmithCache()
+ * is skipped and the action attempts normal sticky-disk device detection; if
+ * the device is unavailable, setup fails and the checkout falls back to
+ * standard behavior.
+ */
+export function isAllowedInsideContainer(): boolean {
+  return (
+    (core.getInput('allow-inside-container') || '').toUpperCase() === 'TRUE' ||
+    (process.env.BLACKSMITH_ALLOW_INSIDE_CONTAINER || '').toUpperCase() ===
+      'TRUE'
+  )
+}
+
+/**
  * Control plane short circuit: when an installation has the
  * `bypass_blacksmith_checkout` flag flipped on, the agent exports
  * BLACKSMITH_BYPASS_CHECKOUT=true into the runner environment. We
@@ -96,10 +114,16 @@ export function shouldUseBlacksmithCache(): boolean {
   // and failing would leave the git mirror hydration lock held, causing
   // spurious 409s for concurrent jobs on the same repository.
   if (isRunningInContainer()) {
-    core.info(
-      '[blacksmith] Running inside a container — the git mirror sticky disk cannot be mounted here, falling back to actions/checkout behavior'
-    )
-    return false
+    if (isAllowedInsideContainer()) {
+      core.info(
+        '[blacksmith] Running inside a container but allow-inside-container is enabled — attempting git mirror sticky disk setup'
+      )
+    } else {
+      core.info(
+        '[blacksmith] Running inside a container — the git mirror sticky disk cannot be mounted here, falling back to actions/checkout behavior. Set allow-inside-container: true to opt in if the container has the runner devices passed through (e.g. --privileged -v /dev:/dev).'
+      )
+      return false
+    }
   }
   return true
 }
