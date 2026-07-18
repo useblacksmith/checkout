@@ -1,0 +1,45 @@
+name: Release
+run-name: Bump ${{ github.event.inputs.tags }} to ${{ github.event.inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: Comma-separated list of tags to update (e.g. v1,v1.0.0-beta)
+        required: true
+        default: v1,v1.0.0-beta
+      ref:
+        description: The commit, branch, or tag to point the tags at
+        required: true
+        default: main
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Git config
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update tags
+        env:
+          TAGS: ${{ github.event.inputs.tags }}
+        run: |
+          echo "### Tags updated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra TAG_LIST <<< "$TAGS"
+          for tag in "${TAG_LIST[@]}"; do
+            tag="$(echo "$tag" | xargs)"  # trim whitespace
+            if [ -z "$tag" ]; then
+              continue
+            fi
+            git tag -f "$tag" HEAD
+            git push origin "$tag" --force
+            echo "- \`$tag\` → \`$(git rev-parse --short HEAD)\`" >> $GITHUB_STEP_SUMMARY
+          done
