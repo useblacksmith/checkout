@@ -103,6 +103,15 @@ inputs:
       Copy objects from Blacksmith git mirror cache to make checkout independent.
       Use this when running Docker-based actions that may not have access to the mirror mount.
     default: false
+  allow-inside-container:
+    description: >
+      Allow using the Blacksmith git mirror cache inside container jobs.
+      By default, container jobs skip the git mirror because the sticky disk
+      block device is not visible inside the container. Set this to true when
+      the container is started with the runner's devices passed through
+      (e.g. `options: --privileged -v /dev:/dev`). Can also be enabled via the
+      BLACKSMITH_ALLOW_INSIDE_CONTAINER=true environment variable.
+    default: false
   verbose:
     description: >
       Enable verbose output for git mirror operations. Outputs GIT_TRACE and GIT_CURL_VERBOSE

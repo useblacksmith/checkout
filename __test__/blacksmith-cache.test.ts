@@ -190,6 +190,65 @@ describe('blacksmith-cache tests', () => {
       mockIsRunningInContainer.mockReturnValue(true)
       expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
     })
+
+    it('returns true inside a container when allow-inside-container input is true', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['INPUT_ALLOW-INSIDE-CONTAINER'] = 'true'
+      mockIsRunningInContainer.mockReturnValue(true)
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('returns true inside a container when BLACKSMITH_ALLOW_INSIDE_CONTAINER=true', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['BLACKSMITH_ALLOW_INSIDE_CONTAINER'] = 'true'
+      mockIsRunningInContainer.mockReturnValue(true)
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('returns false inside a container when opt-in values are not "true"', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['INPUT_ALLOW-INSIDE-CONTAINER'] = 'false'
+      process.env['BLACKSMITH_ALLOW_INSIDE_CONTAINER'] = '1'
+      mockIsRunningInContainer.mockReturnValue(true)
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('container opt-in still honors the BLACKSMITH_BYPASS_CHECKOUT kill switch', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      process.env['INPUT_ALLOW-INSIDE-CONTAINER'] = 'true'
+      mockIsRunningInContainer.mockReturnValue(true)
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+  })
+
+  describe('isAllowedInsideContainer', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {...originalEnv}
+      delete process.env['INPUT_ALLOW-INSIDE-CONTAINER']
+      delete process.env['BLACKSMITH_ALLOW_INSIDE_CONTAINER']
+    })
+
+    afterAll(() => {
+      process.env = originalEnv
+    })
+
+    it('defaults to false', () => {
+      expect(blacksmithCache.isAllowedInsideContainer()).toBe(false)
+    })
+
+    it('is case-insensitive for the action input', () => {
+      process.env['INPUT_ALLOW-INSIDE-CONTAINER'] = 'True'
+      expect(blacksmithCache.isAllowedInsideContainer()).toBe(true)
+    })
+
+    it('is case-insensitive for the environment variable', () => {
+      process.env['BLACKSMITH_ALLOW_INSIDE_CONTAINER'] = 'TRUE'
+      expect(blacksmithCache.isAllowedInsideContainer()).toBe(true)
+    })
   })
 
   describe('multiple checkout scenario', () => {
