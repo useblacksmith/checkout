@@ -281,7 +281,15 @@ function setupCache(owner, repo) {
         // Mount the device at a unique path for this repository
         const mountPoint = getMountPoint(owner, repo);
         yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
-        yield exec.exec('sudo', ['mount', device, mountPoint]);
+        // Mount with noinit_itable to keep the ext4lazyinit kernel thread from
+        // zeroing uninitialized inode tables in the background. Sticky disks are
+        // copy-on-write clones of a committed snapshot: if the snapshot was taken
+        // before lazy init finished, every clone would redo the same multi-GB
+        // zeroing and the writes are thrown away when the clone is discarded. The
+        // zeroing is unnecessary here anyway - mkfs enables checksummed group
+        // descriptors that track unused inodes, and unallocated blocks on the
+        // thin-provisioned device already read back as zeroes.
+        yield exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint]);
         core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
         return {
             exposeId,
