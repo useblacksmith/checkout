@@ -3,7 +3,7 @@ import * as http from 'http'
 
 const METRICS_PORT = process.env.BLACKSMITH_METRICS_HTTP_PORT || ''
 const VM_ID = process.env.BLACKSMITH_VM_ID || ''
-const AGENT_IP = '192.168.127.1'
+const AGENT_IP = process.env.BLACKSMITH_AGENT_ADDR || ''
 
 /**
  * Report an internal metric to the Blacksmith agent.
@@ -18,6 +18,10 @@ export async function reportInternalMetric(
     core.debug(
       '[metrics] BLACKSMITH_METRICS_HTTP_PORT not set, skipping metric'
     )
+    return
+  }
+  if (!AGENT_IP) {
+    core.debug('[metrics] BLACKSMITH_AGENT_ADDR not set, skipping metric')
     return
   }
 
