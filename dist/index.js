@@ -41,6 +41,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getMountPoint = getMountPoint;
 exports.isBlacksmithEnvironment = isBlacksmithEnvironment;
+exports.getAgentAddr = getAgentAddr;
+exports.getGrpcPort = getGrpcPort;
 exports.isAllowedInsideContainer = isAllowedInsideContainer;
 exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
@@ -59,7 +61,9 @@ const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const container_detector_1 = __nccwpck_require__(6424);
-const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
+// Without a deadline, a black-holed dial stalls the checkout until the OS
+// gives up on the TCP handshake.
+const AGENT_RPC_TIMEOUT_MS = 45000;
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
@@ -86,6 +90,12 @@ function getMountPoint(owner, repo) {
 function isBlacksmithEnvironment() {
     return !!process.env.BLACKSMITH_VM_ID;
 }
+function getAgentAddr() {
+    return process.env.BLACKSMITH_AGENT_ADDR || undefined;
+}
+function getGrpcPort() {
+    return process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || undefined;
+}
 /**
  * Escape hatch for container jobs that deliberately pass the runner's
  * block devices through to the container (e.g. `options:
@@ -111,6 +121,10 @@ function isAllowedInsideContainer() {
  */
 function shouldUseBlacksmithCache() {
     if (!isBlacksmithEnvironment()) {
+        return false;
+    }
+    if (!getAgentAddr() || !getGrpcPort()) {
+        core.info('[blacksmith] BLACKSMITH_AGENT_ADDR or BLACKSMITH_STICKY_DISK_GRPC_PORT is not set; the Blacksmith agent is not reachable from this runner, falling back to actions/checkout behavior');
         return false;
     }
     if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
@@ -145,9 +159,14 @@ function getMirrorPath(owner, repo) {
  * Create a gRPC client for communicating with the Blacksmith VM agent
  */
 function createBlacksmithClient() {
-    core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`);
+    const addr = getAgentAddr();
+    const grpcPort = getGrpcPort();
+    if (!addr || !grpcPort) {
+        throw new Error('BLACKSMITH_AGENT_ADDR or BLACKSMITH_STICKY_DISK_GRPC_PORT is not set; cannot dial the Blacksmith agent');
+    }
+    core.debug(`Creating Blacksmith agent client for ${addr}:${grpcPort}`);
     const transport = (0, connect_node_1.createGrpcTransport)({
-        baseUrl: `http://192.168.127.1:${GRPC_PORT}`,
+        baseUrl: `http://${addr}:${grpcPort}`,
         httpVersion: '2'
     });
     return (0, connect_1.createClient)(stickydisk_connect_1.StickyDiskService, transport);
@@ -219,14 +238,18 @@ function setupCache(owner, repo) {
     return __awaiter(this, void 0, void 0, function* () {
         const client = createBlacksmithClient();
         const stickyDiskKey = `${owner}-${repo}`;
-        // Test connection
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), AGENT_RPC_TIMEOUT_MS);
+        // Rethrow the original error so callers can classify it from the gRPC code.
         core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`);
         try {
-            yield client.up({});
+            yield client.up({}, { signal: controller.signal });
             core.debug('[git-mirror] Successfully connected to Blacksmith agent');
         }
         catch (error) {
-            throw new Error(`gRPC connection test failed: ${error.message}`);
+            clearTimeout(timeoutId);
+            core.warning(`[git-mirror] gRPC connection test failed: ${error.message}`);
+            throw error;
         }
         core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`);
         // Request sticky disk from VM agent
@@ -243,7 +266,7 @@ function setupCache(owner, repo) {
                 vmId: process.env.BLACKSMITH_VM_ID || '',
                 repoName: repoName,
                 stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-            });
+            }, { signal: controller.signal });
         }
         catch (error) {
             // Check if this is a gRPC Aborted error indicating hydration in progress
@@ -265,6 +288,9 @@ function setupCache(owner, repo) {
             }
             // Re-throw other errors
             throw error;
+        }
+        finally {
+            clearTimeout(timeoutId);
         }
         const exposeId = response.exposeId || '';
         const device = response.diskIdentifier || '';
@@ -3034,7 +3060,7 @@ const core = __importStar(__nccwpck_require__(2186));
 const http = __importStar(__nccwpck_require__(3685));
 const METRICS_PORT = process.env.BLACKSMITH_METRICS_HTTP_PORT || '';
 const VM_ID = process.env.BLACKSMITH_VM_ID || '';
-const AGENT_IP = '192.168.127.1';
+const AGENT_IP = process.env.BLACKSMITH_AGENT_ADDR || '';
 /**
  * Report an internal metric to the Blacksmith agent.
  * Fire-and-forget: errors are logged but never thrown.
@@ -3043,6 +3069,10 @@ function reportInternalMetric(metricType, value, attributes) {
     return __awaiter(this, void 0, void 0, function* () {
         if (!METRICS_PORT) {
             core.debug('[metrics] BLACKSMITH_METRICS_HTTP_PORT not set, skipping metric');
+            return;
+        }
+        if (!AGENT_IP) {
+            core.debug('[metrics] BLACKSMITH_AGENT_ADDR not set, skipping metric');
             return;
         }
         const payload = JSON.stringify({

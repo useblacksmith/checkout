@@ -8,7 +8,9 @@ import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydi
 import * as retryHelper from './retry-helper'
 import {isRunningInContainer} from './container-detector'
 
-const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
+// Without a deadline, a black-holed dial stalls the checkout until the OS
+// gives up on the TCP handshake.
+const AGENT_RPC_TIMEOUT_MS = 45000
 const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
@@ -72,6 +74,14 @@ export function isBlacksmithEnvironment(): boolean {
   return !!process.env.BLACKSMITH_VM_ID
 }
 
+export function getAgentAddr(): string | undefined {
+  return process.env.BLACKSMITH_AGENT_ADDR || undefined
+}
+
+export function getGrpcPort(): string | undefined {
+  return process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || undefined
+}
+
 /**
  * Escape hatch for container jobs that deliberately pass the runner's
  * block devices through to the container (e.g. `options:
@@ -100,6 +110,12 @@ export function isAllowedInsideContainer(): boolean {
  */
 export function shouldUseBlacksmithCache(): boolean {
   if (!isBlacksmithEnvironment()) {
+    return false
+  }
+  if (!getAgentAddr() || !getGrpcPort()) {
+    core.info(
+      '[blacksmith] BLACKSMITH_AGENT_ADDR or BLACKSMITH_STICKY_DISK_GRPC_PORT is not set; the Blacksmith agent is not reachable from this runner, falling back to actions/checkout behavior'
+    )
     return false
   }
   if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
@@ -141,9 +157,16 @@ export function getMirrorPath(owner: string, repo: string): string {
  * Create a gRPC client for communicating with the Blacksmith VM agent
  */
 function createBlacksmithClient() {
-  core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`)
+  const addr = getAgentAddr()
+  const grpcPort = getGrpcPort()
+  if (!addr || !grpcPort) {
+    throw new Error(
+      'BLACKSMITH_AGENT_ADDR or BLACKSMITH_STICKY_DISK_GRPC_PORT is not set; cannot dial the Blacksmith agent'
+    )
+  }
+  core.debug(`Creating Blacksmith agent client for ${addr}:${grpcPort}`)
   const transport = createGrpcTransport({
-    baseUrl: `http://192.168.127.1:${GRPC_PORT}`,
+    baseUrl: `http://${addr}:${grpcPort}`,
     httpVersion: '2'
   })
 
@@ -228,13 +251,20 @@ export async function setupCache(
   const client = createBlacksmithClient()
   const stickyDiskKey = `${owner}-${repo}`
 
-  // Test connection
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), AGENT_RPC_TIMEOUT_MS)
+
+  // Rethrow the original error so callers can classify it from the gRPC code.
   core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`)
   try {
-    await client.up({})
+    await client.up({}, {signal: controller.signal})
     core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
-    throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
+    clearTimeout(timeoutId)
+    core.warning(
+      `[git-mirror] gRPC connection test failed: ${(error as Error).message}`
+    )
+    throw error
   }
 
   core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`)
@@ -245,15 +275,18 @@ export async function setupCache(
   const repoName = `${owner}/${repo}`
   let response
   try {
-    response = await client.getStickyDisk({
-      stickyDiskKey: stickyDiskKey,
-      stickyDiskType: 'git_mirror',
-      region: process.env.BLACKSMITH_REGION || '',
-      installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
-      vmId: process.env.BLACKSMITH_VM_ID || '',
-      repoName: repoName,
-      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-    })
+    response = await client.getStickyDisk(
+      {
+        stickyDiskKey: stickyDiskKey,
+        stickyDiskType: 'git_mirror',
+        region: process.env.BLACKSMITH_REGION || '',
+        installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
+        vmId: process.env.BLACKSMITH_VM_ID || '',
+        repoName: repoName,
+        stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
+      },
+      {signal: controller.signal}
+    )
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
@@ -279,6 +312,8 @@ export async function setupCache(
     }
     // Re-throw other errors
     throw error
+  } finally {
+    clearTimeout(timeoutId)
   }
 
   const exposeId = (response as {exposeId?: string}).exposeId || ''

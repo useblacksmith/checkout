@@ -147,6 +147,8 @@ describe('blacksmith-cache tests', () => {
     beforeEach(() => {
       jest.resetModules()
       process.env = {...originalEnv}
+      process.env['BLACKSMITH_AGENT_ADDR'] = '192.168.127.1'
+      process.env['BLACKSMITH_STICKY_DISK_GRPC_PORT'] = '5557'
       mockIsRunningInContainer.mockReturnValue(false)
     })
 
@@ -163,6 +165,18 @@ describe('blacksmith-cache tests', () => {
     it('returns false outside of a Blacksmith env regardless of kill switch', () => {
       delete process.env['BLACKSMITH_VM_ID']
       process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns false when BLACKSMITH_AGENT_ADDR is not set', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      delete process.env['BLACKSMITH_AGENT_ADDR']
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns false when BLACKSMITH_STICKY_DISK_GRPC_PORT is not set', () => {
+      process.env['BLACKSMITH_VM_ID'] = 'test-vm-id'
+      delete process.env['BLACKSMITH_STICKY_DISK_GRPC_PORT']
       expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
     })
 
