@@ -338,7 +338,9 @@ export async function setupCache(
   // Mount the device at a unique path for this repository
   const mountPoint = getMountPoint(owner, repo)
   await exec.exec('sudo', ['mkdir', '-p', mountPoint])
-  await exec.exec('sudo', ['mount', device, mountPoint])
+  // noinit_itable stops the background zeroing of a non-trivial portion of
+  // the device (uninitialized inode tables), which is unnecessary here.
+  await exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint])
   core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`)
 
   return {

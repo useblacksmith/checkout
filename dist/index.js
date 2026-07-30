@@ -307,7 +307,9 @@ function setupCache(owner, repo) {
         // Mount the device at a unique path for this repository
         const mountPoint = getMountPoint(owner, repo);
         yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
-        yield exec.exec('sudo', ['mount', device, mountPoint]);
+        // noinit_itable stops the background zeroing of a non-trivial portion of
+        // the device (uninitialized inode tables), which is unnecessary here.
+        yield exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint]);
         core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
         return {
             exposeId,
