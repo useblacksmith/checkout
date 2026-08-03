@@ -720,10 +720,31 @@ class GitCommandManager {
         this.gitPath,
         ...args
       ]
-      result.exitCode = await exec.exec('timeout', timeoutArgs, {
-        ...options,
-        ignoreReturnCode: true
+      // If git is stuck in uninterruptible sleep (D-state) on a dead storage
+      // backend, even SIGKILL is deferred and `timeout` never returns. Race
+      // the exec against a watchdog so we can abandon the wait and fall back
+      // to the network path regardless.
+      const watchdogSecs = stallTimeoutSecs + STALL_KILL_AFTER_SECS * 2
+      let watchdogTimer: NodeJS.Timeout | undefined
+      const watchdog = new Promise<number>(resolve => {
+        watchdogTimer = setTimeout(
+          () => resolve(TIMEOUT_EXIT_CODE),
+          watchdogSecs * 1000
+        )
       })
+      try {
+        result.exitCode = await Promise.race([
+          exec.exec('timeout', timeoutArgs, {
+            ...options,
+            ignoreReturnCode: true
+          }),
+          watchdog
+        ])
+      } finally {
+        if (watchdogTimer) {
+          clearTimeout(watchdogTimer)
+        }
+      }
       result.stdout = stdout.join('')
       if (result.exitCode === TIMEOUT_EXIT_CODE) {
         throw new GitStallTimeoutError(args.join(' '), stallTimeoutSecs)
