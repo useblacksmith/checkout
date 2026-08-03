@@ -77,7 +77,7 @@ This makes the repository available without the mirror mount at the cost of a sl
 
 Git mirror caches are automatically evicted after seven days of inactivity. Each workflow run that uses the mirror resets its last-used timestamp.
 
-Storage usage is available on the [Sticky Disks page](https://app.blacksmith.sh/sticky-disks) in the Blacksmith dashboard. Sticky Disk storage is billed at $0.50/GB/month. See [Blacksmith pricing](https://www.blacksmith.sh/pricing) for current details.
+See the [Git Checkout Caching documentation](https://docs.blacksmith.sh/blacksmith-caching/git-checkout-caching) for storage usage, pricing, and cache lifecycle details.
 
 ## Documentation
 
