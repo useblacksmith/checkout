@@ -64,6 +64,13 @@ export const BlacksmithCachePerformedHydration =
   core.getState('blacksmithCachePerformedHydration') === 'true'
 
 /**
+ * Indicates the sticky disk was deemed unhealthy (e.g. failed the read-health
+ * probe) and must never be committed by the POST action.
+ */
+export const BlacksmithCacheDiskUnhealthy =
+  core.getState('blacksmithCacheDiskUnhealthy') === 'true'
+
+/**
  * The repository URL for refreshing the git mirror in the POST action.
  */
 export const BlacksmithCacheRepoUrl = core.getState('blacksmithCacheRepoUrl')
@@ -146,6 +153,14 @@ export function setBlacksmithCachePerformedHydration(performed: boolean) {
     'blacksmithCachePerformedHydration',
     performed ? 'true' : 'false'
   )
+}
+
+/**
+ * Save that the sticky disk is unhealthy so the POST action releases it
+ * without committing.
+ */
+export function setBlacksmithCacheDiskUnhealthy() {
+  core.saveState('blacksmithCacheDiskUnhealthy', 'true')
 }
 
 /**

@@ -89,7 +89,10 @@ async function cleanup(): Promise<void> {
       let shouldCommit = true
       let skipReason = ''
 
-      if (failureCheck.error) {
+      if (stateHelper.BlacksmithCacheDiskUnhealthy) {
+        shouldCommit = false
+        skipReason = 'Sticky disk was marked unhealthy during the main step'
+      } else if (failureCheck.error) {
         // If we can't determine failure status, skip commit to be safe
         shouldCommit = false
         skipReason = `Unable to check for step failures: ${failureCheck.error}`

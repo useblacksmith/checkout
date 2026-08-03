@@ -39,6 +39,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MIRROR_STALL_TIMEOUT_SECS = void 0;
 exports.getMountPoint = getMountPoint;
 exports.isBlacksmithEnvironment = isBlacksmithEnvironment;
 exports.getAgentAddr = getAgentAddr;
@@ -49,6 +50,8 @@ exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
 exports.refreshMirror = refreshMirror;
+exports.removeAlternates = removeAlternates;
+exports.removeStaleGitLocks = removeStaleGitLocks;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
 exports.cleanup = cleanup;
@@ -75,6 +78,19 @@ const UMOUNT_INITIAL_DELAY_MS = 1000; // Initial delay between retries (1 second
 const UMOUNT_BACKOFF_MULTIPLIER = 2; // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
+// Read-health probe of the mirror sticky disk, run right after mount. A
+// degraded Ceph-backed disk can serve reads at pathological latencies
+// (observed: hundreds of seconds of read wait during a 5-minute step), which
+// stalls fetch/checkout until the customer's step timeout kills the job.
+// If the probe cannot read a few MB quickly, skip the mirror entirely.
+const READ_PROBE_TIMEOUT_SECS = 10;
+const READ_PROBE_KILL_AFTER_SECS = 5;
+const READ_PROBE_MB = 8;
+// Deadline applied to mirror-assisted `git fetch`/`git checkout` in the main
+// step. If either stalls past this (e.g. alternates reads hitting a degraded
+// sticky disk), the checkout falls back to a network-only fetch/checkout
+// instead of failing the job.
+exports.MIRROR_STALL_TIMEOUT_SECS = 120;
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
@@ -311,6 +327,22 @@ function setupCache(owner, repo) {
         // the device (uninitialized inode tables), which is unnecessary here.
         yield exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint]);
         core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
+        if (!(yield probeDeviceReadHealth(device))) {
+            core.warning(`[git-mirror] Sticky disk ${device} failed the read-health probe; unmounting and falling back to network-only checkout`);
+            yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint], { ignoreReturnCode: true });
+            const released = yield releaseStickyDisk(exposeId, stickyDiskKey, repoName);
+            return {
+                exposeId: released ? '' : exposeId,
+                stickyDiskKey,
+                repoName,
+                device: '',
+                mountPoint: '',
+                mirrorPath: '',
+                hydrationInProgress: false,
+                performedHydration: false,
+                readProbeFailed: true
+            };
+        }
         return {
             exposeId,
             stickyDiskKey,
@@ -321,6 +353,66 @@ function setupCache(owner, repo) {
             hydrationInProgress: false,
             performedHydration: false // Will be set by ensureMirror if we do initial clone
         };
+    });
+}
+/**
+ * Check that the sticky disk can serve reads at a sane latency by reading a
+ * few MB directly from the block device (O_DIRECT, bypassing the page cache).
+ * Returns false if the read fails or takes longer than the probe timeout.
+ */
+function probeDeviceReadHealth(device) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const start = Date.now();
+        const result = yield exec.getExecOutput('timeout', [
+            '-k',
+            String(READ_PROBE_KILL_AFTER_SECS),
+            String(READ_PROBE_TIMEOUT_SECS),
+            'sudo',
+            'dd',
+            `if=${device}`,
+            'of=/dev/null',
+            'bs=1M',
+            `count=${READ_PROBE_MB}`,
+            'iflag=direct'
+        ], { ignoreReturnCode: true, silent: true });
+        const durationMs = Date.now() - start;
+        if (result.exitCode === TIMEOUT_EXIT_CODE) {
+            core.warning(`[git-mirror] Read-health probe timed out after ${READ_PROBE_TIMEOUT_SECS}s reading ${READ_PROBE_MB}MB from ${device}`);
+            return false;
+        }
+        if (result.exitCode !== 0) {
+            core.warning(`[git-mirror] Read-health probe failed with exit code ${result.exitCode}: ${result.stderr.trim()}`);
+            return false;
+        }
+        core.info(`[git-mirror] Read-health probe: read ${READ_PROBE_MB}MB from ${device} in ${durationMs}ms`);
+        return true;
+    });
+}
+/**
+ * Release a sticky disk without persisting any changes. Used when the disk
+ * is unusable (e.g. failed the read-health probe) so the backend can detach
+ * it instead of leaving the exposure dangling.
+ */
+function releaseStickyDisk(exposeId, stickyDiskKey, repoName) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const client = createBlacksmithClient();
+            yield client.commitStickyDisk({
+                exposeId,
+                stickyDiskKey,
+                vmId: process.env.BLACKSMITH_VM_ID || '',
+                shouldCommit: false,
+                repoName,
+                stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+                vmHydratedGitMirror: false
+            });
+            core.info('[git-mirror] Released sticky disk without committing');
+            return true;
+        }
+        catch (error) {
+            core.warning(`[git-mirror] Failed to release sticky disk: ${error.message}`);
+            return false;
+        }
     });
 }
 /**
@@ -491,6 +583,44 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
  * This allows the workspace git repo to use objects from the mirror
  * without copying them
  */
+/**
+ * Remove the alternates file so the workspace repo no longer borrows objects
+ * from the mirror. Any objects that were only reachable via the mirror must
+ * be re-fetched from the network afterwards.
+ */
+function removeAlternates(workspacePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const alternatesFile = path.join(workspacePath, '.git', 'objects', 'info', 'alternates');
+        try {
+            yield fs.promises.unlink(alternatesFile);
+            core.info('[git-mirror] Removed alternates file');
+        }
+        catch (_a) {
+            // File may not exist, that's fine
+        }
+    });
+}
+/**
+ * Remove stale git lock files left behind when a git process is killed
+ * (e.g. by the stall timeout) without a chance to clean up.
+ */
+function removeStaleGitLocks(workspacePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const lockFiles = [
+            path.join(workspacePath, '.git', 'index.lock'),
+            path.join(workspacePath, '.git', 'shallow.lock')
+        ];
+        for (const lockFile of lockFiles) {
+            try {
+                yield fs.promises.unlink(lockFile);
+                core.info(`[git-mirror] Removed stale lock file ${lockFile}`);
+            }
+            catch (_a) {
+                // File may not exist, that's fine
+            }
+        }
+    });
+}
 function writeAlternates(workspacePath, mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
         const alternatesDir = path.join(workspacePath, '.git', 'objects', 'info');
@@ -1525,7 +1655,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MinimumGitSparseCheckoutVersion = exports.MinimumGitVersion = void 0;
+exports.GitStallTimeoutError = exports.MinimumGitSparseCheckoutVersion = exports.MinimumGitVersion = void 0;
 exports.createCommandManager = createCommandManager;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -1542,6 +1672,22 @@ const git_version_1 = __nccwpck_require__(3142);
 // sparse-checkout not [well-]supported before 2.28 (see https://github.com/actions/checkout/issues/1386)
 exports.MinimumGitVersion = new git_version_1.GitVersion('2.18');
 exports.MinimumGitSparseCheckoutVersion = new git_version_1.GitVersion('2.28');
+// Exit code returned by the `timeout` command when the child is killed.
+const TIMEOUT_EXIT_CODE = 124;
+// Grace period before `timeout` escalates from SIGTERM to SIGKILL.
+const STALL_KILL_AFTER_SECS = 10;
+/**
+ * Thrown when a git command wrapped with a stall timeout is killed because it
+ * exceeded the deadline. Callers use this to distinguish a stalled command
+ * (e.g. mirror sticky-disk reads hanging) from a genuine git failure.
+ */
+class GitStallTimeoutError extends Error {
+    constructor(command, timeoutSecs) {
+        super(`git ${command} stalled and was killed after ${timeoutSecs}s`);
+        this.name = 'GitStallTimeoutError';
+    }
+}
+exports.GitStallTimeoutError = GitStallTimeoutError;
 function createCommandManager(workingDirectory, lfs, doSparseCheckout) {
     return __awaiter(this, void 0, void 0, function* () {
         return yield GitCommandManager.createCommandManager(workingDirectory, lfs, doSparseCheckout);
@@ -1661,7 +1807,7 @@ class GitCommandManager {
             yield fs.promises.appendFile(sparseCheckoutPath, `\n${sparseCheckout.join('\n')}\n`);
         });
     }
-    checkout(ref, startPoint) {
+    checkout(ref, startPoint, stallTimeoutSecs) {
         return __awaiter(this, void 0, void 0, function* () {
             const args = ['checkout', '--progress', '--force'];
             if (startPoint) {
@@ -1669,6 +1815,10 @@ class GitCommandManager {
             }
             else {
                 args.push(ref);
+            }
+            if (stallTimeoutSecs) {
+                yield this.execGit(args, false, false, {}, stallTimeoutSecs);
+                return;
             }
             yield this.execGit(args);
         });
@@ -1711,6 +1861,12 @@ class GitCommandManager {
     fetch(refSpec, options) {
         return __awaiter(this, void 0, void 0, function* () {
             const args = ['-c', 'protocol.version=2', 'fetch'];
+            if (options.refetch) {
+                // Re-download all objects without negotiating with the server, so
+                // objects previously borrowed from a (now detached) mirror via
+                // alternates are fetched again instead of being assumed present.
+                args.push('--refetch');
+            }
             if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
                 args.push('--no-tags');
             }
@@ -1732,6 +1888,28 @@ class GitCommandManager {
                 args.push(arg);
             }
             const that = this;
+            if (options.stallTimeoutSecs) {
+                // Transient failures are still retried, but a stall aborts immediately:
+                // the caller falls back to a network-only fetch, so retrying with the
+                // mirror still attached only burns time.
+                let stallError;
+                yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                    try {
+                        yield that.execGit(args, false, false, {}, options.stallTimeoutSecs);
+                    }
+                    catch (err) {
+                        if (err instanceof GitStallTimeoutError) {
+                            stallError = err;
+                            return;
+                        }
+                        throw err;
+                    }
+                }));
+                if (stallError) {
+                    throw stallError;
+                }
+                return;
+            }
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
                 yield that.execGit(args);
             }));
@@ -1996,7 +2174,7 @@ class GitCommandManager {
         });
     }
     execGit(args_1) {
-        return __awaiter(this, arguments, void 0, function* (args, allowAllExitCodes = false, silent = false, customListeners = {}) {
+        return __awaiter(this, arguments, void 0, function* (args, allowAllExitCodes = false, silent = false, customListeners = {}, stallTimeoutSecs) {
             fshelper.directoryExistsSync(this.workingDirectory, true);
             const result = new GitOutput();
             const env = {};
@@ -2020,6 +2198,48 @@ class GitCommandManager {
                 ignoreReturnCode: allowAllExitCodes,
                 listeners: mergedListeners
             };
+            if (stallTimeoutSecs) {
+                // Run git under `timeout` so a command stalled on unresponsive storage
+                // (e.g. a degraded mirror sticky disk) is killed instead of running
+                // until the job-level timeout. Only used on Blacksmith Linux runners.
+                const timeoutArgs = [
+                    '-k',
+                    String(STALL_KILL_AFTER_SECS),
+                    String(stallTimeoutSecs),
+                    this.gitPath,
+                    ...args
+                ];
+                // If git is stuck in uninterruptible sleep (D-state) on a dead storage
+                // backend, even SIGKILL is deferred and `timeout` never returns. Race
+                // the exec against a watchdog so we can abandon the wait and fall back
+                // to the network path regardless.
+                const watchdogSecs = stallTimeoutSecs + STALL_KILL_AFTER_SECS * 2;
+                let watchdogTimer;
+                const watchdog = new Promise(resolve => {
+                    watchdogTimer = setTimeout(() => resolve(TIMEOUT_EXIT_CODE), watchdogSecs * 1000);
+                });
+                try {
+                    result.exitCode = yield Promise.race([
+                        exec.exec('timeout', timeoutArgs, Object.assign(Object.assign({}, options), { ignoreReturnCode: true })),
+                        watchdog
+                    ]);
+                }
+                finally {
+                    if (watchdogTimer) {
+                        clearTimeout(watchdogTimer);
+                    }
+                }
+                result.stdout = stdout.join('');
+                if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                    throw new GitStallTimeoutError(args.join(' '), stallTimeoutSecs);
+                }
+                if (result.exitCode !== 0 && !allowAllExitCodes) {
+                    throw new Error(`The process '${this.gitPath}' failed with exit code ${result.exitCode}`);
+                }
+                core.debug(result.exitCode.toString());
+                core.debug(result.stdout);
+                return result;
+            }
             result.exitCode = yield exec.exec(`"${this.gitPath}"`, args, options);
             result.stdout = stdout.join('');
             core.debug(result.exitCode.toString());
@@ -2301,6 +2521,9 @@ const stateHelper = __importStar(__nccwpck_require__(4866));
 const urlHelper = __importStar(__nccwpck_require__(9437));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
 const git_command_manager_1 = __nccwpck_require__(738);
+const git_version_1 = __nccwpck_require__(3142);
+// `git fetch --refetch` requires Git 2.36+.
+const MinimumGitRefetchVersion = new git_version_1.GitVersion('2.36');
 function getSource(settings) {
     return __awaiter(this, void 0, void 0, function* () {
         // Repository URL
@@ -2366,9 +2589,20 @@ function getSource(settings) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
-                    // Check if hydration is in progress - another job is doing the initial git clone --mirror
-                    if (cacheInfo.hydrationInProgress) {
+                    // Fall back to standard checkout if hydration is in progress (another
+                    // job is doing the initial git clone --mirror) or the disk failed the
+                    // read-health probe (already unmounted and released)
+                    if (cacheInfo.hydrationInProgress || cacheInfo.readProbeFailed) {
                         // Warning already logged by setupCache, just fall back to standard checkout
+                        if (cacheInfo.readProbeFailed && cacheInfo.exposeId) {
+                            // The immediate release failed; save state so the post step can
+                            // retry releasing the disk, and mark it unhealthy so the post
+                            // step never commits it.
+                            stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
+                            stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
+                            stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
+                            stateHelper.setBlacksmithCacheDiskUnhealthy();
+                        }
                         cacheInfo = null;
                         core.endGroup();
                     }
@@ -2435,6 +2669,24 @@ function getSource(settings) {
             if (settings.lfs) {
                 yield git.lfsInstall();
             }
+            // When the mirror is attached via alternates, a degraded sticky disk can
+            // stall fetch/checkout on object reads until the customer's step timeout
+            // kills the job. Cap mirror-assisted fetch/checkout and, on a stall,
+            // detach the mirror and fall back to the network instead of failing.
+            const disableMirrorAfterStall = (operation) => __awaiter(this, void 0, void 0, function* () {
+                core.warning(`[git-mirror] ${operation} stalled after ${blacksmithCache.MIRROR_STALL_TIMEOUT_SECS}s with the mirror attached; detaching mirror and falling back to network-only checkout`);
+                yield blacksmithCache.removeAlternates(settings.repositoryPath);
+                // The killed git process may have left stale lock files behind
+                yield blacksmithCache.removeStaleGitLocks(settings.repositoryPath);
+                cacheInfo = null;
+            });
+            // After the mirror is detached, objects previously borrowed via
+            // alternates are missing locally even though refs may point at them.
+            // Recovering requires `git fetch --refetch` (skips negotiation so those
+            // objects are downloaded again), so the stall fallback is only enabled
+            // when the installed git supports it.
+            const stallFallbackEnabled = cacheInfo !== null &&
+                (yield git.version()).checkMinimum(MinimumGitRefetchVersion);
             // Fetch
             core.startGroup('Fetching the repository');
             const fetchOptions = {};
@@ -2444,22 +2696,38 @@ function getSource(settings) {
             else if (settings.sparseCheckout) {
                 fetchOptions.filter = 'blob:none';
             }
+            const fetchWithMirrorFallback = (refSpec) => __awaiter(this, void 0, void 0, function* () {
+                if (!cacheInfo || !stallFallbackEnabled) {
+                    yield git.fetch(refSpec, fetchOptions);
+                    return;
+                }
+                try {
+                    yield git.fetch(refSpec, Object.assign(Object.assign({}, fetchOptions), { stallTimeoutSecs: blacksmithCache.MIRROR_STALL_TIMEOUT_SECS }));
+                }
+                catch (error) {
+                    if (!(error instanceof git_command_manager_1.GitStallTimeoutError)) {
+                        throw error;
+                    }
+                    yield disableMirrorAfterStall('git fetch');
+                    yield git.fetch(refSpec, Object.assign(Object.assign({}, fetchOptions), { refetch: true }));
+                }
+            });
             if (settings.fetchDepth <= 0) {
                 // Fetch all branches and tags
                 let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
+                yield fetchWithMirrorFallback(refSpec);
                 // When all history is fetched, the ref we're interested in may have moved to a different
                 // commit (push or force push). If so, fetch again with a targeted refspec.
                 if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
                     refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                    yield git.fetch(refSpec, fetchOptions);
+                    yield fetchWithMirrorFallback(refSpec);
                 }
             }
             else {
                 fetchOptions.fetchDepth = settings.fetchDepth;
                 fetchOptions.fetchTags = settings.fetchTags;
                 const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
+                yield fetchWithMirrorFallback(refSpec);
             }
             core.endGroup();
             // Checkout info
@@ -2495,7 +2763,24 @@ function getSource(settings) {
             }
             // Checkout
             core.startGroup('Checking out the ref');
-            yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+            if (cacheInfo && stallFallbackEnabled) {
+                try {
+                    yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint, blacksmithCache.MIRROR_STALL_TIMEOUT_SECS);
+                }
+                catch (error) {
+                    if (!(error instanceof git_command_manager_1.GitStallTimeoutError)) {
+                        throw error;
+                    }
+                    yield disableMirrorAfterStall('git checkout');
+                    // Objects previously borrowed from the mirror are gone with the
+                    // alternates file; re-fetch so they exist locally, then retry.
+                    yield git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), Object.assign(Object.assign({}, fetchOptions), { refetch: true }));
+                    yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+                }
+            }
+            else {
+                yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+            }
             core.endGroup();
             // Dissociate from Blacksmith mirror if requested
             // This copies all objects from alternates into the local repo so it's independent
@@ -3234,7 +3519,11 @@ function cleanup() {
                 const failureCheck = yield (0, step_checker_1.checkPreviousStepFailures)();
                 let shouldCommit = true;
                 let skipReason = '';
-                if (failureCheck.error) {
+                if (stateHelper.BlacksmithCacheDiskUnhealthy) {
+                    shouldCommit = false;
+                    skipReason = 'Sticky disk was marked unhealthy during the main step';
+                }
+                else if (failureCheck.error) {
                     // If we can't determine failure status, skip commit to be safe
                     shouldCommit = false;
                     skipReason = `Unable to check for step failures: ${failureCheck.error}`;
@@ -3721,7 +4010,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheDiskUnhealthy = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -3732,6 +4021,7 @@ exports.setBlacksmithCacheMountPoint = setBlacksmithCacheMountPoint;
 exports.setBlacksmithCacheRepoName = setBlacksmithCacheRepoName;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
+exports.setBlacksmithCacheDiskUnhealthy = setBlacksmithCacheDiskUnhealthy;
 exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
 exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 const core = __importStar(__nccwpck_require__(2186));
@@ -3780,6 +4070,11 @@ exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskK
  * Used to notify the backend on commit so it can mark hydration as complete.
  */
 exports.BlacksmithCachePerformedHydration = core.getState('blacksmithCachePerformedHydration') === 'true';
+/**
+ * Indicates the sticky disk was deemed unhealthy (e.g. failed the read-health
+ * probe) and must never be committed by the POST action.
+ */
+exports.BlacksmithCacheDiskUnhealthy = core.getState('blacksmithCacheDiskUnhealthy') === 'true';
 /**
  * The repository URL for refreshing the git mirror in the POST action.
  */
@@ -3848,6 +4143,13 @@ function setBlacksmithCacheStickyDiskKey(stickyDiskKey) {
  */
 function setBlacksmithCachePerformedHydration(performed) {
     core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false');
+}
+/**
+ * Save that the sticky disk is unhealthy so the POST action releases it
+ * without committing.
+ */
+function setBlacksmithCacheDiskUnhealthy() {
+    core.saveState('blacksmithCacheDiskUnhealthy', 'true');
 }
 /**
  * Save the repository URL so the POST action can refresh the git mirror.

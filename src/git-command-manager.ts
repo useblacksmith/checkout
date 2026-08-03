@@ -15,6 +15,23 @@ import {GitVersion} from './git-version'
 export const MinimumGitVersion = new GitVersion('2.18')
 export const MinimumGitSparseCheckoutVersion = new GitVersion('2.28')
 
+// Exit code returned by the `timeout` command when the child is killed.
+const TIMEOUT_EXIT_CODE = 124
+// Grace period before `timeout` escalates from SIGTERM to SIGKILL.
+const STALL_KILL_AFTER_SECS = 10
+
+/**
+ * Thrown when a git command wrapped with a stall timeout is killed because it
+ * exceeded the deadline. Callers use this to distinguish a stalled command
+ * (e.g. mirror sticky-disk reads hanging) from a genuine git failure.
+ */
+export class GitStallTimeoutError extends Error {
+  constructor(command: string, timeoutSecs: number) {
+    super(`git ${command} stalled and was killed after ${timeoutSecs}s`)
+    this.name = 'GitStallTimeoutError'
+  }
+}
+
 export interface IGitCommandManager {
   branchDelete(remote: boolean, branch: string): Promise<void>
   branchExists(remote: boolean, pattern: string): Promise<boolean>
@@ -22,7 +39,11 @@ export interface IGitCommandManager {
   disableSparseCheckout(): Promise<void>
   sparseCheckout(sparseCheckout: string[]): Promise<void>
   sparseCheckoutNonConeMode(sparseCheckout: string[]): Promise<void>
-  checkout(ref: string, startPoint: string): Promise<void>
+  checkout(
+    ref: string,
+    startPoint: string,
+    stallTimeoutSecs?: number
+  ): Promise<void>
   checkoutDetach(): Promise<void>
   config(
     configKey: string,
@@ -39,6 +60,8 @@ export interface IGitCommandManager {
       fetchDepth?: number
       fetchTags?: boolean
       showProgress?: boolean
+      stallTimeoutSecs?: number
+      refetch?: boolean
     }
   ): Promise<void>
   getDefaultBranch(repositoryUrl: string): Promise<string>
@@ -221,12 +244,21 @@ class GitCommandManager {
     )
   }
 
-  async checkout(ref: string, startPoint: string): Promise<void> {
+  async checkout(
+    ref: string,
+    startPoint: string,
+    stallTimeoutSecs?: number
+  ): Promise<void> {
     const args = ['checkout', '--progress', '--force']
     if (startPoint) {
       args.push('-B', ref, startPoint)
     } else {
       args.push(ref)
+    }
+
+    if (stallTimeoutSecs) {
+      await this.execGit(args, false, false, {}, stallTimeoutSecs)
+      return
     }
 
     await this.execGit(args)
@@ -282,9 +314,17 @@ class GitCommandManager {
       fetchDepth?: number
       fetchTags?: boolean
       showProgress?: boolean
+      stallTimeoutSecs?: number
+      refetch?: boolean
     }
   ): Promise<void> {
     const args = ['-c', 'protocol.version=2', 'fetch']
+    if (options.refetch) {
+      // Re-download all objects without negotiating with the server, so
+      // objects previously borrowed from a (now detached) mirror via
+      // alternates are fetched again instead of being assumed present.
+      args.push('--refetch')
+    }
     if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
       args.push('--no-tags')
     }
@@ -314,6 +354,28 @@ class GitCommandManager {
     }
 
     const that = this
+    if (options.stallTimeoutSecs) {
+      // Transient failures are still retried, but a stall aborts immediately:
+      // the caller falls back to a network-only fetch, so retrying with the
+      // mirror still attached only burns time.
+      let stallError: GitStallTimeoutError | undefined
+      await retryHelper.execute(async () => {
+        try {
+          await that.execGit(args, false, false, {}, options.stallTimeoutSecs)
+        } catch (err) {
+          if (err instanceof GitStallTimeoutError) {
+            stallError = err
+            return
+          }
+          throw err
+        }
+      })
+      if (stallError) {
+        throw stallError
+      }
+      return
+    }
+
     await retryHelper.execute(async () => {
       await that.execGit(args)
     })
@@ -615,7 +677,8 @@ class GitCommandManager {
     args: string[],
     allowAllExitCodes = false,
     silent = false,
-    customListeners = {}
+    customListeners = {},
+    stallTimeoutSecs?: number
   ): Promise<GitOutput> {
     fshelper.directoryExistsSync(this.workingDirectory, true)
 
@@ -644,6 +707,56 @@ class GitCommandManager {
       silent,
       ignoreReturnCode: allowAllExitCodes,
       listeners: mergedListeners
+    }
+
+    if (stallTimeoutSecs) {
+      // Run git under `timeout` so a command stalled on unresponsive storage
+      // (e.g. a degraded mirror sticky disk) is killed instead of running
+      // until the job-level timeout. Only used on Blacksmith Linux runners.
+      const timeoutArgs = [
+        '-k',
+        String(STALL_KILL_AFTER_SECS),
+        String(stallTimeoutSecs),
+        this.gitPath,
+        ...args
+      ]
+      // If git is stuck in uninterruptible sleep (D-state) on a dead storage
+      // backend, even SIGKILL is deferred and `timeout` never returns. Race
+      // the exec against a watchdog so we can abandon the wait and fall back
+      // to the network path regardless.
+      const watchdogSecs = stallTimeoutSecs + STALL_KILL_AFTER_SECS * 2
+      let watchdogTimer: NodeJS.Timeout | undefined
+      const watchdog = new Promise<number>(resolve => {
+        watchdogTimer = setTimeout(
+          () => resolve(TIMEOUT_EXIT_CODE),
+          watchdogSecs * 1000
+        )
+      })
+      try {
+        result.exitCode = await Promise.race([
+          exec.exec('timeout', timeoutArgs, {
+            ...options,
+            ignoreReturnCode: true
+          }),
+          watchdog
+        ])
+      } finally {
+        if (watchdogTimer) {
+          clearTimeout(watchdogTimer)
+        }
+      }
+      result.stdout = stdout.join('')
+      if (result.exitCode === TIMEOUT_EXIT_CODE) {
+        throw new GitStallTimeoutError(args.join(' '), stallTimeoutSecs)
+      }
+      if (result.exitCode !== 0 && !allowAllExitCodes) {
+        throw new Error(
+          `The process '${this.gitPath}' failed with exit code ${result.exitCode}`
+        )
+      }
+      core.debug(result.exitCode.toString())
+      core.debug(result.stdout)
+      return result
     }
 
     result.exitCode = await exec.exec(`"${this.gitPath}"`, args, options)
