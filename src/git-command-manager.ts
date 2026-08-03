@@ -353,14 +353,29 @@ class GitCommandManager {
       args.push(arg)
     }
 
+    const that = this
     if (options.stallTimeoutSecs) {
-      // Single attempt: on a stall the caller falls back to a network-only
-      // fetch, so retrying with the mirror still attached only burns time.
-      await this.execGit(args, false, false, {}, options.stallTimeoutSecs)
+      // Transient failures are still retried, but a stall aborts immediately:
+      // the caller falls back to a network-only fetch, so retrying with the
+      // mirror still attached only burns time.
+      let stallError: GitStallTimeoutError | undefined
+      await retryHelper.execute(async () => {
+        try {
+          await that.execGit(args, false, false, {}, options.stallTimeoutSecs)
+        } catch (err) {
+          if (err instanceof GitStallTimeoutError) {
+            stallError = err
+            return
+          }
+          throw err
+        }
+      })
+      if (stallError) {
+        throw stallError
+      }
       return
     }
 
-    const that = this
     await retryHelper.execute(async () => {
       await that.execGit(args)
     })

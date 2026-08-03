@@ -1887,13 +1887,29 @@ class GitCommandManager {
             for (const arg of refSpec) {
                 args.push(arg);
             }
+            const that = this;
             if (options.stallTimeoutSecs) {
-                // Single attempt: on a stall the caller falls back to a network-only
-                // fetch, so retrying with the mirror still attached only burns time.
-                yield this.execGit(args, false, false, {}, options.stallTimeoutSecs);
+                // Transient failures are still retried, but a stall aborts immediately:
+                // the caller falls back to a network-only fetch, so retrying with the
+                // mirror still attached only burns time.
+                let stallError;
+                yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                    try {
+                        yield that.execGit(args, false, false, {}, options.stallTimeoutSecs);
+                    }
+                    catch (err) {
+                        if (err instanceof GitStallTimeoutError) {
+                            stallError = err;
+                            return;
+                        }
+                        throw err;
+                    }
+                }));
+                if (stallError) {
+                    throw stallError;
+                }
                 return;
             }
-            const that = this;
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
                 yield that.execGit(args);
             }));
