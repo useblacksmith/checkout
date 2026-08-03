@@ -19,7 +19,7 @@ steps:
 
 All standard [`actions/checkout` inputs](https://github.com/actions/checkout) continue to work. The `v1` tag tracks the latest compatible Blacksmith Checkout release.
 
-## Why Use Blacksmith Checkout?
+## Why use this over the default?
 
 A normal checkout starts from an empty runner and downloads the repository from GitHub for every job. For large repositories or workflows that need substantial Git history, this can add minutes of repeated network transfer to each run.
 
