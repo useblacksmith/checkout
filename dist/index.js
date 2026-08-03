@@ -2647,8 +2647,11 @@ function getSource(settings) {
             });
             // After the mirror is detached, objects previously borrowed via
             // alternates are missing locally even though refs may point at them.
-            // --refetch skips negotiation so those objects are downloaded again.
-            const canRefetch = (yield git.version()).checkMinimum(MinimumGitRefetchVersion);
+            // Recovering requires `git fetch --refetch` (skips negotiation so those
+            // objects are downloaded again), so the stall fallback is only enabled
+            // when the installed git supports it.
+            const stallFallbackEnabled = cacheInfo !== null &&
+                (yield git.version()).checkMinimum(MinimumGitRefetchVersion);
             // Fetch
             core.startGroup('Fetching the repository');
             const fetchOptions = {};
@@ -2659,7 +2662,7 @@ function getSource(settings) {
                 fetchOptions.filter = 'blob:none';
             }
             const fetchWithMirrorFallback = (refSpec) => __awaiter(this, void 0, void 0, function* () {
-                if (!cacheInfo) {
+                if (!cacheInfo || !stallFallbackEnabled) {
                     yield git.fetch(refSpec, fetchOptions);
                     return;
                 }
@@ -2671,7 +2674,7 @@ function getSource(settings) {
                         throw error;
                     }
                     yield disableMirrorAfterStall('git fetch');
-                    yield git.fetch(refSpec, Object.assign(Object.assign({}, fetchOptions), { refetch: canRefetch }));
+                    yield git.fetch(refSpec, Object.assign(Object.assign({}, fetchOptions), { refetch: true }));
                 }
             });
             if (settings.fetchDepth <= 0) {
@@ -2725,7 +2728,7 @@ function getSource(settings) {
             }
             // Checkout
             core.startGroup('Checking out the ref');
-            if (cacheInfo) {
+            if (cacheInfo && stallFallbackEnabled) {
                 try {
                     yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint, blacksmithCache.MIRROR_STALL_TIMEOUT_SECS);
                 }
@@ -2736,7 +2739,7 @@ function getSource(settings) {
                     yield disableMirrorAfterStall('git checkout');
                     // Objects previously borrowed from the mirror are gone with the
                     // alternates file; re-fetch so they exist locally, then retry.
-                    yield git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), Object.assign(Object.assign({}, fetchOptions), { refetch: canRefetch }));
+                    yield git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), Object.assign(Object.assign({}, fetchOptions), { refetch: true }));
                     yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
                 }
             }

@@ -246,10 +246,12 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // After the mirror is detached, objects previously borrowed via
     // alternates are missing locally even though refs may point at them.
-    // --refetch skips negotiation so those objects are downloaded again.
-    const canRefetch = (await git.version()).checkMinimum(
-      MinimumGitRefetchVersion
-    )
+    // Recovering requires `git fetch --refetch` (skips negotiation so those
+    // objects are downloaded again), so the stall fallback is only enabled
+    // when the installed git supports it.
+    const stallFallbackEnabled =
+      cacheInfo !== null &&
+      (await git.version()).checkMinimum(MinimumGitRefetchVersion)
 
     // Fetch
     core.startGroup('Fetching the repository')
@@ -269,7 +271,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     const fetchWithMirrorFallback = async (
       refSpec: string[]
     ): Promise<void> => {
-      if (!cacheInfo) {
+      if (!cacheInfo || !stallFallbackEnabled) {
         await git.fetch(refSpec, fetchOptions)
         return
       }
@@ -283,7 +285,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           throw error
         }
         await disableMirrorAfterStall('git fetch')
-        await git.fetch(refSpec, {...fetchOptions, refetch: canRefetch})
+        await git.fetch(refSpec, {...fetchOptions, refetch: true})
       }
     }
 
@@ -347,7 +349,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Checkout
     core.startGroup('Checking out the ref')
-    if (cacheInfo) {
+    if (cacheInfo && stallFallbackEnabled) {
       try {
         await git.checkout(
           checkoutInfo.ref,
@@ -363,7 +365,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         // alternates file; re-fetch so they exist locally, then retry.
         await git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), {
           ...fetchOptions,
-          refetch: canRefetch
+          refetch: true
         })
         await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
       }
