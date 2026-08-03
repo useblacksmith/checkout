@@ -251,12 +251,13 @@ class GitCommandManager {
     const args = ['checkout', '--progress', '--force']
     if (startPoint) {
       args.push('-B', ref, startPoint)
+    } else {
+      args.push(ref)
     }
+
     if (stallTimeoutSecs) {
       await this.execGit(args, false, false, {}, stallTimeoutSecs)
       return
-    } else {
-      args.push(ref)
     }
 
     await this.execGit(args)

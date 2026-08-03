@@ -1786,12 +1786,12 @@ class GitCommandManager {
             if (startPoint) {
                 args.push('-B', ref, startPoint);
             }
+            else {
+                args.push(ref);
+            }
             if (stallTimeoutSecs) {
                 yield this.execGit(args, false, false, {}, stallTimeoutSecs);
                 return;
-            }
-            else {
-                args.push(ref);
             }
             yield this.execGit(args);
         });
