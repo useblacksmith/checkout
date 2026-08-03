@@ -1,379 +1,90 @@
 # Blacksmith Checkout
 
-> **⚠️ Beta**: This action is currently in beta. We encourage users to stay on the latest published release as we are rapidly fixing bugs and incorporating feedback.
+> **Beta:** Git checkout caching is currently in beta. Stay on the latest `v1` release while we continue improving reliability and incorporating feedback.
 
-This is [Blacksmith's](https://blacksmith.sh) fork of the `actions/checkout` action, built on top of our [Sticky Disk](https://blacksmith.sh/docs/sticky-disks) primitive. The action is a drop-in replacement for `actions/checkout` and provides
-caching of git repositories to speed up large repository checkouts.
+`useblacksmith/checkout` is Blacksmith's fork of [`actions/checkout`](https://github.com/actions/checkout). It is a drop-in replacement that supports the same inputs and checkout behavior while adding persistent Git repository caching for Blacksmith runners.
 
-## How It Works
+The action is built on [Blacksmith Sticky Disks](https://docs.blacksmith.sh/blacksmith-caching/dependencies-sticky-disks). Instead of cloning the entire repository from GitHub on every workflow run, it maintains a persistent bare Git mirror and updates that mirror incrementally.
 
-`useblacksmith/checkout` uses a persistent git mirror cache to speed up subsequent repository checkouts:
+## Usage
 
-1. **First Run (Hydration)**: On the very first checkout for a repository, the action creates a full git mirror of your repo on a Sticky Disk. This initial hydration may take longer as it mirrors your entire repository, but it only happens once for each repository.
+Replace `actions/checkout` with `useblacksmith/checkout@v1`:
 
-2. **Incremental Updates**: After the initial hydration, the git mirror is updated incrementally on each workflow run using `git fetch --prune` to fetch only new refs and objects. The mirror is always a complete clone, but your workspace respects the `fetch-depth` input — git's alternates mechanism allows the workspace to reference objects from the mirror without copying them, keeping shallow checkouts fast.
+```yaml
+steps:
+  - uses: useblacksmith/checkout@v1
+    with:
+      fetch-depth: 0
+```
 
-3. **Concurrent Job Handling**: While the first hydration is in progress, any concurrent job runs will automatically fall back to the standard `actions/checkout` behavior. Once the mirror is fully hydrated, all subsequent jobs will use the cached mirror.
+All standard [`actions/checkout` inputs](https://github.com/actions/checkout) continue to work. The `v1` tag tracks the latest compatible Blacksmith Checkout release.
 
 ## Why Use Blacksmith Checkout?
 
-This action is most beneficial for:
+A normal checkout starts from an empty runner and downloads the repository from GitHub for every job. For large repositories or workflows that need substantial Git history, this can add minutes of repeated network transfer to each run.
 
-- **Large repositories** (multiple GBs in size) where cloning from GitHub is slow
-- **Deep fetch depths** (`fetch-depth: 0` or large values) where you need extensive commit history
-- **Frequent CI runs** on the same repository where the mirror stays warm
+Blacksmith Checkout keeps the repository's Git objects on a Sticky Disk so later jobs only need to fetch changes made since the previous run. This is particularly useful for:
 
-For these use cases, the persistent git mirror enables incremental updates rather than full clones, significantly reducing checkout times. For smaller repositories with shallow checkouts (`fetch-depth: 1`), checkout times will be comparable to the standard `actions/checkout`.
+- Large repositories with slow clone times
+- Workflows that require full history with `fetch-depth: 0`
+- Frequently run workflows that can reuse a warm mirror
+- Reducing network transfers and exposure to transient GitHub failures or rate limits
 
-**Key benefits:**
+Small repositories using shallow checkouts may see performance similar to the upstream action.
 
-- **Reduced Network Load**: Minimize traffic to GitHub by fetching only new changes incrementally
-- **Drop-in Replacement**: All `actions/checkout` options work exactly the same
+## How It Works
 
----
+Blacksmith runners are ephemeral, but Sticky Disks persist data across workflow runs. Blacksmith Checkout uses that persistent storage to maintain a bare Git mirror for the repository.
 
-> **Note**: This is a fork of [actions/checkout](https://github.com/actions/checkout). All options and behaviors from the upstream action are preserved. The documentation below is from the upstream project.
+### 1. Initial Hydration
 
----
+On the first run, the action creates a full `git clone --mirror` of the repository on a Sticky Disk. This hydration downloads the complete repository and may take as long as a normal full clone, but it only needs to happen once while the cache remains active.
 
-# Usage
+### 2. Incremental Updates
 
-<!-- start usage -->
-```yaml
-- uses: actions/checkout@v6
-  with:
-    # Repository name with owner. For example, actions/checkout
-    # Default: ${{ github.repository }}
-    repository: ''
+On subsequent runs, the action updates the mirror with `git fetch --prune`. Only new refs and objects are fetched from GitHub rather than downloading the complete repository again.
 
-    # The branch, tag or SHA to checkout. When checking out the repository that
-    # triggered a workflow, this defaults to the reference or SHA for that event.
-    # Otherwise, uses the default branch.
-    ref: ''
+The mirror always contains the complete repository, while the workspace still respects inputs such as `fetch-depth`. For example, `fetch-depth: 1` continues to produce a shallow workspace checkout.
 
-    # Personal access token (PAT) used to fetch the repository. The PAT is configured
-    # with the local git config, which enables your scripts to run authenticated git
-    # commands. The post-job step removes the PAT.
-    #
-    # We recommend using a service account with the least permissions necessary. Also
-    # when generating a new PAT, select the least scopes necessary.
-    #
-    # [Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)
-    #
-    # Default: ${{ github.token }}
-    token: ''
+### 3. Workspace Checkout
 
-    # SSH key used to fetch the repository. The SSH key is configured with the local
-    # git config, which enables your scripts to run authenticated git commands. The
-    # post-job step removes the SSH key.
-    #
-    # We recommend using a service account with the least permissions necessary.
-    #
-    # [Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)
-    ssh-key: ''
+The workspace uses [Git's alternates mechanism](https://git-scm.com/docs/gitrepository-layout) to reference objects in the mirror without copying them. This keeps the workspace checkout fast and avoids duplicating the full repository on disk.
 
-    # Known hosts in addition to the user and global host key database. The public SSH
-    # keys for a host may be obtained using the utility `ssh-keyscan`. For example,
-    # `ssh-keyscan github.com`. The public key for github.com is always implicitly
-    # added.
-    ssh-known-hosts: ''
+### 4. Concurrent Jobs and Safe Fallbacks
 
-    # Whether to perform strict host key checking. When true, adds the options
-    # `StrictHostKeyChecking=yes` and `CheckHostIP=no` to the SSH command line. Use
-    # the input `ssh-known-hosts` to configure additional hosts.
-    # Default: true
-    ssh-strict: ''
+If another job starts while the mirror is being hydrated, it automatically falls back to the standard checkout behavior rather than waiting for hydration to finish.
 
-    # The user to use when connecting to the remote SSH host. By default 'git' is
-    # used.
-    # Default: git
-    ssh-user: ''
+The same fallback applies if the Sticky Disk or cached mirror is unavailable. Cache failures do not fail the workflow. The affected run simply clones from GitHub as it would with the upstream action.
 
-    # Whether to configure the token or SSH key with the local git config
-    # Default: true
-    persist-credentials: ''
+Git garbage collection runs during post-job cleanup rather than during checkout, keeping cache maintenance off the critical path for the rest of the workflow.
 
-    # Relative path under $GITHUB_WORKSPACE to place the repository
-    path: ''
+## Docker-Based Actions
 
-    # Whether to execute `git clean -ffdx && git reset --hard HEAD` before fetching
-    # Default: true
-    clean: ''
+By default, the workspace references Git objects stored on the Sticky Disk mount. Docker-based actions may not have access to that mount.
 
-    # Partially clone against a given filter. Overrides sparse-checkout if set.
-    # Default: null
-    filter: ''
-
-    # Do a sparse checkout on given patterns. Each pattern should be separated with
-    # new lines.
-    # Default: null
-    sparse-checkout: ''
-
-    # Specifies whether to use cone-mode when doing a sparse checkout.
-    # Default: true
-    sparse-checkout-cone-mode: ''
-
-    # Number of commits to fetch. 0 indicates all history for all branches and tags.
-    # Default: 1
-    fetch-depth: ''
-
-    # Whether to fetch tags, even if fetch-depth > 0.
-    # Default: false
-    fetch-tags: ''
-
-    # Whether to show progress status output when fetching.
-    # Default: true
-    show-progress: ''
-
-    # Whether to download Git-LFS files
-    # Default: false
-    lfs: ''
-
-    # Whether to checkout submodules: `true` to checkout submodules or `recursive` to
-    # recursively checkout submodules.
-    #
-    # When the `ssh-key` input is not provided, SSH URLs beginning with
-    # `git@github.com:` are converted to HTTPS.
-    #
-    # Default: false
-    submodules: ''
-
-    # Add repository path as safe.directory for Git global config by running `git
-    # config --global --add safe.directory <path>`
-    # Default: true
-    set-safe-directory: ''
-
-    # The base URL for the GitHub instance that you are trying to clone from, will use
-    # environment defaults to fetch from the same instance that the workflow is
-    # running from unless specified. Example URLs are https://github.com or
-    # https://my-ghes-server.example.com
-    github-server-url: ''
-
-    # Copy objects from Blacksmith git mirror cache to make checkout independent. Use
-    # this when running Docker-based actions that may not have access to the mirror
-    # mount.
-    # Default: false
-    dissociate: ''
-
-    # Allow using the Blacksmith git mirror cache inside container jobs. By default,
-    # container jobs skip the git mirror because the sticky disk block device is not
-    # visible inside the container. Set this to true when the container is started
-    # with the runner's devices passed through (e.g. `options: --privileged -v
-    # /dev:/dev`). Can also be enabled via the BLACKSMITH_ALLOW_INSIDE_CONTAINER=true
-    # environment variable.
-    # Default: false
-    allow-inside-container: ''
-
-    # Enable verbose output for git mirror operations. Outputs GIT_TRACE and
-    # GIT_CURL_VERBOSE for debugging connection and performance issues.
-    # Default: false
-    verbose: ''
-```
-<!-- end usage -->
-
-# Scenarios
-
-- [Checkout V5](#checkout-v5)
-  - [What's new](#whats-new)
-- [Checkout V4](#checkout-v4)
-    - [Note](#note)
-- [What's new](#whats-new-1)
-- [Usage](#usage)
-- [Scenarios](#scenarios)
-  - [Fetch only the root files](#fetch-only-the-root-files)
-  - [Fetch only the root files and `.github` and `src` folder](#fetch-only-the-root-files-and-github-and-src-folder)
-  - [Fetch only a single file](#fetch-only-a-single-file)
-  - [Fetch all history for all tags and branches](#fetch-all-history-for-all-tags-and-branches)
-  - [Checkout a different branch](#checkout-a-different-branch)
-  - [Checkout HEAD^](#checkout-head)
-  - [Checkout multiple repos (side by side)](#checkout-multiple-repos-side-by-side)
-  - [Checkout multiple repos (nested)](#checkout-multiple-repos-nested)
-  - [Checkout multiple repos (private)](#checkout-multiple-repos-private)
-  - [Checkout pull request HEAD commit instead of merge commit](#checkout-pull-request-head-commit-instead-of-merge-commit)
-  - [Checkout pull request on closed event](#checkout-pull-request-on-closed-event)
-  - [Push a commit using the built-in token](#push-a-commit-using-the-built-in-token)
-  - [Push a commit to a PR using the built-in token](#push-a-commit-to-a-pr-using-the-built-in-token)
-- [Recommended permissions](#recommended-permissions)
-- [License](#license)
-
-## Fetch only the root files
+Set `dissociate: true` to copy the required objects into the workspace and make the checkout self-contained:
 
 ```yaml
-- uses: actions/checkout@v6
-  with:
-    sparse-checkout: .
+steps:
+  - uses: useblacksmith/checkout@v1
+    with:
+      dissociate: true
 ```
 
-## Fetch only the root files and `.github` and `src` folder
+This makes the repository available without the mirror mount at the cost of a slightly longer checkout and a larger workspace.
 
-```yaml
-- uses: actions/checkout@v6
-  with:
-    sparse-checkout: |
-      .github
-      src
-```
+## Cache Lifecycle and Monitoring
 
-## Fetch only a single file
+Git mirror caches are automatically evicted after seven days of inactivity. Each workflow run that uses the mirror resets its last-used timestamp.
 
-```yaml
-- uses: actions/checkout@v6
-  with:
-    sparse-checkout: |
-      README.md
-    sparse-checkout-cone-mode: false
-```
+Storage usage is available on the [Sticky Disks page](https://app.blacksmith.sh/sticky-disks) in the Blacksmith dashboard. Sticky Disk storage is billed at $0.50/GB/month. See [Blacksmith pricing](https://www.blacksmith.sh/pricing) for current details.
 
-## Fetch all history for all tags and branches
+## Documentation
 
-```yaml
-- uses: actions/checkout@v6
-  with:
-    fetch-depth: 0
-```
+See [Git Checkout Caching](https://docs.blacksmith.sh/blacksmith-caching/git-checkout-caching) for complete documentation about behavior, monitoring, pricing, and cache eviction.
 
-## Checkout a different branch
+For the complete input reference and general checkout examples, see the upstream [`actions/checkout` documentation](https://github.com/actions/checkout).
 
-```yaml
-- uses: actions/checkout@v6
-  with:
-    ref: my-branch
-```
+## License
 
-## Checkout HEAD^
-
-```yaml
-- uses: actions/checkout@v6
-  with:
-    fetch-depth: 2
-- run: git checkout HEAD^
-```
-
-## Checkout multiple repos (side by side)
-
-```yaml
-- name: Checkout
-  uses: actions/checkout@v6
-  with:
-    path: main
-
-- name: Checkout tools repo
-  uses: actions/checkout@v6
-  with:
-    repository: my-org/my-tools
-    path: my-tools
-```
-> - If your secondary repository is private or internal you will need to add the option noted in [Checkout multiple repos (private)](#Checkout-multiple-repos-private)
-
-## Checkout multiple repos (nested)
-
-```yaml
-- name: Checkout
-  uses: actions/checkout@v6
-
-- name: Checkout tools repo
-  uses: actions/checkout@v6
-  with:
-    repository: my-org/my-tools
-    path: my-tools
-```
-> - If your secondary repository is private or internal you will need to add the option noted in [Checkout multiple repos (private)](#Checkout-multiple-repos-private)
-
-## Checkout multiple repos (private)
-
-```yaml
-- name: Checkout
-  uses: actions/checkout@v6
-  with:
-    path: main
-
-- name: Checkout private tools
-  uses: actions/checkout@v6
-  with:
-    repository: my-org/my-private-tools
-    token: ${{ secrets.GH_PAT }} # `GH_PAT` is a secret that contains your PAT
-    path: my-tools
-```
-
-> - `${{ github.token }}` is scoped to the current repository, so if you want to checkout a different repository that is private you will need to provide your own [PAT](https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line).
-
-
-## Checkout pull request HEAD commit instead of merge commit
-
-```yaml
-- uses: actions/checkout@v6
-  with:
-    ref: ${{ github.event.pull_request.head.sha }}
-```
-
-## Checkout pull request on closed event
-
-```yaml
-on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, closed]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-```
-
-## Push a commit using the built-in token
-
-```yaml
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: |
-          date > generated.txt
-          # Note: the following account information will not work on GHES
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "generated"
-          git push
-```
-*NOTE:* The user email is `{user.id}+{user.login}@users.noreply.github.com`. See users API: https://api.github.com/users/github-actions%5Bbot%5D
-
-## Push a commit to a PR using the built-in token
-
-In a pull request trigger, `ref` is required as GitHub Actions checks out in detached HEAD mode, meaning it doesn’t check out your branch by default.
-
-```yaml
-on: pull_request
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref }}
-      - run: |
-          date > generated.txt
-          # Note: the following account information will not work on GHES
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "generated"
-          git push
-```
-
-*NOTE:* The user email is `{user.id}+{user.login}@users.noreply.github.com`. See users API: https://api.github.com/users/github-actions%5Bbot%5D
-
-# Recommended permissions
-
-When using the `checkout` action in your GitHub Actions workflow, it is recommended to set the following `GITHUB_TOKEN` permissions to ensure proper functionality, unless alternative auth is provided via the `token` or `ssh-key` inputs:
-
-```yaml
-permissions:
-  contents: read
-```
-
-# License
-
-The scripts and documentation in this project are released under the [MIT License](LICENSE)
+The scripts and documentation in this project are released under the [MIT License](LICENSE).
