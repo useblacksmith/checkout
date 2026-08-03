@@ -25,6 +25,20 @@ const UMOUNT_BACKOFF_MULTIPLIER = 2 // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124
 
+// Read-health probe of the mirror sticky disk, run right after mount. A
+// degraded Ceph-backed disk can serve reads at pathological latencies
+// (observed: hundreds of seconds of read wait during a 5-minute step), which
+// stalls fetch/checkout until the customer's step timeout kills the job.
+// If the probe cannot read a few MB quickly, skip the mirror entirely.
+const READ_PROBE_TIMEOUT_SECS = 10
+const READ_PROBE_MB = 8
+
+// Deadline applied to mirror-assisted `git fetch`/`git checkout` in the main
+// step. If either stalls past this (e.g. alternates reads hitting a degraded
+// sticky disk), the checkout falls back to a network-only fetch/checkout
+// instead of failing the job.
+export const MIRROR_STALL_TIMEOUT_SECS = 120
+
 /**
  * Result of a git mirror operation that may fail or time out.
  */
@@ -65,6 +79,10 @@ export interface CacheInfo {
   // performedHydration indicates that this job performed the initial git mirror clone.
   // Used to notify the backend on commit so it can mark hydration as complete.
   performedHydration: boolean
+  // readProbeFailed indicates the mounted sticky disk failed the read-health
+  // probe. The disk has already been unmounted and released; the caller
+  // should fall back to regular checkout without using the cache.
+  readProbeFailed?: boolean
 }
 
 /**
@@ -343,6 +361,29 @@ export async function setupCache(
   await exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint])
   core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`)
 
+  if (!(await probeDeviceReadHealth(device))) {
+    core.warning(
+      `[git-mirror] Sticky disk ${device} failed the read-health probe; unmounting and falling back to network-only checkout`
+    )
+    await exec.getExecOutput(
+      'timeout',
+      [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
+      {ignoreReturnCode: true}
+    )
+    await releaseStickyDisk(exposeId, stickyDiskKey, repoName)
+    return {
+      exposeId: '',
+      stickyDiskKey,
+      repoName,
+      device: '',
+      mountPoint: '',
+      mirrorPath: '',
+      hydrationInProgress: false,
+      performedHydration: false,
+      readProbeFailed: true
+    }
+  }
+
   return {
     exposeId,
     stickyDiskKey,
@@ -352,6 +393,75 @@ export async function setupCache(
     mirrorPath: getMirrorPath(owner, repo),
     hydrationInProgress: false,
     performedHydration: false // Will be set by ensureMirror if we do initial clone
+  }
+}
+
+/**
+ * Check that the sticky disk can serve reads at a sane latency by reading a
+ * few MB directly from the block device (O_DIRECT, bypassing the page cache).
+ * Returns false if the read fails or takes longer than the probe timeout.
+ */
+async function probeDeviceReadHealth(device: string): Promise<boolean> {
+  const start = Date.now()
+  const result = await exec.getExecOutput(
+    'timeout',
+    [
+      String(READ_PROBE_TIMEOUT_SECS),
+      'sudo',
+      'dd',
+      `if=${device}`,
+      'of=/dev/null',
+      'bs=1M',
+      `count=${READ_PROBE_MB}`,
+      'iflag=direct'
+    ],
+    {ignoreReturnCode: true, silent: true}
+  )
+  const durationMs = Date.now() - start
+  if (result.exitCode === TIMEOUT_EXIT_CODE) {
+    core.warning(
+      `[git-mirror] Read-health probe timed out after ${READ_PROBE_TIMEOUT_SECS}s reading ${READ_PROBE_MB}MB from ${device}`
+    )
+    return false
+  }
+  if (result.exitCode !== 0) {
+    core.warning(
+      `[git-mirror] Read-health probe failed with exit code ${result.exitCode}: ${result.stderr.trim()}`
+    )
+    return false
+  }
+  core.info(
+    `[git-mirror] Read-health probe: read ${READ_PROBE_MB}MB from ${device} in ${durationMs}ms`
+  )
+  return true
+}
+
+/**
+ * Release a sticky disk without persisting any changes. Used when the disk
+ * is unusable (e.g. failed the read-health probe) so the backend can detach
+ * it instead of leaving the exposure dangling.
+ */
+async function releaseStickyDisk(
+  exposeId: string,
+  stickyDiskKey: string,
+  repoName: string
+): Promise<void> {
+  try {
+    const client = createBlacksmithClient()
+    await client.commitStickyDisk({
+      exposeId,
+      stickyDiskKey,
+      vmId: process.env.BLACKSMITH_VM_ID || '',
+      shouldCommit: false,
+      repoName,
+      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+      vmHydratedGitMirror: false
+    })
+    core.info('[git-mirror] Released sticky disk without committing')
+  } catch (error) {
+    core.warning(
+      `[git-mirror] Failed to release sticky disk: ${(error as Error).message}`
+    )
   }
 }
 
@@ -563,6 +673,27 @@ export async function refreshMirror(
  * This allows the workspace git repo to use objects from the mirror
  * without copying them
  */
+/**
+ * Remove the alternates file so the workspace repo no longer borrows objects
+ * from the mirror. Any objects that were only reachable via the mirror must
+ * be re-fetched from the network afterwards.
+ */
+export async function removeAlternates(workspacePath: string): Promise<void> {
+  const alternatesFile = path.join(
+    workspacePath,
+    '.git',
+    'objects',
+    'info',
+    'alternates'
+  )
+  try {
+    await fs.promises.unlink(alternatesFile)
+    core.info('[git-mirror] Removed alternates file')
+  } catch {
+    // File may not exist, that's fine
+  }
+}
+
 export async function writeAlternates(
   workspacePath: string,
   mirrorPath: string

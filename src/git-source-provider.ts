@@ -12,7 +12,8 @@ import * as urlHelper from './url-helper'
 import * as blacksmithCache from './blacksmith-cache'
 import {
   MinimumGitSparseCheckoutVersion,
-  IGitCommandManager
+  IGitCommandManager,
+  GitStallTimeoutError
 } from './git-command-manager'
 import {IGitSourceSettings} from './git-source-settings'
 
@@ -120,8 +121,10 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           settings.repositoryName
         )
 
-        // Check if hydration is in progress - another job is doing the initial git clone --mirror
-        if (cacheInfo.hydrationInProgress) {
+        // Fall back to standard checkout if hydration is in progress (another
+        // job is doing the initial git clone --mirror) or the disk failed the
+        // read-health probe (already unmounted and released)
+        if (cacheInfo.hydrationInProgress || cacheInfo.readProbeFailed) {
           // Warning already logged by setupCache, just fall back to standard checkout
           cacheInfo = null
           core.endGroup()
@@ -212,6 +215,20 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       await git.lfsInstall()
     }
 
+    // When the mirror is attached via alternates, a degraded sticky disk can
+    // stall fetch/checkout on object reads until the customer's step timeout
+    // kills the job. Cap mirror-assisted fetch/checkout and, on a stall,
+    // detach the mirror and fall back to the network instead of failing.
+    const disableMirrorAfterStall = async (
+      operation: string
+    ): Promise<void> => {
+      core.warning(
+        `[git-mirror] ${operation} stalled after ${blacksmithCache.MIRROR_STALL_TIMEOUT_SECS}s with the mirror attached; detaching mirror and falling back to network-only checkout`
+      )
+      await blacksmithCache.removeAlternates(settings.repositoryPath)
+      cacheInfo = null
+    }
+
     // Fetch
     core.startGroup('Fetching the repository')
     const fetchOptions: {
@@ -227,25 +244,46 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       fetchOptions.filter = 'blob:none'
     }
 
+    const fetchWithMirrorFallback = async (
+      refSpec: string[]
+    ): Promise<void> => {
+      if (!cacheInfo) {
+        await git.fetch(refSpec, fetchOptions)
+        return
+      }
+      try {
+        await git.fetch(refSpec, {
+          ...fetchOptions,
+          stallTimeoutSecs: blacksmithCache.MIRROR_STALL_TIMEOUT_SECS
+        })
+      } catch (error) {
+        if (!(error instanceof GitStallTimeoutError)) {
+          throw error
+        }
+        await disableMirrorAfterStall('git fetch')
+        await git.fetch(refSpec, fetchOptions)
+      }
+    }
+
     if (settings.fetchDepth <= 0) {
       // Fetch all branches and tags
       let refSpec = refHelper.getRefSpecForAllHistory(
         settings.ref,
         settings.commit
       )
-      await git.fetch(refSpec, fetchOptions)
+      await fetchWithMirrorFallback(refSpec)
 
       // When all history is fetched, the ref we're interested in may have moved to a different
       // commit (push or force push). If so, fetch again with a targeted refspec.
       if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
         refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-        await git.fetch(refSpec, fetchOptions)
+        await fetchWithMirrorFallback(refSpec)
       }
     } else {
       fetchOptions.fetchDepth = settings.fetchDepth
       fetchOptions.fetchTags = settings.fetchTags
       const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-      await git.fetch(refSpec, fetchOptions)
+      await fetchWithMirrorFallback(refSpec)
     }
     core.endGroup()
 
@@ -287,7 +325,29 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Checkout
     core.startGroup('Checking out the ref')
-    await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
+    if (cacheInfo) {
+      try {
+        await git.checkout(
+          checkoutInfo.ref,
+          checkoutInfo.startPoint,
+          blacksmithCache.MIRROR_STALL_TIMEOUT_SECS
+        )
+      } catch (error) {
+        if (!(error instanceof GitStallTimeoutError)) {
+          throw error
+        }
+        await disableMirrorAfterStall('git checkout')
+        // Objects previously borrowed from the mirror are gone with the
+        // alternates file; re-fetch so they exist locally, then retry.
+        await git.fetch(
+          refHelper.getRefSpec(settings.ref, settings.commit),
+          fetchOptions
+        )
+        await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
+      }
+    } else {
+      await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
+    }
     core.endGroup()
 
     // Dissociate from Blacksmith mirror if requested
