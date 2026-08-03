@@ -32,17 +32,17 @@ Blacksmith Checkout keeps Git objects on a Sticky Disk so warm jobs can reuse ob
 
 Small repositories using shallow checkouts may see performance similar to the upstream action. The first run must also hydrate the mirror, so the benefit is realized on subsequent runs.
 
-## How It Works
+## How it works
 
 Each repository checked out by the action gets an isolated Sticky Disk and bare Git mirror. Multiple repositories checked out in the same job do not share a mirror.
 
-### 1. Initial Hydration
+### 1. Initial hydration
 
 When no mirror exists, the action creates a full `git clone --mirror` on the Sticky Disk. This initial hydration downloads the complete repository and may take as long as a normal full clone.
 
 Only one job hydrates a mirror at a time. If another job checks out the same repository while hydration is in progress, it falls back to a standard checkout from GitHub for that run rather than waiting.
 
-### 2. Warm Checkout
+### 2. Warm checkout
 
 When a mirror already exists, the action mounts its Sticky Disk and uses [Git's alternates mechanism](https://git-scm.com/docs/gitrepository-layout) to make the mirror's objects available to the workspace without copying them.
 
@@ -50,23 +50,23 @@ The workspace then performs the normal upstream-compatible fetch. Objects alread
 
 The mirror always contains full history, but the workspace still respects inputs such as `fetch-depth`, `fetch-tags`, sparse checkout, LFS, and submodules. For example, `fetch-depth: 1` still produces a shallow workspace checkout.
 
-### 3. Post-Job Refresh
+### 3. Post-job refresh
 
 The action refreshes an existing mirror with `git fetch --prune` during post-job cleanup, outside the critical checkout path. This prepares the mirror for subsequent workflow runs without delaying the checkout step itself.
 
 Post-job cleanup also runs Git's lightweight automatic garbage collection, flushes pending writes, and safely unmounts the Sticky Disk. An updated disk is persisted only when the workflow and cache maintenance leave it in a safe state. Failed or incomplete cache updates are discarded rather than replacing a healthy mirror.
 
-### 4. Safe Fallbacks
+### 4. Safe fallbacks
 
 If the Blacksmith agent, Sticky Disk, or mirror cannot be prepared, the action falls back to the standard `actions/checkout` behavior. Cache maintenance failures are reported as warnings and do not invalidate the completed workspace checkout.
 
 The caching path can also be disabled by Blacksmith's control plane without requiring customers to change their workflows.
 
-## Containers and Docker-Based Actions
+## Containers and Docker-based actions
 
 Container jobs and Docker-based actions that consume a checkout have different requirements.
 
-### Container Jobs
+### Container jobs
 
 Jobs configured with `container:` bypass the Sticky Disk cache by default because the runner's block device is not normally visible inside the container. The checkout still works, but uses the standard upstream behavior.
 
@@ -81,11 +81,11 @@ steps:
 
 If the device is still unavailable, the action falls back to a standard checkout.
 
-### Docker-Based Actions
+### Docker-based actions
 
-A checkout performed on the runner normally references objects on the mounted Sticky Disk. A later Docker-based action may not have access to that mount.
+By default, Blacksmith Checkout writes a Git alternates file into the workspace. That file points to Git objects on the Sticky Disk mounted on the runner. If a later step runs a Docker-based action, its container may receive the workspace but not the Sticky Disk mount. Git commands inside that container can then be unable to resolve objects referenced by the checkout.
 
-Set `dissociate: true` to copy the required objects into the workspace and make the checkout self-contained:
+Set `dissociate: true` when later Docker-based actions need to run Git commands against the repository:
 
 ```yaml
 steps:
@@ -94,9 +94,9 @@ steps:
       dissociate: true
 ```
 
-This makes the repository independent of the mirror mount at the cost of a slightly longer checkout and a larger workspace.
+The action copies the required objects into the workspace and removes its dependency on the mirror mount. This makes the repository self-contained inside later containers at the cost of a slightly longer checkout and a larger workspace.
 
-## Blacksmith-Specific Inputs
+## Blacksmith-specific inputs
 
 In addition to all upstream `actions/checkout` inputs, this action provides:
 
