@@ -58,9 +58,9 @@ Post-job cleanup also runs Git's lightweight automatic garbage collection, flush
 
 ### 4. Safe fallbacks
 
-If the Blacksmith agent, Sticky Disk, or mirror cannot be prepared, the action falls back to the standard `actions/checkout` behavior. Cache maintenance failures are reported as warnings and do not invalidate the completed workspace checkout.
+Mirror clone and refresh operations retry transient Git failures. If the Blacksmith agent, Sticky Disk, or mirror still cannot be prepared, the action falls back to the standard `actions/checkout` behavior.
 
-The caching path can also be disabled by Blacksmith's control plane without requiring customers to change their workflows.
+Cache maintenance failures are reported as warnings and do not invalidate the completed workspace checkout. Blacksmith can also disable the caching path safely without requiring customers to change their workflows.
 
 ## Containers and Docker-based actions
 
