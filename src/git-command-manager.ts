@@ -284,7 +284,15 @@ class GitCommandManager {
       showProgress?: boolean
     }
   ): Promise<void> {
-    const args = ['-c', 'protocol.version=2', 'fetch']
+    const args = [
+      '-c',
+      'protocol.version=2',
+      '-c',
+      'http.lowSpeedLimit=1000',
+      '-c',
+      'http.lowSpeedTime=15',
+      'fetch'
+    ]
     if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
       args.push('--no-tags')
     }
@@ -314,7 +322,8 @@ class GitCommandManager {
     }
 
     const that = this
-    await retryHelper.execute(async () => {
+    const fetchRetryHelper = new retryHelper.RetryHelper(3, 1, 5)
+    await fetchRetryHelper.execute(async () => {
       await that.execGit(args)
     })
   }
