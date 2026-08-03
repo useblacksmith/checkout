@@ -330,9 +330,9 @@ function setupCache(owner, repo) {
         if (!(yield probeDeviceReadHealth(device))) {
             core.warning(`[git-mirror] Sticky disk ${device} failed the read-health probe; unmounting and falling back to network-only checkout`);
             yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint], { ignoreReturnCode: true });
-            yield releaseStickyDisk(exposeId, stickyDiskKey, repoName);
+            const released = yield releaseStickyDisk(exposeId, stickyDiskKey, repoName);
             return {
-                exposeId: '',
+                exposeId: released ? '' : exposeId,
                 stickyDiskKey,
                 repoName,
                 device: '',
@@ -407,9 +407,11 @@ function releaseStickyDisk(exposeId, stickyDiskKey, repoName) {
                 vmHydratedGitMirror: false
             });
             core.info('[git-mirror] Released sticky disk without committing');
+            return true;
         }
         catch (error) {
             core.warning(`[git-mirror] Failed to release sticky disk: ${error.message}`);
+            return false;
         }
     });
 }
@@ -2557,6 +2559,15 @@ function getSource(settings) {
                     // read-health probe (already unmounted and released)
                     if (cacheInfo.hydrationInProgress || cacheInfo.readProbeFailed) {
                         // Warning already logged by setupCache, just fall back to standard checkout
+                        if (cacheInfo.readProbeFailed && cacheInfo.exposeId) {
+                            // The immediate release failed; save state so the post step can
+                            // retry releasing the disk, and mark it unhealthy so the post
+                            // step never commits it.
+                            stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId);
+                            stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey);
+                            stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
+                            stateHelper.setBlacksmithCacheDiskUnhealthy();
+                        }
                         cacheInfo = null;
                         core.endGroup();
                     }
@@ -3470,7 +3481,11 @@ function cleanup() {
                 const failureCheck = yield (0, step_checker_1.checkPreviousStepFailures)();
                 let shouldCommit = true;
                 let skipReason = '';
-                if (failureCheck.error) {
+                if (stateHelper.BlacksmithCacheDiskUnhealthy) {
+                    shouldCommit = false;
+                    skipReason = 'Sticky disk was marked unhealthy during the main step';
+                }
+                else if (failureCheck.error) {
                     // If we can't determine failure status, skip commit to be safe
                     shouldCommit = false;
                     skipReason = `Unable to check for step failures: ${failureCheck.error}`;
@@ -3957,7 +3972,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheDiskUnhealthy = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -3968,6 +3983,7 @@ exports.setBlacksmithCacheMountPoint = setBlacksmithCacheMountPoint;
 exports.setBlacksmithCacheRepoName = setBlacksmithCacheRepoName;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
+exports.setBlacksmithCacheDiskUnhealthy = setBlacksmithCacheDiskUnhealthy;
 exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
 exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 const core = __importStar(__nccwpck_require__(2186));
@@ -4016,6 +4032,11 @@ exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskK
  * Used to notify the backend on commit so it can mark hydration as complete.
  */
 exports.BlacksmithCachePerformedHydration = core.getState('blacksmithCachePerformedHydration') === 'true';
+/**
+ * Indicates the sticky disk was deemed unhealthy (e.g. failed the read-health
+ * probe) and must never be committed by the POST action.
+ */
+exports.BlacksmithCacheDiskUnhealthy = core.getState('blacksmithCacheDiskUnhealthy') === 'true';
 /**
  * The repository URL for refreshing the git mirror in the POST action.
  */
@@ -4084,6 +4105,13 @@ function setBlacksmithCacheStickyDiskKey(stickyDiskKey) {
  */
 function setBlacksmithCachePerformedHydration(performed) {
     core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false');
+}
+/**
+ * Save that the sticky disk is unhealthy so the POST action releases it
+ * without committing.
+ */
+function setBlacksmithCacheDiskUnhealthy() {
+    core.saveState('blacksmithCacheDiskUnhealthy', 'true');
 }
 /**
  * Save the repository URL so the POST action can refresh the git mirror.

@@ -130,6 +130,15 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         // read-health probe (already unmounted and released)
         if (cacheInfo.hydrationInProgress || cacheInfo.readProbeFailed) {
           // Warning already logged by setupCache, just fall back to standard checkout
+          if (cacheInfo.readProbeFailed && cacheInfo.exposeId) {
+            // The immediate release failed; save state so the post step can
+            // retry releasing the disk, and mark it unhealthy so the post
+            // step never commits it.
+            stateHelper.setBlacksmithCacheExposeId(cacheInfo.exposeId)
+            stateHelper.setBlacksmithCacheStickyDiskKey(cacheInfo.stickyDiskKey)
+            stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName)
+            stateHelper.setBlacksmithCacheDiskUnhealthy()
+          }
           cacheInfo = null
           core.endGroup()
         } else {

@@ -371,9 +371,9 @@ export async function setupCache(
       [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
       {ignoreReturnCode: true}
     )
-    await releaseStickyDisk(exposeId, stickyDiskKey, repoName)
+    const released = await releaseStickyDisk(exposeId, stickyDiskKey, repoName)
     return {
-      exposeId: '',
+      exposeId: released ? '' : exposeId,
       stickyDiskKey,
       repoName,
       device: '',
@@ -448,7 +448,7 @@ async function releaseStickyDisk(
   exposeId: string,
   stickyDiskKey: string,
   repoName: string
-): Promise<void> {
+): Promise<boolean> {
   try {
     const client = createBlacksmithClient()
     await client.commitStickyDisk({
@@ -461,10 +461,12 @@ async function releaseStickyDisk(
       vmHydratedGitMirror: false
     })
     core.info('[git-mirror] Released sticky disk without committing')
+    return true
   } catch (error) {
     core.warning(
       `[git-mirror] Failed to release sticky disk: ${(error as Error).message}`
     )
+    return false
   }
 }
 
