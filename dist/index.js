@@ -51,6 +51,7 @@ exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
 exports.refreshMirror = refreshMirror;
 exports.removeAlternates = removeAlternates;
+exports.removeStaleGitLocks = removeStaleGitLocks;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
 exports.cleanup = cleanup;
@@ -83,6 +84,7 @@ const TIMEOUT_EXIT_CODE = 124;
 // stalls fetch/checkout until the customer's step timeout kills the job.
 // If the probe cannot read a few MB quickly, skip the mirror entirely.
 const READ_PROBE_TIMEOUT_SECS = 10;
+const READ_PROBE_KILL_AFTER_SECS = 5;
 const READ_PROBE_MB = 8;
 // Deadline applied to mirror-assisted `git fetch`/`git checkout` in the main
 // step. If either stalls past this (e.g. alternates reads hitting a degraded
@@ -362,6 +364,8 @@ function probeDeviceReadHealth(device) {
     return __awaiter(this, void 0, void 0, function* () {
         const start = Date.now();
         const result = yield exec.getExecOutput('timeout', [
+            '-k',
+            String(READ_PROBE_KILL_AFTER_SECS),
             String(READ_PROBE_TIMEOUT_SECS),
             'sudo',
             'dd',
@@ -591,6 +595,27 @@ function removeAlternates(workspacePath) {
         }
         catch (_a) {
             // File may not exist, that's fine
+        }
+    });
+}
+/**
+ * Remove stale git lock files left behind when a git process is killed
+ * (e.g. by the stall timeout) without a chance to clean up.
+ */
+function removeStaleGitLocks(workspacePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const lockFiles = [
+            path.join(workspacePath, '.git', 'index.lock'),
+            path.join(workspacePath, '.git', 'shallow.lock')
+        ];
+        for (const lockFile of lockFiles) {
+            try {
+                yield fs.promises.unlink(lockFile);
+                core.info(`[git-mirror] Removed stale lock file ${lockFile}`);
+            }
+            catch (_a) {
+                // File may not exist, that's fine
+            }
         }
     });
 }
@@ -1834,6 +1859,12 @@ class GitCommandManager {
     fetch(refSpec, options) {
         return __awaiter(this, void 0, void 0, function* () {
             const args = ['-c', 'protocol.version=2', 'fetch'];
+            if (options.refetch) {
+                // Re-download all objects without negotiating with the server, so
+                // objects previously borrowed from a (now detached) mirror via
+                // alternates are fetched again instead of being assumed present.
+                args.push('--refetch');
+            }
             if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
                 args.push('--no-tags');
             }
@@ -2453,6 +2484,9 @@ const stateHelper = __importStar(__nccwpck_require__(4866));
 const urlHelper = __importStar(__nccwpck_require__(9437));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
 const git_command_manager_1 = __nccwpck_require__(738);
+const git_version_1 = __nccwpck_require__(3142);
+// `git fetch --refetch` requires Git 2.36+.
+const MinimumGitRefetchVersion = new git_version_1.GitVersion('2.36');
 function getSource(settings) {
     return __awaiter(this, void 0, void 0, function* () {
         // Repository URL
@@ -2596,8 +2630,14 @@ function getSource(settings) {
             const disableMirrorAfterStall = (operation) => __awaiter(this, void 0, void 0, function* () {
                 core.warning(`[git-mirror] ${operation} stalled after ${blacksmithCache.MIRROR_STALL_TIMEOUT_SECS}s with the mirror attached; detaching mirror and falling back to network-only checkout`);
                 yield blacksmithCache.removeAlternates(settings.repositoryPath);
+                // The killed git process may have left stale lock files behind
+                yield blacksmithCache.removeStaleGitLocks(settings.repositoryPath);
                 cacheInfo = null;
             });
+            // After the mirror is detached, objects previously borrowed via
+            // alternates are missing locally even though refs may point at them.
+            // --refetch skips negotiation so those objects are downloaded again.
+            const canRefetch = (yield git.version()).checkMinimum(MinimumGitRefetchVersion);
             // Fetch
             core.startGroup('Fetching the repository');
             const fetchOptions = {};
@@ -2620,7 +2660,7 @@ function getSource(settings) {
                         throw error;
                     }
                     yield disableMirrorAfterStall('git fetch');
-                    yield git.fetch(refSpec, fetchOptions);
+                    yield git.fetch(refSpec, Object.assign(Object.assign({}, fetchOptions), { refetch: canRefetch }));
                 }
             });
             if (settings.fetchDepth <= 0) {
@@ -2685,7 +2725,7 @@ function getSource(settings) {
                     yield disableMirrorAfterStall('git checkout');
                     // Objects previously borrowed from the mirror are gone with the
                     // alternates file; re-fetch so they exist locally, then retry.
-                    yield git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), fetchOptions);
+                    yield git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), Object.assign(Object.assign({}, fetchOptions), { refetch: canRefetch }));
                     yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
                 }
             }

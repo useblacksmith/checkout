@@ -15,7 +15,11 @@ import {
   IGitCommandManager,
   GitStallTimeoutError
 } from './git-command-manager'
+import {GitVersion} from './git-version'
 import {IGitSourceSettings} from './git-source-settings'
+
+// `git fetch --refetch` requires Git 2.36+.
+const MinimumGitRefetchVersion = new GitVersion('2.36')
 
 export async function getSource(settings: IGitSourceSettings): Promise<void> {
   // Repository URL
@@ -226,8 +230,17 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         `[git-mirror] ${operation} stalled after ${blacksmithCache.MIRROR_STALL_TIMEOUT_SECS}s with the mirror attached; detaching mirror and falling back to network-only checkout`
       )
       await blacksmithCache.removeAlternates(settings.repositoryPath)
+      // The killed git process may have left stale lock files behind
+      await blacksmithCache.removeStaleGitLocks(settings.repositoryPath)
       cacheInfo = null
     }
+
+    // After the mirror is detached, objects previously borrowed via
+    // alternates are missing locally even though refs may point at them.
+    // --refetch skips negotiation so those objects are downloaded again.
+    const canRefetch = (await git.version()).checkMinimum(
+      MinimumGitRefetchVersion
+    )
 
     // Fetch
     core.startGroup('Fetching the repository')
@@ -261,7 +274,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           throw error
         }
         await disableMirrorAfterStall('git fetch')
-        await git.fetch(refSpec, fetchOptions)
+        await git.fetch(refSpec, {...fetchOptions, refetch: canRefetch})
       }
     }
 
@@ -339,10 +352,10 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         await disableMirrorAfterStall('git checkout')
         // Objects previously borrowed from the mirror are gone with the
         // alternates file; re-fetch so they exist locally, then retry.
-        await git.fetch(
-          refHelper.getRefSpec(settings.ref, settings.commit),
-          fetchOptions
-        )
+        await git.fetch(refHelper.getRefSpec(settings.ref, settings.commit), {
+          ...fetchOptions,
+          refetch: canRefetch
+        })
         await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
       }
     } else {

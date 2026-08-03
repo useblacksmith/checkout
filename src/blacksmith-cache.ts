@@ -31,6 +31,7 @@ const TIMEOUT_EXIT_CODE = 124
 // stalls fetch/checkout until the customer's step timeout kills the job.
 // If the probe cannot read a few MB quickly, skip the mirror entirely.
 const READ_PROBE_TIMEOUT_SECS = 10
+const READ_PROBE_KILL_AFTER_SECS = 5
 const READ_PROBE_MB = 8
 
 // Deadline applied to mirror-assisted `git fetch`/`git checkout` in the main
@@ -406,6 +407,8 @@ async function probeDeviceReadHealth(device: string): Promise<boolean> {
   const result = await exec.getExecOutput(
     'timeout',
     [
+      '-k',
+      String(READ_PROBE_KILL_AFTER_SECS),
       String(READ_PROBE_TIMEOUT_SECS),
       'sudo',
       'dd',
@@ -691,6 +694,27 @@ export async function removeAlternates(workspacePath: string): Promise<void> {
     core.info('[git-mirror] Removed alternates file')
   } catch {
     // File may not exist, that's fine
+  }
+}
+
+/**
+ * Remove stale git lock files left behind when a git process is killed
+ * (e.g. by the stall timeout) without a chance to clean up.
+ */
+export async function removeStaleGitLocks(
+  workspacePath: string
+): Promise<void> {
+  const lockFiles = [
+    path.join(workspacePath, '.git', 'index.lock'),
+    path.join(workspacePath, '.git', 'shallow.lock')
+  ]
+  for (const lockFile of lockFiles) {
+    try {
+      await fs.promises.unlink(lockFile)
+      core.info(`[git-mirror] Removed stale lock file ${lockFile}`)
+    } catch {
+      // File may not exist, that's fine
+    }
   }
 }
 

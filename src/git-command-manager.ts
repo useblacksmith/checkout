@@ -61,6 +61,7 @@ export interface IGitCommandManager {
       fetchTags?: boolean
       showProgress?: boolean
       stallTimeoutSecs?: number
+      refetch?: boolean
     }
   ): Promise<void>
   getDefaultBranch(repositoryUrl: string): Promise<string>
@@ -314,9 +315,16 @@ class GitCommandManager {
       fetchTags?: boolean
       showProgress?: boolean
       stallTimeoutSecs?: number
+      refetch?: boolean
     }
   ): Promise<void> {
     const args = ['-c', 'protocol.version=2', 'fetch']
+    if (options.refetch) {
+      // Re-download all objects without negotiating with the server, so
+      // objects previously borrowed from a (now detached) mirror via
+      // alternates are fetched again instead of being assumed present.
+      args.push('--refetch')
+    }
     if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
       args.push('--no-tags')
     }
