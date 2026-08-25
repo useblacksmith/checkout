@@ -56,22 +56,35 @@ async function cleanup(): Promise<void> {
     }
 
     // Refresh the git mirror in the post step (outside the critical checkout path)
-    // This updates the mirror for future runs without blocking the workflow
+    // This updates the mirror for future runs without blocking the workflow.
+    // A probabilistic staleness gate decides whether this job refreshes at
+    // all: concurrent jobs on a busy repo would otherwise each repeat the
+    // same all-refs fetch against the remote, even when the mirror is only
+    // seconds old.
+    let refreshSkipped = false
     if (mirrorPath && repoUrl && !performedHydration) {
       core.startGroup('Refreshing Blacksmith git mirror')
-      // Re-read auth token from input (don't store sensitive data in state)
-      const authToken = core.getInput('token', {required: false})
-      if (authToken) {
-        refreshResult = await blacksmithCache.refreshMirror(
-          mirrorPath,
-          repoUrl,
-          authToken,
-          verbose
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorPath)
+      if (!decision.refresh) {
+        refreshSkipped = true
+        core.info(
+          `[git-mirror] Skipping mirror refresh: mirror is ${Math.round(decision.ageSecs)}s old (refresh probability ${decision.probability.toFixed(3)})`
         )
       } else {
-        core.warning(
-          '[git-mirror] No auth token available, skipping mirror refresh'
-        )
+        // Re-read auth token from input (don't store sensitive data in state)
+        const authToken = core.getInput('token', {required: false})
+        if (authToken) {
+          refreshResult = await blacksmithCache.refreshMirror(
+            mirrorPath,
+            repoUrl,
+            authToken,
+            verbose
+          )
+        } else {
+          core.warning(
+            '[git-mirror] No auth token available, skipping mirror refresh'
+          )
+        }
       }
       core.endGroup()
     }
@@ -119,12 +132,21 @@ async function cleanup(): Promise<void> {
         core.info('[git-mirror] No previous step failures detected')
       }
 
+      // When the refresh was skipped, nothing changed the mirror, so skip GC
+      // and commit as well: unmount and release the sticky disk untouched.
+      if (refreshSkipped) {
+        core.info(
+          '[git-mirror] Refresh skipped, releasing sticky disk without commit'
+        )
+        shouldCommit = false
+      }
+
       cleanupResult = await blacksmithCache.cleanup({
         exposeId,
         stickyDiskKey,
         repoName: repoName || undefined,
         mountPoint: mountPoint || undefined,
-        mirrorPath: mirrorPath || undefined,
+        mirrorPath: refreshSkipped ? undefined : mirrorPath || undefined,
         shouldCommit,
         vmHydratedGitMirror,
         mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
@@ -137,6 +159,9 @@ async function cleanup(): Promise<void> {
     }
 
     // Report metrics for any failures/timeouts (fire-and-forget)
+    if (refreshSkipped) {
+      await reportInternalMetric('git_mirror_refresh_skipped', 1, {})
+    }
     if (!refreshResult.success) {
       await reportInternalMetric('git_mirror_refresh_failure', 1, {
         reason: refreshResult.timedOut ? 'timeout' : 'failure'

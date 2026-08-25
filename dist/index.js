@@ -48,6 +48,7 @@ exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
+exports.shouldRefreshMirror = shouldRefreshMirror;
 exports.refreshMirror = refreshMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
@@ -67,6 +68,9 @@ const AGENT_RPC_TIMEOUT_MS = 45000;
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
+// Target mirror refresh interval for the probabilistic staleness gate.
+// Refresh probability ramps with staleness and reaches 1 at twice this age.
+const REFRESH_TARGET_INTERVAL_SECS = 300; // 5 minutes
 const GC_TIMEOUT_SECS = 120; // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
@@ -419,6 +423,55 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         return true; // Initial hydration performed
     });
 }
+function getRefreshTargetIntervalSecs() {
+    const raw = process.env.BLACKSMITH_MIRROR_REFRESH_TARGET_SECS;
+    if (raw !== undefined && raw !== '') {
+        const parsed = Number(raw);
+        if (!isNaN(parsed) && parsed >= 0) {
+            return parsed;
+        }
+        core.warning(`[git-mirror] Invalid BLACKSMITH_MIRROR_REFRESH_TARGET_SECS value "${raw}", using default ${REFRESH_TARGET_INTERVAL_SECS}`);
+    }
+    return REFRESH_TARGET_INTERVAL_SECS;
+}
+/**
+ * Probabilistic staleness gate for the post-step mirror refresh (inspired by
+ * probabilistic early expiration / XFetch). Every job flips a coin weighted
+ * by how stale the mirror is: p = min(1, (age/target)^2 / 4), which is ~0
+ * for a fresh mirror, 25% at the target age, and 1 at twice the target age.
+ *
+ * This self-tunes across traffic levels without any cross-VM coordination:
+ * busy repos make many low-probability attempts (so ~one job refreshes per
+ * target interval instead of every job), while on quiet repos the age keeps
+ * growing until a lone job's probability reaches 1. The smooth ramp (instead
+ * of a hard age threshold) avoids a refresh herd right after the target age,
+ * since a committed refresh only becomes visible to new VMs once its sticky
+ * disk commit lands.
+ *
+ * Staleness is read from the mirror's FETCH_HEAD mtime, which is preserved
+ * by sticky disk snapshots and updated by every refresh fetch. A mirror with
+ * no FETCH_HEAD (never refreshed since hydration) is treated as maximally
+ * stale. Setting BLACKSMITH_MIRROR_REFRESH_TARGET_SECS=0 disables the gate
+ * (always refresh).
+ */
+function shouldRefreshMirror(mirrorPath) {
+    const targetSecs = getRefreshTargetIntervalSecs();
+    if (targetSecs === 0) {
+        return { refresh: true, ageSecs: Infinity, probability: 1 };
+    }
+    let ageSecs = Infinity;
+    try {
+        const stat = fs.statSync(path.join(mirrorPath, 'FETCH_HEAD'));
+        ageSecs = Math.max(0, (Date.now() - stat.mtimeMs) / 1000);
+    }
+    catch (_a) {
+        // No FETCH_HEAD: never refreshed since hydration - treat as maximally stale
+    }
+    const probability = ageSecs === Infinity
+        ? 1
+        : Math.min(1, Math.pow(ageSecs / targetSecs, 2) / 4);
+    return { refresh: Math.random() < probability, ageSecs, probability };
+}
 /**
  * Refresh an existing git mirror by fetching updates from the remote.
  * This is called in the post step to update the mirror for future runs,
@@ -445,20 +498,36 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                 // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
                 // files on the mirror mount, causing the subsequent umount to fail with
                 // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
+                // Fetch only heads and tags rather than the mirror's default
+                // +refs/*:refs/* refspec: most of a busy repository's refs are
+                // refs/pull/* and the ref advertisement/negotiation cost of the fetch
+                // is proportional to ref count, not to new data. Pull-ref objects a
+                // job needs are fetched directly into its workspace on demand.
+                // fetch.negotiationAlgorithm=skipping reduces negotiation rounds
+                // against large ref counts. BLACKSMITH_MIRROR_REFRESH_ALL_REFS=true
+                // restores the previous all-refs behavior.
+                const allRefs = (process.env.BLACKSMITH_MIRROR_REFRESH_ALL_REFS || '').toUpperCase() ===
+                    'TRUE';
                 const fetchArgs = [
                     '-c',
                     `${configKey}=${configValue}`,
                     '-c',
                     'gc.auto=0',
+                    '-c',
+                    'fetch.negotiationAlgorithm=skipping',
                     '-C',
                     mirrorPath,
                     'fetch',
                     '--prune',
-                    'origin'
+                    'origin',
+                    ...(allRefs
+                        ? []
+                        : ['+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*'])
                 ];
                 if (verbose) {
                     fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
                 }
+                const fetchStart = Date.now();
                 const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true, silent: !verbose });
                 if (result.exitCode === TIMEOUT_EXIT_CODE) {
                     throw new Error(`git fetch timed out after ${timeoutSecs}s`);
@@ -469,6 +538,7 @@ function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                     const details = stderr ? `: ${stderr}` : '';
                     throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
                 }
+                core.info(`[git-mirror] Refresh fetch finished in ${Date.now() - fetchStart}ms`);
             }));
             core.info('[git-mirror] Mirror refresh complete');
             return { success: true, timedOut: false };
@@ -535,6 +605,7 @@ function runMirrorGC(mirrorPath_1) {
             // Without this, the parent `git gc --auto` returns immediately while the
             // daemonized child keeps running with cwd and mmap'd pack files on the
             // mirror mount, causing the subsequent `umount` to fail with EBUSY.
+            const gcStart = Date.now();
             const result = yield exec.getExecOutput('timeout', [
                 String(timeoutSecs),
                 'git',
@@ -561,7 +632,7 @@ function runMirrorGC(mirrorPath_1) {
                     error: `git gc failed with exit code ${result.exitCode}`
                 };
             }
-            core.debug('[git-mirror] Completed git gc --auto');
+            core.info(`[git-mirror] Completed git gc --auto in ${Date.now() - gcStart}ms`);
             return { success: true, timedOut: false };
         }
         catch (error) {
@@ -3213,16 +3284,28 @@ function cleanup() {
                 timedOut: false
             };
             // Refresh the git mirror in the post step (outside the critical checkout path)
-            // This updates the mirror for future runs without blocking the workflow
+            // This updates the mirror for future runs without blocking the workflow.
+            // A probabilistic staleness gate decides whether this job refreshes at
+            // all: concurrent jobs on a busy repo would otherwise each repeat the
+            // same all-refs fetch against the remote, even when the mirror is only
+            // seconds old.
+            let refreshSkipped = false;
             if (mirrorPath && repoUrl && !performedHydration) {
                 core.startGroup('Refreshing Blacksmith git mirror');
-                // Re-read auth token from input (don't store sensitive data in state)
-                const authToken = core.getInput('token', { required: false });
-                if (authToken) {
-                    refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
+                const decision = blacksmithCache.shouldRefreshMirror(mirrorPath);
+                if (!decision.refresh) {
+                    refreshSkipped = true;
+                    core.info(`[git-mirror] Skipping mirror refresh: mirror is ${Math.round(decision.ageSecs)}s old (refresh probability ${decision.probability.toFixed(3)})`);
                 }
                 else {
-                    core.warning('[git-mirror] No auth token available, skipping mirror refresh');
+                    // Re-read auth token from input (don't store sensitive data in state)
+                    const authToken = core.getInput('token', { required: false });
+                    if (authToken) {
+                        refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
+                    }
+                    else {
+                        core.warning('[git-mirror] No auth token available, skipping mirror refresh');
+                    }
                 }
                 core.endGroup();
             }
@@ -3259,12 +3342,18 @@ function cleanup() {
                 else {
                     core.info('[git-mirror] No previous step failures detected');
                 }
+                // When the refresh was skipped, nothing changed the mirror, so skip GC
+                // and commit as well: unmount and release the sticky disk untouched.
+                if (refreshSkipped) {
+                    core.info('[git-mirror] Refresh skipped, releasing sticky disk without commit');
+                    shouldCommit = false;
+                }
                 cleanupResult = yield blacksmithCache.cleanup({
                     exposeId,
                     stickyDiskKey,
                     repoName: repoName || undefined,
                     mountPoint: mountPoint || undefined,
-                    mirrorPath: mirrorPath || undefined,
+                    mirrorPath: refreshSkipped ? undefined : mirrorPath || undefined,
                     shouldCommit,
                     vmHydratedGitMirror,
                     mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
@@ -3275,6 +3364,9 @@ function cleanup() {
                 core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
             }
             // Report metrics for any failures/timeouts (fire-and-forget)
+            if (refreshSkipped) {
+                yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_refresh_skipped', 1, {});
+            }
             if (!refreshResult.success) {
                 yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_refresh_failure', 1, {
                     reason: refreshResult.timedOut ? 'timeout' : 'failure'

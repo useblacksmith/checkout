@@ -15,6 +15,9 @@ const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
 const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
+// Target mirror refresh interval for the probabilistic staleness gate.
+// Refresh probability ramps with staleness and reaches 1 at twice this age.
+const REFRESH_TARGET_INTERVAL_SECS = 300 // 5 minutes
 const GC_TIMEOUT_SECS = 120 // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
@@ -472,6 +475,70 @@ export async function ensureMirror(
 }
 
 /**
+ * Decision returned by shouldRefreshMirror.
+ */
+export interface RefreshDecision {
+  refresh: boolean
+  ageSecs: number
+  probability: number
+}
+
+function getRefreshTargetIntervalSecs(): number {
+  const raw = process.env.BLACKSMITH_MIRROR_REFRESH_TARGET_SECS
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw)
+    if (!isNaN(parsed) && parsed >= 0) {
+      return parsed
+    }
+    core.warning(
+      `[git-mirror] Invalid BLACKSMITH_MIRROR_REFRESH_TARGET_SECS value "${raw}", using default ${REFRESH_TARGET_INTERVAL_SECS}`
+    )
+  }
+  return REFRESH_TARGET_INTERVAL_SECS
+}
+
+/**
+ * Probabilistic staleness gate for the post-step mirror refresh (inspired by
+ * probabilistic early expiration / XFetch). Every job flips a coin weighted
+ * by how stale the mirror is: p = min(1, (age/target)^2 / 4), which is ~0
+ * for a fresh mirror, 25% at the target age, and 1 at twice the target age.
+ *
+ * This self-tunes across traffic levels without any cross-VM coordination:
+ * busy repos make many low-probability attempts (so ~one job refreshes per
+ * target interval instead of every job), while on quiet repos the age keeps
+ * growing until a lone job's probability reaches 1. The smooth ramp (instead
+ * of a hard age threshold) avoids a refresh herd right after the target age,
+ * since a committed refresh only becomes visible to new VMs once its sticky
+ * disk commit lands.
+ *
+ * Staleness is read from the mirror's FETCH_HEAD mtime, which is preserved
+ * by sticky disk snapshots and updated by every refresh fetch. A mirror with
+ * no FETCH_HEAD (never refreshed since hydration) is treated as maximally
+ * stale. Setting BLACKSMITH_MIRROR_REFRESH_TARGET_SECS=0 disables the gate
+ * (always refresh).
+ */
+export function shouldRefreshMirror(mirrorPath: string): RefreshDecision {
+  const targetSecs = getRefreshTargetIntervalSecs()
+  if (targetSecs === 0) {
+    return {refresh: true, ageSecs: Infinity, probability: 1}
+  }
+
+  let ageSecs = Infinity
+  try {
+    const stat = fs.statSync(path.join(mirrorPath, 'FETCH_HEAD'))
+    ageSecs = Math.max(0, (Date.now() - stat.mtimeMs) / 1000)
+  } catch {
+    // No FETCH_HEAD: never refreshed since hydration - treat as maximally stale
+  }
+
+  const probability =
+    ageSecs === Infinity
+      ? 1
+      : Math.min(1, Math.pow(ageSecs / targetSecs, 2) / 4)
+  return {refresh: Math.random() < probability, ageSecs, probability}
+}
+
+/**
  * Refresh an existing git mirror by fetching updates from the remote.
  * This is called in the post step to update the mirror for future runs,
  * outside of the critical checkout path.
@@ -508,16 +575,32 @@ export async function refreshMirror(
       // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
       // files on the mirror mount, causing the subsequent umount to fail with
       // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
+      // Fetch only heads and tags rather than the mirror's default
+      // +refs/*:refs/* refspec: most of a busy repository's refs are
+      // refs/pull/* and the ref advertisement/negotiation cost of the fetch
+      // is proportional to ref count, not to new data. Pull-ref objects a
+      // job needs are fetched directly into its workspace on demand.
+      // fetch.negotiationAlgorithm=skipping reduces negotiation rounds
+      // against large ref counts. BLACKSMITH_MIRROR_REFRESH_ALL_REFS=true
+      // restores the previous all-refs behavior.
+      const allRefs =
+        (process.env.BLACKSMITH_MIRROR_REFRESH_ALL_REFS || '').toUpperCase() ===
+        'TRUE'
       const fetchArgs = [
         '-c',
         `${configKey}=${configValue}`,
         '-c',
         'gc.auto=0',
+        '-c',
+        'fetch.negotiationAlgorithm=skipping',
         '-C',
         mirrorPath,
         'fetch',
         '--prune',
-        'origin'
+        'origin',
+        ...(allRefs
+          ? []
+          : ['+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*'])
       ]
       if (verbose) {
         fetchArgs.splice(
@@ -527,6 +610,7 @@ export async function refreshMirror(
           '--verbose'
         )
       }
+      const fetchStart = Date.now()
       const result = await exec.getExecOutput(
         'timeout',
         [String(timeoutSecs), 'git', ...fetchArgs],
@@ -543,6 +627,9 @@ export async function refreshMirror(
           `git fetch failed with exit code ${result.exitCode}${details}`
         )
       }
+      core.info(
+        `[git-mirror] Refresh fetch finished in ${Date.now() - fetchStart}ms`
+      )
     })
     core.info('[git-mirror] Mirror refresh complete')
     return {success: true, timedOut: false}
@@ -621,6 +708,7 @@ async function runMirrorGC(
     // Without this, the parent `git gc --auto` returns immediately while the
     // daemonized child keeps running with cwd and mmap'd pack files on the
     // mirror mount, causing the subsequent `umount` to fail with EBUSY.
+    const gcStart = Date.now()
     const result = await exec.getExecOutput(
       'timeout',
       [
@@ -651,7 +739,9 @@ async function runMirrorGC(
         error: `git gc failed with exit code ${result.exitCode}`
       }
     }
-    core.debug('[git-mirror] Completed git gc --auto')
+    core.info(
+      `[git-mirror] Completed git gc --auto in ${Date.now() - gcStart}ms`
+    )
     return {success: true, timedOut: false}
   } catch (error) {
     const msg = (error as Error).message || String(error)
