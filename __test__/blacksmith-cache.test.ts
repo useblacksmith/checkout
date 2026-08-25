@@ -20,6 +20,9 @@ jest.mock('../src/container-detector', () => ({
   isRunningInContainer: jest.fn(() => false)
 }))
 
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import * as blacksmithCache from '../src/blacksmith-cache'
 import {isRunningInContainer} from '../src/container-detector'
 
@@ -262,6 +265,83 @@ describe('blacksmith-cache tests', () => {
     it('is case-insensitive for the environment variable', () => {
       process.env['BLACKSMITH_ALLOW_INSIDE_CONTAINER'] = 'TRUE'
       expect(blacksmithCache.isAllowedInsideContainer()).toBe(true)
+    })
+  })
+
+  describe('shouldRefreshMirror', () => {
+    const originalEnv = process.env
+    let mirrorDir: string
+
+    const setFetchHeadAge = (ageSecs: number): void => {
+      const fetchHead = path.join(mirrorDir, 'FETCH_HEAD')
+      fs.writeFileSync(fetchHead, '')
+      const t = new Date(Date.now() - ageSecs * 1000)
+      fs.utimesSync(fetchHead, t, t)
+    }
+
+    beforeEach(() => {
+      process.env = {...originalEnv}
+      delete process.env.BLACKSMITH_MIRROR_REFRESH_TARGET_SECS
+      mirrorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-test-'))
+    })
+
+    afterEach(() => {
+      fs.rmSync(mirrorDir, {recursive: true, force: true})
+      jest.restoreAllMocks()
+    })
+
+    afterAll(() => {
+      process.env = originalEnv
+    })
+
+    it('always refreshes when FETCH_HEAD is missing', () => {
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.refresh).toBe(true)
+      expect(decision.probability).toBe(1)
+      expect(decision.ageSecs).toBe(Infinity)
+    })
+
+    it('gives a fresh mirror a near-zero probability', () => {
+      setFetchHeadAge(10)
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.probability).toBeLessThan(0.001)
+    })
+
+    it('gives ~25% probability at the target age', () => {
+      setFetchHeadAge(300)
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.probability).toBeGreaterThan(0.2)
+      expect(decision.probability).toBeLessThan(0.3)
+    })
+
+    it('always refreshes at twice the target age', () => {
+      setFetchHeadAge(600)
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.probability).toBe(1)
+      expect(decision.refresh).toBe(true)
+    })
+
+    it('uses the drawn random value against the probability', () => {
+      setFetchHeadAge(300)
+      jest.spyOn(Math, 'random').mockReturnValue(0.99)
+      expect(blacksmithCache.shouldRefreshMirror(mirrorDir).refresh).toBe(false)
+      jest.spyOn(Math, 'random').mockReturnValue(0.01)
+      expect(blacksmithCache.shouldRefreshMirror(mirrorDir).refresh).toBe(true)
+    })
+
+    it('respects BLACKSMITH_MIRROR_REFRESH_TARGET_SECS', () => {
+      process.env.BLACKSMITH_MIRROR_REFRESH_TARGET_SECS = '30'
+      setFetchHeadAge(60)
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.probability).toBe(1)
+    })
+
+    it('disables the gate when target is 0', () => {
+      process.env.BLACKSMITH_MIRROR_REFRESH_TARGET_SECS = '0'
+      setFetchHeadAge(1)
+      const decision = blacksmithCache.shouldRefreshMirror(mirrorDir)
+      expect(decision.refresh).toBe(true)
+      expect(decision.probability).toBe(1)
     })
   })
 
