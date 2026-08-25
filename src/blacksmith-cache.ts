@@ -26,6 +26,10 @@ const UMOUNT_BACKOFF_MULTIPLIER = 2 // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124
 
+// Cap on --negotiation-tip arguments passed to the mirror sync fetch, to
+// bound the command line length when many refs changed at once.
+const MAX_NEGOTIATION_TIPS = 1000
+
 /**
  * Result of a git mirror operation that may fail or time out.
  */
@@ -541,6 +545,11 @@ interface RefDiff {
   updatedRefSpecs: string[]
   deletedRefs: string[]
   remoteRefCount: number
+  // Old local tips of the refs being updated, used as --negotiation-tip
+  // arguments so git only reports commits reachable from these tips instead
+  // of walking every local ref (mark_complete_local_refs is O(all refs) in
+  // cold-cache pack reads otherwise).
+  negotiationTips: string[]
 }
 
 /**
@@ -588,9 +597,23 @@ export function diffMirrorRefs(
   }
 
   const updatedRefSpecs: string[] = []
+  const negotiationTips: string[] = []
   for (const [refName, sha] of remoteRefs) {
-    if (localRefs.get(refName) !== sha) {
+    const localSha = localRefs.get(refName)
+    if (localSha !== sha) {
       updatedRefSpecs.push(`+${refName}:${refName}`)
+      if (localSha) {
+        negotiationTips.push(localSha)
+      }
+    }
+  }
+  if (negotiationTips.length === 0) {
+    // Every changed ref is new locally; negotiate from the default branch
+    // tip so the server still learns about the bulk of shared history.
+    const fallback =
+      localRefs.get('refs/heads/main') ?? localRefs.get('refs/heads/master')
+    if (fallback) {
+      negotiationTips.push(fallback)
     }
   }
 
@@ -601,7 +624,12 @@ export function diffMirrorRefs(
     }
   }
 
-  return {updatedRefSpecs, deletedRefs, remoteRefCount: remoteRefs.size}
+  return {
+    updatedRefSpecs,
+    deletedRefs,
+    remoteRefCount: remoteRefs.size,
+    negotiationTips
+  }
 }
 
 /**
@@ -731,6 +759,14 @@ export async function syncMirrorFromRemote(
           'fetch',
           '--no-tags',
           '--stdin',
+          // Restrict negotiation to the changed refs' old tips. Without
+          // this, git's mark_complete_local_refs walks every local ref and
+          // parses each tip commit out of the pack - tens of seconds of
+          // random reads on a large mirror when the sticky disk's pages are
+          // cold.
+          ...diff.negotiationTips
+            .slice(0, MAX_NEGOTIATION_TIPS)
+            .map(tip => `--negotiation-tip=${tip}`),
           'origin'
         ]
         if (verbose) {

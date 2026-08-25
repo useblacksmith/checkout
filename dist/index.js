@@ -78,6 +78,9 @@ const UMOUNT_INITIAL_DELAY_MS = 1000; // Initial delay between retries (1 second
 const UMOUNT_BACKOFF_MULTIPLIER = 2; // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
+// Cap on --negotiation-tip arguments passed to the mirror sync fetch, to
+// bound the command line length when many refs changed at once.
+const MAX_NEGOTIATION_TIPS = 1000;
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
@@ -479,6 +482,7 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
  * @param localRefsOutput - stdout of `git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags`
  */
 function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
+    var _a;
     const remoteRefs = new Map();
     for (const line of lsRemoteOutput.split('\n')) {
         const trimmed = line.trim();
@@ -511,9 +515,22 @@ function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
         localRefs.set(refName, sha);
     }
     const updatedRefSpecs = [];
+    const negotiationTips = [];
     for (const [refName, sha] of remoteRefs) {
-        if (localRefs.get(refName) !== sha) {
+        const localSha = localRefs.get(refName);
+        if (localSha !== sha) {
             updatedRefSpecs.push(`+${refName}:${refName}`);
+            if (localSha) {
+                negotiationTips.push(localSha);
+            }
+        }
+    }
+    if (negotiationTips.length === 0) {
+        // Every changed ref is new locally; negotiate from the default branch
+        // tip so the server still learns about the bulk of shared history.
+        const fallback = (_a = localRefs.get('refs/heads/main')) !== null && _a !== void 0 ? _a : localRefs.get('refs/heads/master');
+        if (fallback) {
+            negotiationTips.push(fallback);
         }
     }
     const deletedRefs = [];
@@ -522,7 +539,12 @@ function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
             deletedRefs.push(refName);
         }
     }
-    return { updatedRefSpecs, deletedRefs, remoteRefCount: remoteRefs.size };
+    return {
+        updatedRefSpecs,
+        deletedRefs,
+        remoteRefCount: remoteRefs.size,
+        negotiationTips
+    };
 }
 /**
  * Synchronize the mirror with the remote before the workspace is populated
@@ -623,6 +645,14 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         'fetch',
                         '--no-tags',
                         '--stdin',
+                        // Restrict negotiation to the changed refs' old tips. Without
+                        // this, git's mark_complete_local_refs walks every local ref and
+                        // parses each tip commit out of the pack - tens of seconds of
+                        // random reads on a large mirror when the sticky disk's pages are
+                        // cold.
+                        ...diff.negotiationTips
+                            .slice(0, MAX_NEGOTIATION_TIPS)
+                            .map(tip => `--negotiation-tip=${tip}`),
                         'origin'
                     ];
                     if (verbose) {

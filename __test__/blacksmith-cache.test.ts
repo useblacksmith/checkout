@@ -290,6 +290,23 @@ describe('blacksmith-cache tests', () => {
       expect(diff.deletedRefs).toEqual([])
     })
 
+    it('uses old tips of changed refs as negotiation tips', () => {
+      const lsRemote = `${shaB}\trefs/heads/main\n${shaC}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/main\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.negotiationTips).toEqual([shaA])
+    })
+
+    it('falls back to the default branch tip when all changed refs are new', () => {
+      const lsRemote = `${shaA}\trefs/heads/main\n${shaC}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/main\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([
+        '+refs/heads/feature:refs/heads/feature'
+      ])
+      expect(diff.negotiationTips).toEqual([shaA])
+    })
+
     it('detects refs deleted on the remote', () => {
       const lsRemote = `${shaA}\trefs/heads/main\n`
       const local = `${shaA} refs/heads/main\n${shaB} refs/heads/gone\n`
