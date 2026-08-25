@@ -265,6 +265,67 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('diffMirrorRefs', () => {
+    const shaA = 'a'.repeat(40)
+    const shaB = 'b'.repeat(40)
+    const shaC = 'c'.repeat(40)
+
+    it('returns no changes when local refs match the remote', () => {
+      const lsRemote = `${shaA}\trefs/heads/main\n${shaB}\trefs/tags/v1\n`
+      const local = `${shaA} refs/heads/main\n${shaB} refs/tags/v1\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([])
+      expect(diff.deletedRefs).toEqual([])
+      expect(diff.remoteRefCount).toBe(2)
+    })
+
+    it('detects moved and new refs', () => {
+      const lsRemote = `${shaB}\trefs/heads/main\n${shaC}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/main\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs.sort()).toEqual([
+        '+refs/heads/feature:refs/heads/feature',
+        '+refs/heads/main:refs/heads/main'
+      ])
+      expect(diff.deletedRefs).toEqual([])
+    })
+
+    it('detects refs deleted on the remote', () => {
+      const lsRemote = `${shaA}\trefs/heads/main\n`
+      const local = `${shaA} refs/heads/main\n${shaB} refs/heads/gone\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([])
+      expect(diff.deletedRefs).toEqual(['refs/heads/gone'])
+    })
+
+    it('ignores peeled annotated tag entries', () => {
+      const lsRemote = `${shaA}\trefs/tags/v1\n${shaB}\trefs/tags/v1^{}\n`
+      const local = `${shaA} refs/tags/v1\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([])
+      expect(diff.deletedRefs).toEqual([])
+      expect(diff.remoteRefCount).toBe(1)
+    })
+
+    it('handles empty inputs', () => {
+      const diff = blacksmithCache.diffMirrorRefs('', '')
+      expect(diff.updatedRefSpecs).toEqual([])
+      expect(diff.deletedRefs).toEqual([])
+      expect(diff.remoteRefCount).toBe(0)
+    })
+
+    it('marks local refs missing from the advertisement as deletions', () => {
+      const lsRemote = `${shaA}\trefs/heads/main\n`
+      const local = `${shaA} refs/heads/main\n${shaB} refs/heads/gone\n${shaC} refs/tags/v0.1\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([])
+      expect(diff.deletedRefs.sort()).toEqual([
+        'refs/heads/gone',
+        'refs/tags/v0.1'
+      ])
+    })
+  })
+
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:

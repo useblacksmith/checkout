@@ -222,7 +222,16 @@ class GitCommandManager {
   }
 
   async checkout(ref: string, startPoint: string): Promise<void> {
-    const args = ['checkout', '--progress', '--force']
+    // checkout.workers < 1 means "use the number of logical cores" (git 2.32+;
+    // ignored by older versions). Parallel workers overlap the synchronous
+    // object reads and file writes that dominate large worktree checkouts.
+    const args = [
+      '-c',
+      'checkout.workers=0',
+      'checkout',
+      '--progress',
+      '--force'
+    ]
     if (startPoint) {
       args.push('-B', ref, startPoint)
     } else {

@@ -112,6 +112,10 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // so flipping that flag disables the entire Blacksmith code path here
     // and in the post step.
     let cacheInfo: blacksmithCache.CacheInfo | null = null
+    // mirrorFresh indicates the mirror's branch/tag refs match the remote as
+    // of this run (hydrated now, or synced via ls-remote diff). Only then can
+    // the workspace copy its refs from the mirror instead of the network.
+    let mirrorFresh = false
     if (blacksmithCache.shouldUseBlacksmithCache()) {
       try {
         core.startGroup('Setting up Blacksmith git mirror cache')
@@ -132,9 +136,6 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName)
           stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
           stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint)
-          // Save repo URL and verbose flag for post step mirror refresh
-          stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
-          stateHelper.setBlacksmithCacheVerbose(settings.verbose)
 
           const performedHydration = await blacksmithCache.ensureMirror(
             cacheInfo.mirrorPath,
@@ -143,6 +144,39 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
             settings.verbose
           )
           stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
+
+          if (performedHydration) {
+            // A freshly-cloned mirror is exactly the remote's current state
+            mirrorFresh = true
+            stateHelper.setBlacksmithCacheMirrorChanged(true)
+          } else if (settings.fetchDepth <= 0) {
+            // Bring the mirror's branch/tag refs up to date with the remote
+            // (ls-remote diff + targeted fetch of only the changed refs), so
+            // the workspace can be populated from the mirror with the same
+            // freshness as a direct network fetch.
+            const syncResult = await blacksmithCache.syncMirrorFromRemote(
+              cacheInfo.mirrorPath,
+              repositoryUrl,
+              settings.authToken,
+              settings.verbose
+            )
+            mirrorFresh = syncResult.success
+            stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed)
+            stateHelper.setBlacksmithCacheMirrorSyncFailed(
+              !syncResult.success && !syncResult.timedOut
+            )
+            stateHelper.setBlacksmithCacheMirrorSyncTimedOut(
+              syncResult.timedOut
+            )
+          } else {
+            // Shallow checkouts never populate the workspace from mirror
+            // refs, so the checkout step doesn't need a fresh mirror. Defer
+            // the mirror sync to the post step to keep the checkout step
+            // fast.
+            stateHelper.setBlacksmithCacheMirrorSyncDeferred(true)
+            stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
+            stateHelper.setBlacksmithCacheVerbose(settings.verbose)
+          }
           core.endGroup()
         }
       } catch (error) {
@@ -228,18 +262,62 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     }
 
     if (settings.fetchDepth <= 0) {
-      // Fetch all branches and tags
-      let refSpec = refHelper.getRefSpecForAllHistory(
-        settings.ref,
-        settings.commit
-      )
-      await git.fetch(refSpec, fetchOptions)
+      // When the Blacksmith mirror is available and synced with the remote,
+      // copy branch/tag refs from it locally (objects are already shared via
+      // alternates) instead of doing a full +refs/heads/* fetch over the
+      // network, and only ask the network for the specific ref/commit this
+      // run needs.
+      let fetchedFromMirror = false
+      if (
+        cacheInfo &&
+        mirrorFresh &&
+        !fetchOptions.filter &&
+        !fsHelper.fileExistsSync(
+          path.join(settings.repositoryPath, '.git', 'shallow')
+        )
+      ) {
+        fetchedFromMirror = await blacksmithCache.fetchRefsFromMirror(
+          settings.repositoryPath,
+          cacheInfo.mirrorPath
+        )
+      }
 
-      // When all history is fetched, the ref we're interested in may have moved to a different
-      // commit (push or force push). If so, fetch again with a targeted refspec.
-      if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
-        refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+      if (fetchedFromMirror) {
+        // The mirror copy only materializes branches and tags. Any other ref
+        // (refs/pull/*, etc.) must be fetched from the network so its local
+        // destination ref exists for checkout. For branches/tags, verify the
+        // wanted ref/commit is present and fetch it directly if not.
+        const upperRef = (settings.ref || '').toUpperCase()
+        const coveredByMirror =
+          !settings.ref ||
+          !upperRef.startsWith('REFS/') ||
+          upperRef.startsWith('REFS/HEADS/') ||
+          upperRef.startsWith('REFS/TAGS/')
+        let verified = false
+        if (coveredByMirror) {
+          verified = await refHelper.testRef(git, settings.ref, settings.commit)
+          if (verified && settings.commit) {
+            verified = await git.shaExists(settings.commit)
+          }
+        }
+        if (!verified) {
+          const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+          await git.fetch(refSpec, fetchOptions)
+        }
+      } else {
+        // Fetch all branches and tags
+        let refSpec = refHelper.getRefSpecForAllHistory(
+          settings.ref,
+          settings.commit
+        )
         await git.fetch(refSpec, fetchOptions)
+
+        // When all history is fetched, the ref we're interested in may have moved to a different
+        // commit (push or force push). If so, fetch again with a targeted refspec.
+        if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+          refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+          await git.fetch(refSpec, fetchOptions)
+        }
       }
     } else {
       fetchOptions.fetchDepth = settings.fetchDepth

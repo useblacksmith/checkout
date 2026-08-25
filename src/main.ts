@@ -46,34 +46,34 @@ async function cleanup(): Promise<void> {
   const mountPoint = stateHelper.BlacksmithCacheMountPoint
   const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
   const performedHydration = stateHelper.BlacksmithCachePerformedHydration
-  const repoUrl = stateHelper.BlacksmithCacheRepoUrl
-  const verbose = stateHelper.BlacksmithCacheVerbose
+  let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged
+  let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed
+  let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut
   if (exposeId && stickyDiskKey) {
-    // Track mirror refresh outcome for metrics and commit decision
-    let refreshResult: blacksmithCache.OperationResult = {
-      success: true,
-      timedOut: false
-    }
-
-    // Refresh the git mirror in the post step (outside the critical checkout path)
-    // This updates the mirror for future runs without blocking the workflow
-    if (mirrorPath && repoUrl && !performedHydration) {
-      core.startGroup('Refreshing Blacksmith git mirror')
+    // For shallow checkouts the checkout step never populates the workspace
+    // from mirror refs, so the mirror sync is deferred here to keep the
+    // checkout step fast.
+    if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
+      const repoUrl = stateHelper.BlacksmithCacheRepoUrl
       // Re-read auth token from input (don't store sensitive data in state)
       const authToken = core.getInput('token', {required: false})
-      if (authToken) {
-        refreshResult = await blacksmithCache.refreshMirror(
+      if (repoUrl && authToken) {
+        core.startGroup('Syncing Blacksmith git mirror')
+        const syncResult = await blacksmithCache.syncMirrorFromRemote(
           mirrorPath,
           repoUrl,
           authToken,
-          verbose
+          stateHelper.BlacksmithCacheVerbose
         )
+        mirrorChanged = syncResult.changed
+        mirrorSyncFailed = !syncResult.success && !syncResult.timedOut
+        mirrorSyncTimedOut = syncResult.timedOut
+        core.endGroup()
       } else {
         core.warning(
-          '[git-mirror] No auth token available, skipping mirror refresh'
+          '[git-mirror] No auth token available, skipping mirror sync'
         )
       }
-      core.endGroup()
     }
 
     let cleanupResult: blacksmithCache.CleanupResult | undefined
@@ -105,9 +105,6 @@ async function cleanup(): Promise<void> {
         }
       }
 
-      // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
-      const vmHydratedGitMirror = shouldCommit && performedHydration
-
       if (!shouldCommit) {
         core.warning(`[git-mirror] Skipping cache commit: ${skipReason}`)
         if (performedHydration) {
@@ -119,16 +116,30 @@ async function cleanup(): Promise<void> {
         core.info('[git-mirror] No previous step failures detected')
       }
 
+      // The mirror was synchronized with the remote in the main step. If it
+      // was already up to date (no refs changed and no hydration), there is
+      // nothing to persist - release the sticky disk without committing and
+      // skip GC.
+      if (shouldCommit && !mirrorChanged) {
+        shouldCommit = false
+        core.info(
+          '[git-mirror] Mirror unchanged since last commit, releasing sticky disk without commit'
+        )
+      }
+
+      // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
+      const vmHydratedGitMirror = shouldCommit && performedHydration
+
       cleanupResult = await blacksmithCache.cleanup({
         exposeId,
         stickyDiskKey,
         repoName: repoName || undefined,
         mountPoint: mountPoint || undefined,
-        mirrorPath: mirrorPath || undefined,
+        mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
         shouldCommit,
         vmHydratedGitMirror,
-        mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
-        mirrorRefreshTimedOut: refreshResult.timedOut
+        mirrorSyncFailed,
+        mirrorSyncTimedOut
       })
     } catch (error) {
       core.warning(
@@ -137,9 +148,9 @@ async function cleanup(): Promise<void> {
     }
 
     // Report metrics for any failures/timeouts (fire-and-forget)
-    if (!refreshResult.success) {
-      await reportInternalMetric('git_mirror_refresh_failure', 1, {
-        reason: refreshResult.timedOut ? 'timeout' : 'failure'
+    if (mirrorSyncFailed || mirrorSyncTimedOut) {
+      await reportInternalMetric('git_mirror_sync_failure', 1, {
+        reason: mirrorSyncTimedOut ? 'timeout' : 'failure'
       })
     }
     if (cleanupResult) {

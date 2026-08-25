@@ -64,7 +64,31 @@ export const BlacksmithCachePerformedHydration =
   core.getState('blacksmithCachePerformedHydration') === 'true'
 
 /**
- * The repository URL for refreshing the git mirror in the POST action.
+ * Whether the main step's mirror sync changed the mirror. Used by the POST
+ * action to decide whether the sticky disk needs to be committed.
+ */
+export const BlacksmithCacheMirrorChanged =
+  core.getState('blacksmithCacheMirrorChanged') === 'true'
+
+/**
+ * Whether the main step's mirror sync failed or timed out. Used by the POST
+ * action to skip committing a potentially inconsistent mirror.
+ */
+export const BlacksmithCacheMirrorSyncFailed =
+  core.getState('blacksmithCacheMirrorSyncFailed') === 'true'
+
+export const BlacksmithCacheMirrorSyncTimedOut =
+  core.getState('blacksmithCacheMirrorSyncTimedOut') === 'true'
+
+/**
+ * Whether the mirror sync was deferred to the POST action (shallow
+ * checkouts, which never populate the workspace from mirror refs).
+ */
+export const BlacksmithCacheMirrorSyncDeferred =
+  core.getState('blacksmithCacheMirrorSyncDeferred') === 'true'
+
+/**
+ * The repository URL for a deferred mirror sync in the POST action.
  */
 export const BlacksmithCacheRepoUrl = core.getState('blacksmithCacheRepoUrl')
 
@@ -149,7 +173,38 @@ export function setBlacksmithCachePerformedHydration(performed: boolean) {
 }
 
 /**
- * Save the repository URL so the POST action can refresh the git mirror.
+ * Save whether the main step's mirror sync changed the mirror.
+ */
+export function setBlacksmithCacheMirrorChanged(changed: boolean) {
+  core.saveState('blacksmithCacheMirrorChanged', changed ? 'true' : 'false')
+}
+
+/**
+ * Save the outcome of the main step's mirror sync.
+ */
+export function setBlacksmithCacheMirrorSyncFailed(failed: boolean) {
+  core.saveState('blacksmithCacheMirrorSyncFailed', failed ? 'true' : 'false')
+}
+
+export function setBlacksmithCacheMirrorSyncTimedOut(timedOut: boolean) {
+  core.saveState(
+    'blacksmithCacheMirrorSyncTimedOut',
+    timedOut ? 'true' : 'false'
+  )
+}
+
+/**
+ * Save whether the mirror sync was deferred to the POST action.
+ */
+export function setBlacksmithCacheMirrorSyncDeferred(deferred: boolean) {
+  core.saveState(
+    'blacksmithCacheMirrorSyncDeferred',
+    deferred ? 'true' : 'false'
+  )
+}
+
+/**
+ * Save the repository URL so the POST action can sync the git mirror.
  */
 export function setBlacksmithCacheRepoUrl(repoUrl: string) {
   core.saveState('blacksmithCacheRepoUrl', repoUrl)

@@ -401,11 +401,10 @@ function buildGitEnv(verbose: boolean): {[key: string]: string} {
 
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
- * If the mirror already exists, skip the fetch (it will be updated in the post step).
- *
- * This approach moves the mirror refresh to the post step to avoid step-level timeouts
- * affecting checkout performance. The alternates mechanism allows checkout to work
- * with a stale mirror - missing objects will be fetched from the network.
+ * If the mirror already exists, it is left as-is; the caller brings it up to
+ * date with syncMirrorFromRemote(), which only pays for refs that actually
+ * changed. The alternates mechanism allows checkout to work with the mirror
+ * - any objects it lacks are fetched from the network.
  *
  * Uses http.extraheader for authentication (same as upstream checkout action).
  *
@@ -422,10 +421,9 @@ export async function ensureMirror(
   verbose: boolean = false
 ): Promise<boolean> {
   if (fs.existsSync(mirrorPath)) {
-    // Mirror exists - skip fetch here, it will be done in the post step
-    core.info(
-      `[git-mirror] Found existing mirror at ${mirrorPath}, deferring refresh to post step`
-    )
+    // Mirror exists - the caller synchronizes it with the remote via
+    // syncMirrorFromRemote() before populating the workspace from it
+    core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`)
     return false // Not initial hydration
   }
 
@@ -450,7 +448,7 @@ export async function ensureMirror(
       )
       await fs.promises.rm(mirrorPath, {recursive: true, force: true})
     }
-    // gc.auto=0: disable auto-gc during clone (see comment in refreshMirror)
+    // gc.auto=0: disable auto-gc during clone (see comment in syncMirrorFromRemote)
     const cloneArgs = [
       '-c',
       `${configKey}=${configValue}`,
@@ -472,89 +470,312 @@ export async function ensureMirror(
 }
 
 /**
- * Refresh an existing git mirror by fetching updates from the remote.
- * This is called in the post step to update the mirror for future runs,
- * outside of the critical checkout path.
+ * Result of synchronizing the mirror with the remote.
+ */
+export interface MirrorSyncResult extends OperationResult {
+  // changed indicates the mirror's refs/objects were modified by the sync.
+  // When false, the mirror was already up to date and the sticky disk does
+  // not need to be committed.
+  changed: boolean
+}
+
+interface RefDiff {
+  updatedRefSpecs: string[]
+  deletedRefs: string[]
+  remoteRefCount: number
+}
+
+/**
+ * Compute the difference between the remote's advertised branch/tag tips
+ * and the mirror's local refs.
+ *
+ * @param lsRemoteOutput - stdout of `git ls-remote --heads --tags origin`
+ * @param localRefsOutput - stdout of `git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags`
+ */
+export function diffMirrorRefs(
+  lsRemoteOutput: string,
+  localRefsOutput: string
+): RefDiff {
+  const remoteRefs = new Map<string, string>()
+  for (const line of lsRemoteOutput.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    const [sha, refName] = trimmed.split('\t')
+    if (!sha || !refName) {
+      continue
+    }
+    // Skip peeled annotated tag entries (refs/tags/v1^{}); the tag ref
+    // itself is advertised separately and is what the mirror stores.
+    if (refName.endsWith('^{}')) {
+      continue
+    }
+    remoteRefs.set(refName, sha)
+  }
+
+  const localRefs = new Map<string, string>()
+  for (const line of localRefsOutput.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    const spaceIdx = trimmed.indexOf(' ')
+    if (spaceIdx <= 0) {
+      continue
+    }
+    const sha = trimmed.substring(0, spaceIdx)
+    const refName = trimmed.substring(spaceIdx + 1)
+    localRefs.set(refName, sha)
+  }
+
+  const updatedRefSpecs: string[] = []
+  for (const [refName, sha] of remoteRefs) {
+    if (localRefs.get(refName) !== sha) {
+      updatedRefSpecs.push(`+${refName}:${refName}`)
+    }
+  }
+
+  const deletedRefs: string[] = []
+  for (const refName of localRefs.keys()) {
+    if (!remoteRefs.has(refName)) {
+      deletedRefs.push(refName)
+    }
+  }
+
+  return {updatedRefSpecs, deletedRefs, remoteRefCount: remoteRefs.size}
+}
+
+/**
+ * Synchronize the mirror with the remote before the workspace is populated
+ * from it. Instead of a full `git fetch --prune origin` (whose cost is
+ * proportional to the total ref count even when nothing changed), this:
+ *
+ * 1. Runs `git ls-remote --heads --tags origin` - a single request that
+ *    returns the current tip of every branch/tag with no negotiation and no
+ *    object transfer.
+ * 2. Diffs those tips against the mirror's local refs.
+ * 3. Fetches only the changed refs (usually zero or a handful) and deletes
+ *    refs that no longer exist on the remote.
+ *
+ * After a successful sync the mirror's branch/tag refs exactly match the
+ * remote at ls-remote time, so the workspace can be populated from the
+ * mirror with the same freshness guarantee as a direct network fetch.
+ *
+ * refs/pull/* are not synchronized: a job that needs a pull ref fetches it
+ * directly into its workspace, and pull refs would otherwise dominate the
+ * advertisement size on busy repositories. Any refs/pull/* already present
+ * in the mirror are left untouched.
  *
  * @param mirrorPath - Path to the bare git mirror
  * @param repoUrl - URL of the repository to mirror
  * @param authToken - Authentication token for the repository
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  */
-export async function refreshMirror(
+export async function syncMirrorFromRemote(
   mirrorPath: string,
   repoUrl: string,
   authToken: string,
   verbose: boolean = false,
   timeoutSecs: number = REFRESH_TIMEOUT_SECS
-): Promise<OperationResult> {
+): Promise<MirrorSyncResult> {
   if (!fs.existsSync(mirrorPath)) {
     core.debug(
-      `[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`
+      `[git-mirror] Mirror does not exist at ${mirrorPath}, skipping sync`
     )
-    return {success: true, timedOut: false}
+    return {success: true, timedOut: false, changed: false}
   }
 
   core.info(
-    `[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`
+    `[git-mirror] Syncing mirror at ${mirrorPath} with remote (timeout: ${timeoutSecs}s per attempt)`
   )
 
   try {
     const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
     const gitEnv = buildGitEnv(verbose)
+
+    const lsRemoteStart = Date.now()
+    let lsRemoteOutput = ''
     await retryHelper.execute(async () => {
-      // gc.auto=0: disable git's internal auto-gc that porcelain commands like
-      // fetch run after completing. Without this, fetch can spawn a background
-      // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
-      // files on the mirror mount, causing the subsequent umount to fail with
-      // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
-      const fetchArgs = [
-        '-c',
-        `${configKey}=${configValue}`,
-        '-c',
-        'gc.auto=0',
-        '-C',
-        mirrorPath,
-        'fetch',
-        '--prune',
-        'origin'
-      ]
-      if (verbose) {
-        fetchArgs.splice(
-          fetchArgs.indexOf('origin'),
-          0,
-          '--progress',
-          '--verbose'
-        )
-      }
       const result = await exec.getExecOutput(
         'timeout',
-        [String(timeoutSecs), 'git', ...fetchArgs],
-        {env: gitEnv, ignoreReturnCode: true, silent: !verbose}
+        [
+          String(timeoutSecs),
+          'git',
+          '-c',
+          `${configKey}=${configValue}`,
+          '-C',
+          mirrorPath,
+          'ls-remote',
+          '--heads',
+          '--tags',
+          'origin'
+        ],
+        {env: gitEnv, ignoreReturnCode: true, silent: true}
       )
       if (result.exitCode === TIMEOUT_EXIT_CODE) {
-        throw new Error(`git fetch timed out after ${timeoutSecs}s`)
+        throw new Error(`git ls-remote timed out after ${timeoutSecs}s`)
       }
       if (result.exitCode !== 0) {
-        // Include stderr in error message so failure details are visible even when silent
         const stderr = result.stderr.trim()
         const details = stderr ? `: ${stderr}` : ''
         throw new Error(
-          `git fetch failed with exit code ${result.exitCode}${details}`
+          `git ls-remote failed with exit code ${result.exitCode}${details}`
         )
       }
+      lsRemoteOutput = result.stdout
     })
-    core.info('[git-mirror] Mirror refresh complete')
-    return {success: true, timedOut: false}
+
+    const localRefsResult = await exec.getExecOutput(
+      'git',
+      [
+        '-C',
+        mirrorPath,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/heads',
+        'refs/tags'
+      ],
+      {silent: true}
+    )
+
+    const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout)
+    core.info(
+      `[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`
+    )
+
+    if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
+      core.info('[git-mirror] Mirror is already up to date with the remote')
+      return {success: true, timedOut: false, changed: false}
+    }
+
+    if (diff.updatedRefSpecs.length > 0) {
+      const fetchStart = Date.now()
+      await retryHelper.execute(async () => {
+        // gc.auto=0: disable git's internal auto-gc that porcelain commands
+        // like fetch run after completing. Without this, fetch can spawn a
+        // background gc daemon (gc.autoDetach defaults to true) that holds
+        // cwd + mmap'd pack files on the mirror mount, causing the
+        // subsequent umount to fail with EBUSY. We run gc explicitly in
+        // runMirrorGC() with gc.autoDetach=false.
+        // --stdin: refspecs are passed on stdin to avoid command line length
+        // limits when many refs changed.
+        const fetchArgs = [
+          '-c',
+          `${configKey}=${configValue}`,
+          '-c',
+          'gc.auto=0',
+          '-c',
+          'fetch.negotiationAlgorithm=skipping',
+          '-C',
+          mirrorPath,
+          'fetch',
+          '--no-tags',
+          '--stdin',
+          'origin'
+        ]
+        if (verbose) {
+          fetchArgs.splice(
+            fetchArgs.indexOf('origin'),
+            0,
+            '--progress',
+            '--verbose'
+          )
+        }
+        const result = await exec.getExecOutput(
+          'timeout',
+          [String(timeoutSecs), 'git', ...fetchArgs],
+          {
+            env: gitEnv,
+            ignoreReturnCode: true,
+            silent: !verbose,
+            input: Buffer.from(`${diff.updatedRefSpecs.join('\n')}\n`)
+          }
+        )
+        if (result.exitCode === TIMEOUT_EXIT_CODE) {
+          throw new Error(`git fetch timed out after ${timeoutSecs}s`)
+        }
+        if (result.exitCode !== 0) {
+          // Include stderr in error message so failure details are visible even when silent
+          const stderr = result.stderr.trim()
+          const details = stderr ? `: ${stderr}` : ''
+          throw new Error(
+            `git fetch failed with exit code ${result.exitCode}${details}`
+          )
+        }
+      })
+      core.info(
+        `[git-mirror] Fetched ${diff.updatedRefSpecs.length} changed refs in ${Date.now() - fetchStart}ms`
+      )
+    }
+
+    if (diff.deletedRefs.length > 0) {
+      await exec.getExecOutput(
+        'git',
+        ['-C', mirrorPath, 'update-ref', '--stdin'],
+        {
+          silent: true,
+          input: Buffer.from(
+            diff.deletedRefs.map(ref => `delete ${ref}\n`).join('')
+          )
+        }
+      )
+      core.info(
+        `[git-mirror] Deleted ${diff.deletedRefs.length} refs removed on the remote`
+      )
+    }
+
+    core.info('[git-mirror] Mirror sync complete')
+    return {success: true, timedOut: false, changed: true}
   } catch (error) {
     const msg = (error as Error).message || String(error)
     const timedOut = msg.includes('timed out')
     if (timedOut) {
-      core.warning(`[git-mirror] Mirror refresh timed out: ${msg}`)
+      core.warning(`[git-mirror] Mirror sync timed out: ${msg}`)
     } else {
-      core.warning(`[git-mirror] Mirror refresh failed: ${msg}`)
+      core.warning(`[git-mirror] Mirror sync failed: ${msg}`)
     }
-    return {success: false, timedOut, error: msg}
+    return {success: false, timedOut, error: msg, changed: false}
+  }
+}
+
+/**
+ * Fetch branch and tag refs into the workspace from the local mirror.
+ * Because the workspace shares the mirror's object store via alternates,
+ * this transfers no object data - it only copies refs. This replaces the
+ * full `+refs/heads/*` network fetch against the remote for fetch-depth: 0
+ * checkouts. The caller synchronizes the mirror with the remote first (see
+ * syncMirrorFromRemote) and still verifies/fetches the specific ref/commit
+ * it needs from the network afterwards as a safety net.
+ *
+ * @returns true on success, false if the local fetch failed and the caller
+ * should fall back to a network fetch
+ */
+export async function fetchRefsFromMirror(
+  workspacePath: string,
+  mirrorPath: string
+): Promise<boolean> {
+  try {
+    core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`)
+    await exec.exec('git', [
+      '-C',
+      workspacePath,
+      '-c',
+      'gc.auto=0',
+      'fetch',
+      '--prune',
+      '--no-tags',
+      '--no-recurse-submodules',
+      mirrorPath,
+      '+refs/heads/*:refs/remotes/origin/*',
+      '+refs/tags/*:refs/tags/*'
+    ])
+    return true
+  } catch (error) {
+    core.warning(
+      `[git-mirror] Local ref fetch from mirror failed, falling back to network fetch: ${error}`
+    )
+    return false
   }
 }
 
@@ -788,16 +1009,16 @@ export interface CleanupOptions {
   // vmHydratedGitMirror indicates this job performed initial git mirror clone.
   // Used by backend to mark hydration as complete.
   vmHydratedGitMirror: boolean
-  // Mirror refresh outcome from the post step (run before cleanup is called).
-  mirrorRefreshFailed?: boolean
-  mirrorRefreshTimedOut?: boolean
+  // Mirror sync outcome from the main step.
+  mirrorSyncFailed?: boolean
+  mirrorSyncTimedOut?: boolean
 }
 
 /**
  * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
  * Execution order: GC → sync → unmount (with retry) → flush → commit
- * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
+ * If the mirror sync or GC failed or timed out, shouldCommit is set to false.
  */
 export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   const {
@@ -806,8 +1027,8 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     repoName,
     mountPoint,
     mirrorPath,
-    mirrorRefreshFailed,
-    mirrorRefreshTimedOut
+    mirrorSyncFailed,
+    mirrorSyncTimedOut
   } = options
   let {shouldCommit} = options
   // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
@@ -824,11 +1045,11 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     `[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
   )
 
-  // If mirror refresh failed or timed out, don't commit
-  if (mirrorRefreshFailed || mirrorRefreshTimedOut) {
-    const reason = mirrorRefreshTimedOut ? 'timed out' : 'failed'
+  // If the mirror sync failed or timed out, don't commit
+  if (mirrorSyncFailed || mirrorSyncTimedOut) {
+    const reason = mirrorSyncTimedOut ? 'timed out' : 'failed'
     core.warning(
-      `[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`
+      `[git-mirror] Mirror sync ${reason}, will not commit sticky disk`
     )
     shouldCommit = false
     vmHydratedGitMirror = false

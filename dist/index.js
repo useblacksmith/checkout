@@ -48,7 +48,9 @@ exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
-exports.refreshMirror = refreshMirror;
+exports.diffMirrorRefs = diffMirrorRefs;
+exports.syncMirrorFromRemote = syncMirrorFromRemote;
+exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
 exports.cleanup = cleanup;
@@ -360,11 +362,10 @@ function buildGitEnv(verbose) {
 }
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
- * If the mirror already exists, skip the fetch (it will be updated in the post step).
- *
- * This approach moves the mirror refresh to the post step to avoid step-level timeouts
- * affecting checkout performance. The alternates mechanism allows checkout to work
- * with a stale mirror - missing objects will be fetched from the network.
+ * If the mirror already exists, it is left as-is; the caller brings it up to
+ * date with syncMirrorFromRemote(), which only pays for refs that actually
+ * changed. The alternates mechanism allows checkout to work with the mirror
+ * - any objects it lacks are fetched from the network.
  *
  * Uses http.extraheader for authentication (same as upstream checkout action).
  *
@@ -378,8 +379,9 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
         var _a, _b, _c, _d;
         if (fs.existsSync(mirrorPath)) {
-            // Mirror exists - skip fetch here, it will be done in the post step
-            core.info(`[git-mirror] Found existing mirror at ${mirrorPath}, deferring refresh to post step`);
+            // Mirror exists - the caller synchronizes it with the remote via
+            // syncMirrorFromRemote() before populating the workspace from it
+            core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`);
             return false; // Not initial hydration
         }
         // First time - create a bare mirror clone (initial hydration)
@@ -398,7 +400,7 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
                 core.info(`[git-mirror] Removing partial mirror directory from failed attempt`);
                 yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
             }
-            // gc.auto=0: disable auto-gc during clone (see comment in refreshMirror)
+            // gc.auto=0: disable auto-gc during clone (see comment in syncMirrorFromRemote)
             const cloneArgs = [
                 '-c',
                 `${configKey}=${configValue}`,
@@ -420,69 +422,236 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
     });
 }
 /**
- * Refresh an existing git mirror by fetching updates from the remote.
- * This is called in the post step to update the mirror for future runs,
- * outside of the critical checkout path.
+ * Compute the difference between the remote's advertised branch/tag tips
+ * and the mirror's local refs.
+ *
+ * @param lsRemoteOutput - stdout of `git ls-remote --heads --tags origin`
+ * @param localRefsOutput - stdout of `git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags`
+ */
+function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
+    const remoteRefs = new Map();
+    for (const line of lsRemoteOutput.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            continue;
+        }
+        const [sha, refName] = trimmed.split('\t');
+        if (!sha || !refName) {
+            continue;
+        }
+        // Skip peeled annotated tag entries (refs/tags/v1^{}); the tag ref
+        // itself is advertised separately and is what the mirror stores.
+        if (refName.endsWith('^{}')) {
+            continue;
+        }
+        remoteRefs.set(refName, sha);
+    }
+    const localRefs = new Map();
+    for (const line of localRefsOutput.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            continue;
+        }
+        const spaceIdx = trimmed.indexOf(' ');
+        if (spaceIdx <= 0) {
+            continue;
+        }
+        const sha = trimmed.substring(0, spaceIdx);
+        const refName = trimmed.substring(spaceIdx + 1);
+        localRefs.set(refName, sha);
+    }
+    const updatedRefSpecs = [];
+    for (const [refName, sha] of remoteRefs) {
+        if (localRefs.get(refName) !== sha) {
+            updatedRefSpecs.push(`+${refName}:${refName}`);
+        }
+    }
+    const deletedRefs = [];
+    for (const refName of localRefs.keys()) {
+        if (!remoteRefs.has(refName)) {
+            deletedRefs.push(refName);
+        }
+    }
+    return { updatedRefSpecs, deletedRefs, remoteRefCount: remoteRefs.size };
+}
+/**
+ * Synchronize the mirror with the remote before the workspace is populated
+ * from it. Instead of a full `git fetch --prune origin` (whose cost is
+ * proportional to the total ref count even when nothing changed), this:
+ *
+ * 1. Runs `git ls-remote --heads --tags origin` - a single request that
+ *    returns the current tip of every branch/tag with no negotiation and no
+ *    object transfer.
+ * 2. Diffs those tips against the mirror's local refs.
+ * 3. Fetches only the changed refs (usually zero or a handful) and deletes
+ *    refs that no longer exist on the remote.
+ *
+ * After a successful sync the mirror's branch/tag refs exactly match the
+ * remote at ls-remote time, so the workspace can be populated from the
+ * mirror with the same freshness guarantee as a direct network fetch.
+ *
+ * refs/pull/* are not synchronized: a job that needs a pull ref fetches it
+ * directly into its workspace, and pull refs would otherwise dominate the
+ * advertisement size on busy repositories. Any refs/pull/* already present
+ * in the mirror are left untouched.
  *
  * @param mirrorPath - Path to the bare git mirror
  * @param repoUrl - URL of the repository to mirror
  * @param authToken - Authentication token for the repository
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  */
-function refreshMirror(mirrorPath_1, repoUrl_1, authToken_1) {
+function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false, timeoutSecs = REFRESH_TIMEOUT_SECS) {
         if (!fs.existsSync(mirrorPath)) {
-            core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping refresh`);
-            return { success: true, timedOut: false };
+            core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping sync`);
+            return { success: true, timedOut: false, changed: false };
         }
-        core.info(`[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`);
+        core.info(`[git-mirror] Syncing mirror at ${mirrorPath} with remote (timeout: ${timeoutSecs}s per attempt)`);
         try {
             const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
             const gitEnv = buildGitEnv(verbose);
+            const lsRemoteStart = Date.now();
+            let lsRemoteOutput = '';
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                // gc.auto=0: disable git's internal auto-gc that porcelain commands like
-                // fetch run after completing. Without this, fetch can spawn a background
-                // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
-                // files on the mirror mount, causing the subsequent umount to fail with
-                // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
-                const fetchArgs = [
+                const result = yield exec.getExecOutput('timeout', [
+                    String(timeoutSecs),
+                    'git',
                     '-c',
                     `${configKey}=${configValue}`,
-                    '-c',
-                    'gc.auto=0',
                     '-C',
                     mirrorPath,
-                    'fetch',
-                    '--prune',
+                    'ls-remote',
+                    '--heads',
+                    '--tags',
                     'origin'
-                ];
-                if (verbose) {
-                    fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
-                }
-                const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], { env: gitEnv, ignoreReturnCode: true, silent: !verbose });
+                ], { env: gitEnv, ignoreReturnCode: true, silent: true });
                 if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                    throw new Error(`git fetch timed out after ${timeoutSecs}s`);
+                    throw new Error(`git ls-remote timed out after ${timeoutSecs}s`);
                 }
                 if (result.exitCode !== 0) {
-                    // Include stderr in error message so failure details are visible even when silent
                     const stderr = result.stderr.trim();
                     const details = stderr ? `: ${stderr}` : '';
-                    throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
+                    throw new Error(`git ls-remote failed with exit code ${result.exitCode}${details}`);
                 }
+                lsRemoteOutput = result.stdout;
             }));
-            core.info('[git-mirror] Mirror refresh complete');
-            return { success: true, timedOut: false };
+            const localRefsResult = yield exec.getExecOutput('git', [
+                '-C',
+                mirrorPath,
+                'for-each-ref',
+                '--format=%(objectname) %(refname)',
+                'refs/heads',
+                'refs/tags'
+            ], { silent: true });
+            const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout);
+            core.info(`[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`);
+            if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
+                core.info('[git-mirror] Mirror is already up to date with the remote');
+                return { success: true, timedOut: false, changed: false };
+            }
+            if (diff.updatedRefSpecs.length > 0) {
+                const fetchStart = Date.now();
+                yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                    // gc.auto=0: disable git's internal auto-gc that porcelain commands
+                    // like fetch run after completing. Without this, fetch can spawn a
+                    // background gc daemon (gc.autoDetach defaults to true) that holds
+                    // cwd + mmap'd pack files on the mirror mount, causing the
+                    // subsequent umount to fail with EBUSY. We run gc explicitly in
+                    // runMirrorGC() with gc.autoDetach=false.
+                    // --stdin: refspecs are passed on stdin to avoid command line length
+                    // limits when many refs changed.
+                    const fetchArgs = [
+                        '-c',
+                        `${configKey}=${configValue}`,
+                        '-c',
+                        'gc.auto=0',
+                        '-c',
+                        'fetch.negotiationAlgorithm=skipping',
+                        '-C',
+                        mirrorPath,
+                        'fetch',
+                        '--no-tags',
+                        '--stdin',
+                        'origin'
+                    ];
+                    if (verbose) {
+                        fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
+                    }
+                    const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], {
+                        env: gitEnv,
+                        ignoreReturnCode: true,
+                        silent: !verbose,
+                        input: Buffer.from(`${diff.updatedRefSpecs.join('\n')}\n`)
+                    });
+                    if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                        throw new Error(`git fetch timed out after ${timeoutSecs}s`);
+                    }
+                    if (result.exitCode !== 0) {
+                        // Include stderr in error message so failure details are visible even when silent
+                        const stderr = result.stderr.trim();
+                        const details = stderr ? `: ${stderr}` : '';
+                        throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
+                    }
+                }));
+                core.info(`[git-mirror] Fetched ${diff.updatedRefSpecs.length} changed refs in ${Date.now() - fetchStart}ms`);
+            }
+            if (diff.deletedRefs.length > 0) {
+                yield exec.getExecOutput('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
+                    silent: true,
+                    input: Buffer.from(diff.deletedRefs.map(ref => `delete ${ref}\n`).join(''))
+                });
+                core.info(`[git-mirror] Deleted ${diff.deletedRefs.length} refs removed on the remote`);
+            }
+            core.info('[git-mirror] Mirror sync complete');
+            return { success: true, timedOut: false, changed: true };
         }
         catch (error) {
             const msg = error.message || String(error);
             const timedOut = msg.includes('timed out');
             if (timedOut) {
-                core.warning(`[git-mirror] Mirror refresh timed out: ${msg}`);
+                core.warning(`[git-mirror] Mirror sync timed out: ${msg}`);
             }
             else {
-                core.warning(`[git-mirror] Mirror refresh failed: ${msg}`);
+                core.warning(`[git-mirror] Mirror sync failed: ${msg}`);
             }
-            return { success: false, timedOut, error: msg };
+            return { success: false, timedOut, error: msg, changed: false };
+        }
+    });
+}
+/**
+ * Fetch branch and tag refs into the workspace from the local mirror.
+ * Because the workspace shares the mirror's object store via alternates,
+ * this transfers no object data - it only copies refs. This replaces the
+ * full `+refs/heads/*` network fetch against the remote for fetch-depth: 0
+ * checkouts. The caller synchronizes the mirror with the remote first (see
+ * syncMirrorFromRemote) and still verifies/fetches the specific ref/commit
+ * it needs from the network afterwards as a safety net.
+ *
+ * @returns true on success, false if the local fetch failed and the caller
+ * should fall back to a network fetch
+ */
+function fetchRefsFromMirror(workspacePath, mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`);
+            yield exec.exec('git', [
+                '-C',
+                workspacePath,
+                '-c',
+                'gc.auto=0',
+                'fetch',
+                '--prune',
+                '--no-tags',
+                '--no-recurse-submodules',
+                mirrorPath,
+                '+refs/heads/*:refs/remotes/origin/*',
+                '+refs/tags/*:refs/tags/*'
+            ]);
+            return true;
+        }
+        catch (error) {
+            core.warning(`[git-mirror] Local ref fetch from mirror failed, falling back to network fetch: ${error}`);
+            return false;
         }
     });
 }
@@ -666,12 +835,12 @@ function flushBlockDevice(devicePath) {
  * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
  * Execution order: GC → sync → unmount (with retry) → flush → commit
- * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
+ * If the mirror sync or GC failed or timed out, shouldCommit is set to false.
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
-        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorRefreshFailed, mirrorRefreshTimedOut } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut } = options;
         let { shouldCommit } = options;
         // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
         // (due to GC/refresh failure), we must not tell the backend that
@@ -682,10 +851,10 @@ function cleanup(options) {
             gcResult: { success: true, timedOut: false }
         };
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
-        // If mirror refresh failed or timed out, don't commit
-        if (mirrorRefreshFailed || mirrorRefreshTimedOut) {
-            const reason = mirrorRefreshTimedOut ? 'timed out' : 'failed';
-            core.warning(`[git-mirror] Mirror refresh ${reason}, will not commit sticky disk`);
+        // If the mirror sync failed or timed out, don't commit
+        if (mirrorSyncFailed || mirrorSyncTimedOut) {
+            const reason = mirrorSyncTimedOut ? 'timed out' : 'failed';
+            core.warning(`[git-mirror] Mirror sync ${reason}, will not commit sticky disk`);
             shouldCommit = false;
             vmHydratedGitMirror = false;
         }
@@ -1663,7 +1832,16 @@ class GitCommandManager {
     }
     checkout(ref, startPoint) {
         return __awaiter(this, void 0, void 0, function* () {
-            const args = ['checkout', '--progress', '--force'];
+            // checkout.workers < 1 means "use the number of logical cores" (git 2.32+;
+            // ignored by older versions). Parallel workers overlap the synchronous
+            // object reads and file writes that dominate large worktree checkouts.
+            const args = [
+                '-c',
+                'checkout.workers=0',
+                'checkout',
+                '--progress',
+                '--force'
+            ];
             if (startPoint) {
                 args.push('-B', ref, startPoint);
             }
@@ -2362,6 +2540,10 @@ function getSource(settings) {
             // so flipping that flag disables the entire Blacksmith code path here
             // and in the post step.
             let cacheInfo = null;
+            // mirrorFresh indicates the mirror's branch/tag refs match the remote as
+            // of this run (hydrated now, or synced via ls-remote diff). Only then can
+            // the workspace copy its refs from the mirror instead of the network.
+            let mirrorFresh = false;
             if (blacksmithCache.shouldUseBlacksmithCache()) {
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
@@ -2379,11 +2561,33 @@ function getSource(settings) {
                         stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                         stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint);
-                        // Save repo URL and verbose flag for post step mirror refresh
-                        stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
-                        stateHelper.setBlacksmithCacheVerbose(settings.verbose);
                         const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
                         stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
+                        if (performedHydration) {
+                            // A freshly-cloned mirror is exactly the remote's current state
+                            mirrorFresh = true;
+                            stateHelper.setBlacksmithCacheMirrorChanged(true);
+                        }
+                        else if (settings.fetchDepth <= 0) {
+                            // Bring the mirror's branch/tag refs up to date with the remote
+                            // (ls-remote diff + targeted fetch of only the changed refs), so
+                            // the workspace can be populated from the mirror with the same
+                            // freshness as a direct network fetch.
+                            const syncResult = yield blacksmithCache.syncMirrorFromRemote(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            mirrorFresh = syncResult.success;
+                            stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed);
+                            stateHelper.setBlacksmithCacheMirrorSyncFailed(!syncResult.success && !syncResult.timedOut);
+                            stateHelper.setBlacksmithCacheMirrorSyncTimedOut(syncResult.timedOut);
+                        }
+                        else {
+                            // Shallow checkouts never populate the workspace from mirror
+                            // refs, so the checkout step doesn't need a fresh mirror. Defer
+                            // the mirror sync to the post step to keep the checkout step
+                            // fast.
+                            stateHelper.setBlacksmithCacheMirrorSyncDeferred(true);
+                            stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
+                            stateHelper.setBlacksmithCacheVerbose(settings.verbose);
+                        }
                         core.endGroup();
                     }
                 }
@@ -2445,14 +2649,50 @@ function getSource(settings) {
                 fetchOptions.filter = 'blob:none';
             }
             if (settings.fetchDepth <= 0) {
-                // Fetch all branches and tags
-                let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
-                // When all history is fetched, the ref we're interested in may have moved to a different
-                // commit (push or force push). If so, fetch again with a targeted refspec.
-                if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
-                    refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                // When the Blacksmith mirror is available and synced with the remote,
+                // copy branch/tag refs from it locally (objects are already shared via
+                // alternates) instead of doing a full +refs/heads/* fetch over the
+                // network, and only ask the network for the specific ref/commit this
+                // run needs.
+                let fetchedFromMirror = false;
+                if (cacheInfo &&
+                    mirrorFresh &&
+                    !fetchOptions.filter &&
+                    !fsHelper.fileExistsSync(path.join(settings.repositoryPath, '.git', 'shallow'))) {
+                    fetchedFromMirror = yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath);
+                }
+                if (fetchedFromMirror) {
+                    // The mirror copy only materializes branches and tags. Any other ref
+                    // (refs/pull/*, etc.) must be fetched from the network so its local
+                    // destination ref exists for checkout. For branches/tags, verify the
+                    // wanted ref/commit is present and fetch it directly if not.
+                    const upperRef = (settings.ref || '').toUpperCase();
+                    const coveredByMirror = !settings.ref ||
+                        !upperRef.startsWith('REFS/') ||
+                        upperRef.startsWith('REFS/HEADS/') ||
+                        upperRef.startsWith('REFS/TAGS/');
+                    let verified = false;
+                    if (coveredByMirror) {
+                        verified = yield refHelper.testRef(git, settings.ref, settings.commit);
+                        if (verified && settings.commit) {
+                            verified = yield git.shaExists(settings.commit);
+                        }
+                    }
+                    if (!verified) {
+                        const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                        yield git.fetch(refSpec, fetchOptions);
+                    }
+                }
+                else {
+                    // Fetch all branches and tags
+                    let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
                     yield git.fetch(refSpec, fetchOptions);
+                    // When all history is fetched, the ref we're interested in may have moved to a different
+                    // commit (push or force push). If so, fetch again with a targeted refspec.
+                    if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
+                        refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                        yield git.fetch(refSpec, fetchOptions);
+                    }
                 }
             }
             else {
@@ -3204,27 +3444,28 @@ function cleanup() {
         const mountPoint = stateHelper.BlacksmithCacheMountPoint;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
         const performedHydration = stateHelper.BlacksmithCachePerformedHydration;
-        const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
-        const verbose = stateHelper.BlacksmithCacheVerbose;
+        let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged;
+        let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed;
+        let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut;
         if (exposeId && stickyDiskKey) {
-            // Track mirror refresh outcome for metrics and commit decision
-            let refreshResult = {
-                success: true,
-                timedOut: false
-            };
-            // Refresh the git mirror in the post step (outside the critical checkout path)
-            // This updates the mirror for future runs without blocking the workflow
-            if (mirrorPath && repoUrl && !performedHydration) {
-                core.startGroup('Refreshing Blacksmith git mirror');
+            // For shallow checkouts the checkout step never populates the workspace
+            // from mirror refs, so the mirror sync is deferred here to keep the
+            // checkout step fast.
+            if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
+                const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
                 // Re-read auth token from input (don't store sensitive data in state)
                 const authToken = core.getInput('token', { required: false });
-                if (authToken) {
-                    refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
+                if (repoUrl && authToken) {
+                    core.startGroup('Syncing Blacksmith git mirror');
+                    const syncResult = yield blacksmithCache.syncMirrorFromRemote(mirrorPath, repoUrl, authToken, stateHelper.BlacksmithCacheVerbose);
+                    mirrorChanged = syncResult.changed;
+                    mirrorSyncFailed = !syncResult.success && !syncResult.timedOut;
+                    mirrorSyncTimedOut = syncResult.timedOut;
+                    core.endGroup();
                 }
                 else {
-                    core.warning('[git-mirror] No auth token available, skipping mirror refresh');
+                    core.warning('[git-mirror] No auth token available, skipping mirror sync');
                 }
-                core.endGroup();
             }
             let cleanupResult;
             try {
@@ -3248,8 +3489,6 @@ function cleanup() {
                         }
                     }
                 }
-                // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
-                const vmHydratedGitMirror = shouldCommit && performedHydration;
                 if (!shouldCommit) {
                     core.warning(`[git-mirror] Skipping cache commit: ${skipReason}`);
                     if (performedHydration) {
@@ -3259,25 +3498,35 @@ function cleanup() {
                 else {
                     core.info('[git-mirror] No previous step failures detected');
                 }
+                // The mirror was synchronized with the remote in the main step. If it
+                // was already up to date (no refs changed and no hydration), there is
+                // nothing to persist - release the sticky disk without committing and
+                // skip GC.
+                if (shouldCommit && !mirrorChanged) {
+                    shouldCommit = false;
+                    core.info('[git-mirror] Mirror unchanged since last commit, releasing sticky disk without commit');
+                }
+                // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
+                const vmHydratedGitMirror = shouldCommit && performedHydration;
                 cleanupResult = yield blacksmithCache.cleanup({
                     exposeId,
                     stickyDiskKey,
                     repoName: repoName || undefined,
                     mountPoint: mountPoint || undefined,
-                    mirrorPath: mirrorPath || undefined,
+                    mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
                     shouldCommit,
                     vmHydratedGitMirror,
-                    mirrorRefreshFailed: !refreshResult.success && !refreshResult.timedOut,
-                    mirrorRefreshTimedOut: refreshResult.timedOut
+                    mirrorSyncFailed,
+                    mirrorSyncTimedOut
                 });
             }
             catch (error) {
                 core.warning(`Failed to cleanup Blacksmith cache: ${(_b = error === null || error === void 0 ? void 0 : error.message) !== null && _b !== void 0 ? _b : error}`);
             }
             // Report metrics for any failures/timeouts (fire-and-forget)
-            if (!refreshResult.success) {
-                yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_refresh_failure', 1, {
-                    reason: refreshResult.timedOut ? 'timeout' : 'failure'
+            if (mirrorSyncFailed || mirrorSyncTimedOut) {
+                yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_sync_failure', 1, {
+                    reason: mirrorSyncTimedOut ? 'timeout' : 'failure'
                 });
             }
             if (cleanupResult) {
@@ -3721,7 +3970,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -3732,6 +3981,10 @@ exports.setBlacksmithCacheMountPoint = setBlacksmithCacheMountPoint;
 exports.setBlacksmithCacheRepoName = setBlacksmithCacheRepoName;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
+exports.setBlacksmithCacheMirrorChanged = setBlacksmithCacheMirrorChanged;
+exports.setBlacksmithCacheMirrorSyncFailed = setBlacksmithCacheMirrorSyncFailed;
+exports.setBlacksmithCacheMirrorSyncTimedOut = setBlacksmithCacheMirrorSyncTimedOut;
+exports.setBlacksmithCacheMirrorSyncDeferred = setBlacksmithCacheMirrorSyncDeferred;
 exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
 exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 const core = __importStar(__nccwpck_require__(2186));
@@ -3781,7 +4034,23 @@ exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskK
  */
 exports.BlacksmithCachePerformedHydration = core.getState('blacksmithCachePerformedHydration') === 'true';
 /**
- * The repository URL for refreshing the git mirror in the POST action.
+ * Whether the main step's mirror sync changed the mirror. Used by the POST
+ * action to decide whether the sticky disk needs to be committed.
+ */
+exports.BlacksmithCacheMirrorChanged = core.getState('blacksmithCacheMirrorChanged') === 'true';
+/**
+ * Whether the main step's mirror sync failed or timed out. Used by the POST
+ * action to skip committing a potentially inconsistent mirror.
+ */
+exports.BlacksmithCacheMirrorSyncFailed = core.getState('blacksmithCacheMirrorSyncFailed') === 'true';
+exports.BlacksmithCacheMirrorSyncTimedOut = core.getState('blacksmithCacheMirrorSyncTimedOut') === 'true';
+/**
+ * Whether the mirror sync was deferred to the POST action (shallow
+ * checkouts, which never populate the workspace from mirror refs).
+ */
+exports.BlacksmithCacheMirrorSyncDeferred = core.getState('blacksmithCacheMirrorSyncDeferred') === 'true';
+/**
+ * The repository URL for a deferred mirror sync in the POST action.
  */
 exports.BlacksmithCacheRepoUrl = core.getState('blacksmithCacheRepoUrl');
 /**
@@ -3850,7 +4119,28 @@ function setBlacksmithCachePerformedHydration(performed) {
     core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false');
 }
 /**
- * Save the repository URL so the POST action can refresh the git mirror.
+ * Save whether the main step's mirror sync changed the mirror.
+ */
+function setBlacksmithCacheMirrorChanged(changed) {
+    core.saveState('blacksmithCacheMirrorChanged', changed ? 'true' : 'false');
+}
+/**
+ * Save the outcome of the main step's mirror sync.
+ */
+function setBlacksmithCacheMirrorSyncFailed(failed) {
+    core.saveState('blacksmithCacheMirrorSyncFailed', failed ? 'true' : 'false');
+}
+function setBlacksmithCacheMirrorSyncTimedOut(timedOut) {
+    core.saveState('blacksmithCacheMirrorSyncTimedOut', timedOut ? 'true' : 'false');
+}
+/**
+ * Save whether the mirror sync was deferred to the POST action.
+ */
+function setBlacksmithCacheMirrorSyncDeferred(deferred) {
+    core.saveState('blacksmithCacheMirrorSyncDeferred', deferred ? 'true' : 'false');
+}
+/**
+ * Save the repository URL so the POST action can sync the git mirror.
  */
 function setBlacksmithCacheRepoUrl(repoUrl) {
     core.saveState('blacksmithCacheRepoUrl', repoUrl);
