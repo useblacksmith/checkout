@@ -57,6 +57,7 @@ exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(7147));
+const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
 const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
@@ -347,7 +348,7 @@ function getAuthConfigArgs(repoUrl, authToken) {
 /**
  * Build git environment with optional verbose flags
  */
-function buildGitEnv(verbose) {
+function buildGitEnv(verbose, trace2PerfPath) {
     const gitEnv = {};
     for (const [key, value] of Object.entries(process.env)) {
         if (value !== undefined) {
@@ -357,8 +358,53 @@ function buildGitEnv(verbose) {
     if (verbose) {
         gitEnv['GIT_TRACE'] = '1';
         gitEnv['GIT_CURL_VERBOSE'] = '1';
+        if (trace2PerfPath) {
+            gitEnv['GIT_TRACE2_PERF'] = trace2PerfPath;
+        }
     }
     return gitEnv;
+}
+function newTrace2PerfPath(label) {
+    return path.join(os.tmpdir(), `blacksmith-git-trace2-${label}-${Date.now()}-${process.pid}`);
+}
+/**
+ * Print the slowest trace2 perf regions recorded at trace2PerfPath, so
+ * verbose runs show where time went inside a git command (ref advertisement,
+ * negotiation, pack transfer, ...) without users having to parse raw trace2
+ * output.
+ */
+function summarizeTrace2Perf(trace2PerfPath, title) {
+    try {
+        if (!fs.existsSync(trace2PerfPath)) {
+            return;
+        }
+        const regions = [];
+        for (const line of fs.readFileSync(trace2PerfPath, 'utf8').split('\n')) {
+            if (!line.includes('region_leave')) {
+                continue;
+            }
+            const cols = line.split('|').map(col => col.trim());
+            if (cols.length < 3) {
+                continue;
+            }
+            const duration = parseFloat(cols[cols.length - 3]);
+            const label = cols[cols.length - 1];
+            if (!isNaN(duration) && label) {
+                regions.push({ duration, label });
+            }
+        }
+        regions.sort((a, b) => b.duration - a.duration);
+        core.info(`[git-mirror] trace2 slowest regions (${title}):`);
+        for (const region of regions.slice(0, 12)) {
+            core.info(`[git-mirror]   ${region.duration.toFixed(6)}  ${region.label}`);
+        }
+    }
+    catch (error) {
+        core.debug(`[git-mirror] Failed to summarize trace2 output: ${error.message}`);
+    }
+    finally {
+        fs.rmSync(trace2PerfPath, { force: true });
+    }
 }
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
@@ -387,7 +433,8 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         // First time - create a bare mirror clone (initial hydration)
         core.info(`[git-mirror] Creating new mirror at ${mirrorPath} (initial hydration)`);
         const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
-        const gitEnv = buildGitEnv(verbose);
+        const trace2PerfPath = verbose ? newTrace2PerfPath('clone') : undefined;
+        const gitEnv = buildGitEnv(verbose, trace2PerfPath);
         const mirrorDir = path.dirname(mirrorPath);
         yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
         // Change ownership so git can write to it
@@ -418,6 +465,9 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
             yield exec.exec('git', cloneArgs, { env: gitEnv });
         }));
         core.info('[git-mirror] Initial mirror clone complete');
+        if (trace2PerfPath) {
+            summarizeTrace2Perf(trace2PerfPath, 'initial mirror clone');
+        }
         return true; // Initial hydration performed
     });
 }
@@ -509,7 +559,8 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
         core.info(`[git-mirror] Syncing mirror at ${mirrorPath} with remote (timeout: ${timeoutSecs}s per attempt)`);
         try {
             const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
-            const gitEnv = buildGitEnv(verbose);
+            const trace2PerfPath = verbose ? newTrace2PerfPath('sync') : undefined;
+            const gitEnv = buildGitEnv(verbose, trace2PerfPath);
             const lsRemoteStart = Date.now();
             let lsRemoteOutput = '';
             yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
@@ -594,6 +645,9 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                     }
                 }));
                 core.info(`[git-mirror] Fetched ${diff.updatedRefSpecs.length} changed refs in ${Date.now() - fetchStart}ms`);
+                if (trace2PerfPath) {
+                    summarizeTrace2Perf(trace2PerfPath, 'mirror sync');
+                }
             }
             if (diff.deletedRefs.length > 0) {
                 yield exec.getExecOutput('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
