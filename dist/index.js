@@ -59,6 +59,7 @@ exports.copyRefsFromMirror = copyRefsFromMirror;
 exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
+exports.hasCommitGraph = hasCommitGraph;
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -583,21 +584,29 @@ function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
  */
 function purgePullRefs(mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
-        const pullRefs = yield exec.getExecOutput('git', ['-C', mirrorPath, 'for-each-ref', '--format=%(refname)', 'refs/pull'], { silent: true });
-        const refs = pullRefs.stdout
-            .split('\n')
-            .map(line => line.trim())
-            .filter(ref => ref.length > 0);
-        if (refs.length === 0) {
+        try {
+            const pullRefs = yield exec.getExecOutput('git', ['-C', mirrorPath, 'for-each-ref', '--format=%(refname)', 'refs/pull'], { silent: true });
+            const refs = pullRefs.stdout
+                .split('\n')
+                .map(line => line.trim())
+                .filter(ref => ref.length > 0);
+            if (refs.length === 0) {
+                return 0;
+            }
+            const start = Date.now();
+            yield exec.exec('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
+                silent: true,
+                input: Buffer.from(refs.map(ref => `delete ${ref}\n`).join(''))
+            });
+            core.info(`[git-mirror] Purged ${refs.length} refs/pull/* refs from the mirror in ${Date.now() - start}ms`);
+            return refs.length;
+        }
+        catch (error) {
+            // The purge is an optimization on an already-valid mirror; never let it
+            // fail the operation that invoked it (e.g. discard a completed clone).
+            core.warning(`[git-mirror] refs/pull/* purge failed: ${error}`);
             return 0;
         }
-        const start = Date.now();
-        yield exec.exec('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
-            silent: true,
-            input: Buffer.from(refs.map(ref => `delete ${ref}\n`).join(''))
-        });
-        core.info(`[git-mirror] Purged ${refs.length} refs/pull/* refs from the mirror in ${Date.now() - start}ms`);
-        return refs.length;
     });
 }
 /**
@@ -716,13 +725,16 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         'fetch.negotiationAlgorithm=skipping',
                         // Keep the commit-graph current so ref-tip commit parsing
                         // (mark_complete_local_refs and negotiation walks) reads one
-                        // compact mmap'd file instead of scattered pack entries. Writes
-                        // are incremental (split chains), proportional to the commits
-                        // just fetched. Clone and no-op auto-gc never write one, so
-                        // without this the graph only exists/refreshes when a real gc
-                        // happens to run.
-                        '-c',
-                        'fetch.writeCommitGraph=true',
+                        // compact mmap'd file instead of scattered pack entries. Only
+                        // enabled when a graph already exists: then the write is
+                        // incremental (split chains), proportional to the commits just
+                        // fetched. When no graph exists yet the write would be a full
+                        // reachable walk that could blow the fetch timeout, so the
+                        // initial graph is written outside the fetch instead (after the
+                        // clone, or by the post-step catch-up for pre-existing mirrors).
+                        ...(hasCommitGraph(mirrorPath)
+                            ? ['-c', 'fetch.writeCommitGraph=true']
+                            : []),
                         '-C',
                         mirrorPath,
                         'fetch',
@@ -943,7 +955,11 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
             const freshWorkspace = workspaceRefs.stdout.trim() === '' && !fs.existsSync(packedRefsPath);
             if (freshWorkspace) {
                 const content = buildPackedRefsContent(mirrorRefs.stdout);
-                yield fs.promises.writeFile(packedRefsPath, content);
+                // Write-then-rename so no reader (or fallback path, if the write
+                // fails partway) ever sees a truncated packed-refs file.
+                const tmpPath = `${packedRefsPath}.new`;
+                yield fs.promises.writeFile(tmpPath, content);
+                yield fs.promises.rename(tmpPath, packedRefsPath);
                 const refCount = content.trimEnd().split('\n').length - 1;
                 core.info(`[git-mirror] Wrote ${refCount} refs from mirror as packed-refs in ${Date.now() - start}ms`);
                 return true;
@@ -1054,17 +1070,41 @@ function dissociate(workspacePath) {
  * none until the first threshold-tripping `gc --auto`. Failure is
  * non-fatal - the graph is a pure cache.
  */
-function writeCommitGraph(mirrorPath) {
-    return __awaiter(this, void 0, void 0, function* () {
+function writeCommitGraph(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
         try {
             const start = Date.now();
-            yield exec.exec('git', ['-C', mirrorPath, 'commit-graph', 'write', '--reachable'], { silent: true });
+            const result = yield exec.getExecOutput('timeout', [
+                String(timeoutSecs),
+                'git',
+                '-C',
+                mirrorPath,
+                'commit-graph',
+                'write',
+                '--reachable'
+            ], { silent: true, ignoreReturnCode: true });
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                core.warning(`[git-mirror] commit-graph write timed out after ${timeoutSecs}s`);
+                return;
+            }
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] commit-graph write failed with exit code ${result.exitCode}`);
+                return;
+            }
             core.info(`[git-mirror] Wrote commit-graph in ${Date.now() - start}ms`);
         }
         catch (error) {
             core.warning(`[git-mirror] commit-graph write failed: ${error}`);
         }
     });
+}
+/**
+ * Whether the mirror has a commit-graph (single file or split chain).
+ * Determines if the sync fetch can write incrementally.
+ */
+function hasCommitGraph(mirrorPath) {
+    return (fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graph')) ||
+        fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graphs', 'commit-graph-chain')));
 }
 /**
  * Run lightweight garbage collection on the mirror.
@@ -1242,6 +1282,13 @@ function cleanup(options) {
                 core.warning('[git-mirror] GC failed or timed out, will not commit sticky disk');
                 shouldCommit = false;
                 vmHydratedGitMirror = false;
+            }
+            // Catch-up for mirrors that predate commit-graph writing: build the
+            // initial graph here in the post step, off the checkout critical path.
+            // Once it exists, the sync fetch keeps it current incrementally. Only
+            // worth doing when the disk is being committed; failure is non-fatal.
+            if (shouldCommit && !hasCommitGraph(mirrorPath)) {
+                yield writeCommitGraph(mirrorPath);
             }
         }
         // Sync filesystem before unmount to ensure all writes are flushed
