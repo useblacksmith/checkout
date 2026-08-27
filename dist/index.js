@@ -50,6 +50,9 @@ exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.syncMirrorFromRemote = syncMirrorFromRemote;
+exports.mapMirrorRefToWorkspace = mapMirrorRefToWorkspace;
+exports.buildRefCopyInstructions = buildRefCopyInstructions;
+exports.copyRefsFromMirror = copyRefsFromMirror;
 exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
@@ -703,6 +706,109 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
     });
 }
 /**
+ * Map a mirror ref name to the workspace ref it should be copied to:
+ * branches become remote-tracking refs, tags stay tags. Returns null for
+ * refs that are not copied into the workspace (e.g. refs/pull).
+ */
+function mapMirrorRefToWorkspace(ref) {
+    if (ref.startsWith('refs/heads/')) {
+        return `refs/remotes/origin/${ref.slice('refs/heads/'.length)}`;
+    }
+    if (ref.startsWith('refs/tags/')) {
+        return ref;
+    }
+    return null;
+}
+/**
+ * Build the `git update-ref --stdin` instructions that make the workspace's
+ * refs/remotes/origin/* and refs/tags/* exactly mirror the mirror's
+ * refs/heads/* and refs/tags/*. Both inputs are `for-each-ref` output in
+ * '<objectname> <refname>' format. Workspace refs not present in the mirror
+ * are deleted (the equivalent of `fetch --prune`); everything else is set
+ * unconditionally (the equivalent of a `+` force refspec).
+ */
+function buildRefCopyInstructions(mirrorRefs, workspaceRefs) {
+    const desired = new Map();
+    for (const line of mirrorRefs.split('\n')) {
+        const [sha, ref] = line.trim().split(' ');
+        if (!sha || !ref) {
+            continue;
+        }
+        const target = mapMirrorRefToWorkspace(ref);
+        if (target) {
+            desired.set(target, sha);
+        }
+    }
+    const instructions = [];
+    for (const line of workspaceRefs.split('\n')) {
+        const [sha, ref] = line.trim().split(' ');
+        if (!sha || !ref) {
+            continue;
+        }
+        if ((ref.startsWith('refs/remotes/origin/') ||
+            ref.startsWith('refs/tags/')) &&
+            !desired.has(ref)) {
+            instructions.push(`delete ${ref}`);
+        }
+    }
+    for (const [ref, sha] of desired) {
+        instructions.push(`update ${ref} ${sha}`);
+    }
+    return instructions;
+}
+/**
+ * Copy branch and tag refs from the local mirror into the workspace by
+ * writing them directly with `git update-ref --stdin`, then packing them.
+ * Because the workspace shares the mirror's object store via alternates, no
+ * object data needs to move - and unlike `git fetch <mirrorPath>`, this
+ * skips the fetch machinery entirely (ref advertisement of the full mirror
+ * ref set, the mark_complete walk that parses every local tip out of the
+ * cold pack, and the connectivity check), which is minutes of serialized
+ * reads on a large cold mirror. update-ref still verifies each object
+ * exists (a pack-index lookup, no inflation).
+ *
+ * @returns true on success, false if the caller should fall back
+ */
+function copyRefsFromMirror(workspacePath, mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const start = Date.now();
+            const mirrorRefs = yield exec.getExecOutput('git', [
+                '-C',
+                mirrorPath,
+                'for-each-ref',
+                '--format=%(objectname) %(refname)',
+                'refs/heads',
+                'refs/tags'
+            ], { silent: true });
+            const workspaceRefs = yield exec.getExecOutput('git', [
+                '-C',
+                workspacePath,
+                'for-each-ref',
+                '--format=%(objectname) %(refname)',
+                'refs/remotes/origin',
+                'refs/tags'
+            ], { silent: true });
+            const instructions = buildRefCopyInstructions(mirrorRefs.stdout, workspaceRefs.stdout);
+            if (instructions.length > 0) {
+                yield exec.exec('git', ['-C', workspacePath, 'update-ref', '--stdin'], {
+                    silent: true,
+                    input: Buffer.from(`${instructions.join('\n')}\n`)
+                });
+                yield exec.exec('git', ['-C', workspacePath, 'pack-refs', '--all'], {
+                    silent: true
+                });
+            }
+            core.info(`[git-mirror] Copied ${instructions.length} refs from mirror in ${Date.now() - start}ms`);
+            return true;
+        }
+        catch (error) {
+            core.warning(`[git-mirror] Direct ref copy from mirror failed, falling back to local fetch: ${error}`);
+            return false;
+        }
+    });
+}
+/**
  * Fetch branch and tag refs into the workspace from the local mirror.
  * Because the workspace shares the mirror's object store via alternates,
  * this transfers no object data - it only copies refs. This replaces the
@@ -711,13 +817,21 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
  * syncMirrorFromRemote) and still verifies/fetches the specific ref/commit
  * it needs from the network afterwards as a safety net.
  *
+ * Refs are copied directly with update-ref (see copyRefsFromMirror); if
+ * that fails for any reason, fall back to a local `git fetch` from the
+ * mirror, which produces the same end state through the slower fetch
+ * machinery.
+ *
  * @returns true on success, false if the local fetch failed and the caller
  * should fall back to a network fetch
  */
 function fetchRefsFromMirror(workspacePath, mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
+        core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`);
+        if (yield copyRefsFromMirror(workspacePath, mirrorPath)) {
+            return true;
+        }
         try {
-            core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`);
             yield exec.exec('git', [
                 '-C',
                 workspacePath,

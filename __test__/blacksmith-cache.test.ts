@@ -343,6 +343,64 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('mapMirrorRefToWorkspace', () => {
+    it('maps branches to remote-tracking refs', () => {
+      expect(
+        blacksmithCache.mapMirrorRefToWorkspace('refs/heads/feature/x')
+      ).toBe('refs/remotes/origin/feature/x')
+    })
+
+    it('keeps tags as tags', () => {
+      expect(blacksmithCache.mapMirrorRefToWorkspace('refs/tags/v1.2')).toBe(
+        'refs/tags/v1.2'
+      )
+    })
+
+    it('skips other refs', () => {
+      expect(
+        blacksmithCache.mapMirrorRefToWorkspace('refs/pull/12/merge')
+      ).toBeNull()
+    })
+  })
+
+  describe('buildRefCopyInstructions', () => {
+    const shaA = 'a'.repeat(40)
+    const shaB = 'b'.repeat(40)
+    const shaC = 'c'.repeat(40)
+
+    it('updates all mirror heads and tags into an empty workspace', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/tags/v1\n`
+      expect(blacksmithCache.buildRefCopyInstructions(mirror, '')).toEqual([
+        `update refs/remotes/origin/main ${shaA}`,
+        `update refs/tags/v1 ${shaB}`
+      ])
+    })
+
+    it('deletes workspace refs no longer in the mirror (prune)', () => {
+      const mirror = `${shaA} refs/heads/main\n`
+      const workspace = `${shaA} refs/remotes/origin/main\n${shaB} refs/remotes/origin/gone\n${shaC} refs/tags/v0\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([
+        'delete refs/remotes/origin/gone',
+        'delete refs/tags/v0',
+        `update refs/remotes/origin/main ${shaA}`
+      ])
+    })
+
+    it('does not copy or delete non-branch non-tag refs', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/pull/1/merge\n`
+      const workspace = `${shaC} refs/heads/local-branch\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/main ${shaA}`])
+    })
+
+    it('handles empty inputs', () => {
+      expect(blacksmithCache.buildRefCopyInstructions('', '')).toEqual([])
+    })
+  })
+
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:
