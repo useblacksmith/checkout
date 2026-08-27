@@ -75,7 +75,13 @@ const container_detector_1 = __nccwpck_require__(6424);
 const AGENT_RPC_TIMEOUT_MS = 45000;
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
-const REFRESH_TIMEOUT_SECS = 120; // 2 minutes
+// A sync that doesn't finish within this window is abandoned (single
+// attempt, no retries): sync failure is soft - the workspace is populated
+// from the mirror's last good state plus a targeted fetch of the job's own
+// ref - and the next job on the mirror picks the refs up. Healthy syncs
+// finish in seconds even on large repositories, so waiting longer mostly
+// burns checkout time on a mirror disk that is having a bad day.
+const REFRESH_TIMEOUT_SECS = 60; // 1 minute, single attempt
 const GC_TIMEOUT_SECS = 120; // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
@@ -646,30 +652,27 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
             const trace2PerfPath = verbose ? newTrace2PerfPath('sync') : undefined;
             const gitEnv = buildGitEnv(verbose, trace2PerfPath);
             const lsRemoteStart = Date.now();
-            let lsRemoteOutput = '';
-            yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
-                const result = yield exec.getExecOutput('timeout', [
-                    String(timeoutSecs),
-                    'git',
-                    '-c',
-                    `${configKey}=${configValue}`,
-                    '-C',
-                    mirrorPath,
-                    'ls-remote',
-                    '--heads',
-                    '--tags',
-                    'origin'
-                ], { env: gitEnv, ignoreReturnCode: true, silent: true });
-                if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                    throw new Error(`git ls-remote timed out after ${timeoutSecs}s`);
-                }
-                if (result.exitCode !== 0) {
-                    const stderr = result.stderr.trim();
-                    const details = stderr ? `: ${stderr}` : '';
-                    throw new Error(`git ls-remote failed with exit code ${result.exitCode}${details}`);
-                }
-                lsRemoteOutput = result.stdout;
-            }));
+            const lsRemoteResult = yield exec.getExecOutput('timeout', [
+                String(timeoutSecs),
+                'git',
+                '-c',
+                `${configKey}=${configValue}`,
+                '-C',
+                mirrorPath,
+                'ls-remote',
+                '--heads',
+                '--tags',
+                'origin'
+            ], { env: gitEnv, ignoreReturnCode: true, silent: true });
+            if (lsRemoteResult.exitCode === TIMEOUT_EXIT_CODE) {
+                throw new Error(`git ls-remote timed out after ${timeoutSecs}s`);
+            }
+            if (lsRemoteResult.exitCode !== 0) {
+                const stderr = lsRemoteResult.stderr.trim();
+                const details = stderr ? `: ${stderr}` : '';
+                throw new Error(`git ls-remote failed with exit code ${lsRemoteResult.exitCode}${details}`);
+            }
+            const lsRemoteOutput = lsRemoteResult.stdout;
             const localRefsResult = yield exec.getExecOutput('git', [
                 '-C',
                 mirrorPath,
@@ -695,7 +698,7 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
             const vanishedRefs = [];
             if (refSpecs.length > 0) {
                 const fetchStart = Date.now();
-                yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
+                {
                     // gc.auto=0: disable git's internal auto-gc that porcelain commands
                     // like fetch run after completing. Without this, fetch can spawn a
                     // background gc daemon (gc.autoDetach defaults to true) that holds
@@ -740,7 +743,7 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                     }
                     for (let vanishedRetry = 0; vanishedRetry <= MAX_VANISHED_REF_RETRIES; vanishedRetry++) {
                         if (refSpecs.length === 0) {
-                            return;
+                            break;
                         }
                         const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], {
                             env: gitEnv,
@@ -752,7 +755,7 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                             throw new Error(`git fetch timed out after ${timeoutSecs}s`);
                         }
                         if (result.exitCode === 0) {
-                            return;
+                            break;
                         }
                         // Include stderr in error message so failure details are visible even when silent
                         const stderr = result.stderr.trim();
@@ -768,7 +771,7 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         const details = stderr ? `: ${stderr}` : '';
                         throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
                     }
-                }));
+                }
                 core.info(`[git-mirror] Fetched ${refSpecs.length} changed refs in ${Date.now() - fetchStart}ms`);
                 if (trace2PerfPath) {
                     summarizeTrace2Perf(trace2PerfPath, 'mirror sync');
