@@ -477,6 +477,7 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         // which are never synchronized afterwards. Drop them so the mirror starts
         // with only the refs it maintains.
         yield purgePullRefs(mirrorPath);
+        yield writeCommitGraph(mirrorPath);
         if (trace2PerfPath) {
             summarizeTrace2Perf(trace2PerfPath, 'initial mirror clone');
         }
@@ -687,6 +688,15 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         'gc.auto=0',
                         '-c',
                         'fetch.negotiationAlgorithm=skipping',
+                        // Keep the commit-graph current so ref-tip commit parsing
+                        // (mark_complete_local_refs and negotiation walks) reads one
+                        // compact mmap'd file instead of scattered pack entries. Writes
+                        // are incremental (split chains), proportional to the commits
+                        // just fetched. Clone and no-op auto-gc never write one, so
+                        // without this the graph only exists/refreshes when a real gc
+                        // happens to run.
+                        '-c',
+                        'fetch.writeCommitGraph=true',
                         '-C',
                         mirrorPath,
                         'fetch',
@@ -981,6 +991,26 @@ function dissociate(workspacePath) {
         }
         catch (_a) {
             // File may not exist, that's fine
+        }
+    });
+}
+/**
+ * Write the mirror's commit-graph so subsequent commit parsing (e.g. the
+ * per-ref walks inside fetch) is a lookup in one compact file instead of
+ * scattered pack reads. Reading commit-graphs is enabled by default in git;
+ * writing only happens during a real gc, so a freshly cloned mirror has
+ * none until the first threshold-tripping `gc --auto`. Failure is
+ * non-fatal - the graph is a pure cache.
+ */
+function writeCommitGraph(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const start = Date.now();
+            yield exec.exec('git', ['-C', mirrorPath, 'commit-graph', 'write', '--reachable'], { silent: true });
+            core.info(`[git-mirror] Wrote commit-graph in ${Date.now() - start}ms`);
+        }
+        catch (error) {
+            core.warning(`[git-mirror] commit-graph write failed: ${error}`);
         }
     });
 }
