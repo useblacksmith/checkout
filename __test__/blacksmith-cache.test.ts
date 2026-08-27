@@ -397,6 +397,26 @@ describe('blacksmith-cache tests', () => {
     it('handles empty inputs', () => {
       expect(blacksmithCache.buildRefCopyInstructions('', '')).toEqual([])
     })
+
+    it('never deletes or rewrites symbolic refs like origin/HEAD', () => {
+      const mirror = `${shaA} refs/heads/main\n`
+      const workspace =
+        `${shaA} refs/remotes/origin/HEAD refs/remotes/origin/main\n` +
+        `${shaA} refs/remotes/origin/main\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([])
+    })
+
+    it('still updates the branch behind a symbolic ref', () => {
+      const mirror = `${shaB} refs/heads/main\n`
+      const workspace =
+        `${shaA} refs/remotes/origin/HEAD refs/remotes/origin/main\n` +
+        `${shaA} refs/remotes/origin/main\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/main ${shaB}`])
+    })
   })
 
   describe('buildPackedRefsContent', () => {

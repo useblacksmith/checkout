@@ -42,3 +42,75 @@ jobs:
             exit 1
           fi
           echo "Second checkout successful (used cached mirror)"
+
+      - name: Test fetch-depth 0 checkout (fresh workspace, direct mirror ref copy)
+        uses: ./
+        with:
+          path: deep-checkout
+          fetch-depth: 0
+
+      - name: Verify deep checkout refs, tags and connectivity
+        run: |
+          set -euo pipefail
+          cd deep-checkout
+
+          # Exact ref parity with the remote: every branch/tag ls-remote
+          # advertises must exist locally at the same sha (modulo refs that
+          # moved between the checkout and this re-listing).
+          git ls-remote --heads --tags origin | grep -v '\^{}' | sort > /tmp/remote-refs
+          git for-each-ref --format='%(objectname)	%(refname)' refs/remotes/origin refs/tags \
+            | grep -v 'refs/remotes/origin/HEAD' \
+            | sed 's#refs/remotes/origin/#refs/heads/#' | sort > /tmp/local-refs
+          if ! diff -u /tmp/remote-refs /tmp/local-refs; then
+            echo "Local refs do not match the remote advertisement"
+            exit 1
+          fi
+
+          # Annotated tags must peel through the shared object store
+          for tag in $(git for-each-ref --format='%(refname:short)' refs/tags | head -5); do
+            git rev-parse "$tag^{commit}" > /dev/null
+          done
+
+          # Every copied ref must be fully connected
+          git fsck --no-dangling
+          git rev-list --objects --all --quiet
+          echo "Deep checkout verified"
+
+      - name: Prepare reused deep workspace (origin/HEAD, stale ref, stale FETCH_HEAD)
+        run: |
+          set -euo pipefail
+          cd deep-checkout
+          git remote set-head origin -a
+          git update-ref refs/remotes/origin/zz-stale-test "$(git rev-parse HEAD)"
+          echo "stale fetch head content" > .git/FETCH_HEAD
+
+      - name: Test fetch-depth 0 checkout (reused workspace, ref reconciliation)
+        uses: ./
+        with:
+          path: deep-checkout
+          fetch-depth: 0
+
+      - name: Verify reused deep checkout preserved origin/HEAD and pruned stale refs
+        run: |
+          set -euo pipefail
+          cd deep-checkout
+
+          # origin/HEAD must survive reconciliation as a symref whose target exists
+          head_target=$(git symbolic-ref refs/remotes/origin/HEAD)
+          git rev-parse --verify "$head_target" > /dev/null
+          echo "origin/HEAD -> $head_target"
+
+          # The ref that no longer exists on the remote must have been pruned
+          if git rev-parse --verify refs/remotes/origin/zz-stale-test 2>/dev/null; then
+            echo "Stale ref was not pruned"
+            exit 1
+          fi
+
+          # Stale FETCH_HEAD from a previous checkout must not survive
+          if grep -q "stale fetch head content" .git/FETCH_HEAD 2>/dev/null; then
+            echo "Stale FETCH_HEAD survived the checkout"
+            exit 1
+          fi
+
+          git fsck --no-dangling
+          echo "Reused deep checkout verified"

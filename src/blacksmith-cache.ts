@@ -750,8 +750,21 @@ export async function syncMirrorFromRemote(
   }
 
   core.info(
-    `[git-mirror] Syncing mirror at ${mirrorPath} with remote (timeout: ${timeoutSecs}s per attempt)`
+    `[git-mirror] Syncing mirror at ${mirrorPath} with remote (budget: ${timeoutSecs}s)`
   )
+
+  // One deadline bounds the whole sync: ls-remote and every fetch
+  // invocation (including vanished-ref reruns) draw from the same budget,
+  // so the sync's worst case is timeoutSecs regardless of how many
+  // subprocesses run.
+  const deadline = Date.now() + timeoutSecs * 1000
+  const remainingSecs = (): number => {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000)
+    if (remaining <= 0) {
+      throw new Error(`mirror sync timed out after ${timeoutSecs}s`)
+    }
+    return remaining
+  }
 
   try {
     const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
@@ -762,7 +775,7 @@ export async function syncMirrorFromRemote(
     const lsRemoteResult = await exec.getExecOutput(
       'timeout',
       [
-        String(timeoutSecs),
+        String(remainingSecs()),
         'git',
         '-c',
         `${configKey}=${configValue}`,
@@ -776,7 +789,7 @@ export async function syncMirrorFromRemote(
       {env: gitEnv, ignoreReturnCode: true, silent: true}
     )
     if (lsRemoteResult.exitCode === TIMEOUT_EXIT_CODE) {
-      throw new Error(`git ls-remote timed out after ${timeoutSecs}s`)
+      throw new Error(`git ls-remote timed out (budget ${timeoutSecs}s)`)
     }
     if (lsRemoteResult.exitCode !== 0) {
       const stderr = lsRemoteResult.stderr.trim()
@@ -884,7 +897,7 @@ export async function syncMirrorFromRemote(
           }
           const result = await exec.getExecOutput(
             'timeout',
-            [String(timeoutSecs), 'git', ...fetchArgs],
+            [String(remainingSecs()), 'git', ...fetchArgs],
             {
               env: gitEnv,
               ignoreReturnCode: true,
@@ -893,7 +906,7 @@ export async function syncMirrorFromRemote(
             }
           )
           if (result.exitCode === TIMEOUT_EXIT_CODE) {
-            throw new Error(`git fetch timed out after ${timeoutSecs}s`)
+            throw new Error(`git fetch timed out (budget ${timeoutSecs}s)`)
           }
           if (result.exitCode === 0) {
             break
@@ -990,13 +1003,19 @@ export function mapMirrorRefToWorkspace(ref: string): string | null {
 /**
  * Build the `git update-ref --stdin` instructions that make the workspace's
  * refs/remotes/origin/* and refs/tags/* exactly mirror the mirror's
- * refs/heads/* and refs/tags/*. Both inputs are `for-each-ref` output in
- * '<objectname> <refname>' format. Workspace refs not present in the mirror
+ * refs/heads/* and refs/tags/*. The mirror input is `for-each-ref` output in
+ * '<objectname> <refname>' format; the workspace input additionally carries
+ * a third '%(symref)' column. Workspace refs not present in the mirror
  * are deleted (the equivalent of `fetch --prune`); refs whose value differs
  * are set unconditionally (the equivalent of a `+` force refspec); refs
  * already at the right value are skipped, because update-ref verifies the
  * object of every ref it writes and those reads are expensive on a cold
  * mirror.
+ *
+ * Symbolic refs (notably refs/remotes/origin/HEAD) are left untouched:
+ * update-ref would dereference a `delete` through the symref and delete the
+ * branch it points at instead. `git fetch --prune` also preserves
+ * origin/HEAD.
  */
 export function buildRefCopyInstructions(
   mirrorRefs: string,
@@ -1016,7 +1035,7 @@ export function buildRefCopyInstructions(
 
   const instructions: string[] = []
   for (const line of workspaceRefs.split('\n')) {
-    const [sha, ref] = line.trim().split(' ')
+    const [sha, ref, symrefTarget] = line.trim().split(' ')
     if (!sha || !ref) {
       continue
     }
@@ -1024,6 +1043,11 @@ export function buildRefCopyInstructions(
       !ref.startsWith('refs/remotes/origin/') &&
       !ref.startsWith('refs/tags/')
     ) {
+      continue
+    }
+    if (symrefTarget) {
+      // Symbolic ref (e.g. origin/HEAD): never delete or rewrite it, and
+      // don't let it consume the desired entry for its target branch.
       continue
     }
     const desiredSha = desired.get(ref)
@@ -1076,15 +1100,28 @@ export function buildPackedRefsContent(mirrorRefs: string): string {
  * parses every local tip out of the cold pack, and the connectivity check -
  * which is minutes of serialized reads on a large cold mirror.
  *
+ * The copy is only valid when the workspace actually shares the mirror's
+ * object store: the copied refs are bare name -> sha pairs, so without the
+ * alternate every one of them would dangle. Eligibility is therefore
+ * verified explicitly (the alternates file must reference this mirror's
+ * objects directory) rather than inferred, and anything unexpected -
+ * missing/foreign alternates, a non-files ref backend, a gitfile worktree -
+ * falls back to the local fetch, which moves objects as well as refs.
+ *
  * Fresh workspace (no packed-refs file and nothing in the target
  * namespaces - the normal checkout path): the refs are written as the
  * workspace's packed-refs file directly. This touches no objects at all;
  * the only mirror reads are its own ref listing.
  *
  * Reused workspace: the refs are reconciled with `git update-ref --stdin`,
- * updating only refs that changed and pruning ones that disappeared.
- * update-ref verifies the object of each ref it writes, so this costs one
- * pack-index lookup per *changed* ref rather than per ref.
+ * updating only refs that changed and pruning ones that disappeared
+ * (symbolic refs such as origin/HEAD are preserved). update-ref verifies
+ * the object of each ref it writes, so this costs one pack-index lookup
+ * per *changed* ref rather than per ref.
+ *
+ * A successful copy removes any stale FETCH_HEAD left by an earlier
+ * checkout in a reused workspace, so scripts never read fetch output that
+ * predates this ref state.
  *
  * @returns true on success, false if the caller should fall back
  */
@@ -1094,6 +1131,50 @@ export async function copyRefsFromMirror(
 ): Promise<boolean> {
   try {
     const start = Date.now()
+
+    const gitDir = path.join(workspacePath, '.git')
+    if (!fs.existsSync(gitDir) || !fs.statSync(gitDir).isDirectory()) {
+      core.info(
+        '[git-mirror] Workspace .git is not a directory, using local fetch instead of direct ref copy'
+      )
+      return false
+    }
+
+    const alternatesPath = path.join(gitDir, 'objects', 'info', 'alternates')
+    const expectedAlternate = `${mirrorPath}/objects`
+    let hasMirrorAlternate = false
+    try {
+      const alternates = await fs.promises.readFile(alternatesPath, 'utf8')
+      hasMirrorAlternate = alternates
+        .split('\n')
+        .some(line => line.trim() === expectedAlternate)
+    } catch {
+      hasMirrorAlternate = false
+    }
+    if (!hasMirrorAlternate) {
+      core.info(
+        '[git-mirror] Workspace does not share the mirror object store, using local fetch instead of direct ref copy'
+      )
+      return false
+    }
+
+    // Only the files ref backend stores refs in packed-refs / update-ref's
+    // default loose format the way this path assumes. A reftable
+    // repository ignores a packed-refs file entirely, so writing one would
+    // silently produce a repo with no refs.
+    const refStorage = await exec.getExecOutput(
+      'git',
+      ['-C', workspacePath, 'config', '--get', 'extensions.refstorage'],
+      {silent: true, ignoreReturnCode: true}
+    )
+    const refBackend = refStorage.stdout.trim()
+    if (refBackend !== '' && refBackend !== 'files') {
+      core.info(
+        `[git-mirror] Workspace uses ref backend '${refBackend}', using local fetch instead of direct ref copy`
+      )
+      return false
+    }
+
     const mirrorRefs = await exec.getExecOutput(
       'git',
       [
@@ -1112,14 +1193,14 @@ export async function copyRefsFromMirror(
         '-C',
         workspacePath,
         'for-each-ref',
-        '--format=%(objectname) %(refname)',
+        '--format=%(objectname) %(refname) %(symref)',
         'refs/remotes/origin',
         'refs/tags'
       ],
       {silent: true}
     )
 
-    const packedRefsPath = path.join(workspacePath, '.git', 'packed-refs')
+    const packedRefsPath = path.join(gitDir, 'packed-refs')
     const freshWorkspace =
       workspaceRefs.stdout.trim() === '' && !fs.existsSync(packedRefsPath)
 
@@ -1134,6 +1215,7 @@ export async function copyRefsFromMirror(
       core.info(
         `[git-mirror] Wrote ${refCount} refs from mirror as packed-refs in ${Date.now() - start}ms`
       )
+      await removeStaleFetchHead(gitDir)
       return true
     }
 
@@ -1153,12 +1235,26 @@ export async function copyRefsFromMirror(
     core.info(
       `[git-mirror] Reconciled ${instructions.length} refs from mirror in ${Date.now() - start}ms`
     )
+    await removeStaleFetchHead(gitDir)
     return true
   } catch (error) {
     core.warning(
       `[git-mirror] Direct ref copy from mirror failed, falling back to local fetch: ${error}`
     )
     return false
+  }
+}
+
+/**
+ * The direct ref copy does not run the fetch machinery, so it never writes
+ * FETCH_HEAD. Remove one left over from an earlier checkout in a reused
+ * workspace rather than letting scripts read stale fetch output.
+ */
+async function removeStaleFetchHead(gitDir: string): Promise<void> {
+  try {
+    await fs.promises.unlink(path.join(gitDir, 'FETCH_HEAD'))
+  } catch {
+    // Usually ENOENT (fresh workspace); FETCH_HEAD removal is best-effort.
   }
 }
 
