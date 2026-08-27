@@ -525,6 +525,10 @@ export async function ensureMirror(
     await exec.exec('git', cloneArgs, {env: gitEnv})
   })
   core.info('[git-mirror] Initial mirror clone complete')
+  // `clone --mirror` brings in every advertised ref, including refs/pull/*,
+  // which are never synchronized afterwards. Drop them so the mirror starts
+  // with only the refs it maintains.
+  await purgePullRefs(mirrorPath)
   if (trace2PerfPath) {
     summarizeTrace2Perf(trace2PerfPath, 'initial mirror clone')
   }
@@ -633,6 +637,45 @@ export function diffMirrorRefs(
 }
 
 /**
+ * Delete all refs/pull/* from the mirror. Pull refs are no longer
+ * synchronized (a job that needs one fetches it directly into its
+ * workspace), but mirrors created before that change still carry a ref for
+ * every pull request ever opened - often several times more refs than live
+ * branches and tags. Every ref in the mirror has a cost: git's fetch
+ * machinery walks all local refs (mark_complete_local_refs), and the ref
+ * advertisement and packed-refs scans grow with the total count.
+ *
+ * Deleting only touches the ref database (one packed-refs rewrite plus
+ * loose ref unlinks) - no object access - and is a no-op on mirrors that
+ * have no pull refs left.
+ *
+ * @returns the number of refs deleted
+ */
+export async function purgePullRefs(mirrorPath: string): Promise<number> {
+  const pullRefs = await exec.getExecOutput(
+    'git',
+    ['-C', mirrorPath, 'for-each-ref', '--format=%(refname)', 'refs/pull'],
+    {silent: true}
+  )
+  const refs = pullRefs.stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(ref => ref.length > 0)
+  if (refs.length === 0) {
+    return 0
+  }
+  const start = Date.now()
+  await exec.exec('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
+    silent: true,
+    input: Buffer.from(refs.map(ref => `delete ${ref}\n`).join(''))
+  })
+  core.info(
+    `[git-mirror] Purged ${refs.length} refs/pull/* refs from the mirror in ${Date.now() - start}ms`
+  )
+  return refs.length
+}
+
+/**
  * Synchronize the mirror with the remote before the workspace is populated
  * from it. Instead of a full `git fetch --prune origin` (whose cost is
  * proportional to the total ref count even when nothing changed), this:
@@ -650,8 +693,8 @@ export function diffMirrorRefs(
  *
  * refs/pull/* are not synchronized: a job that needs a pull ref fetches it
  * directly into its workspace, and pull refs would otherwise dominate the
- * advertisement size on busy repositories. Any refs/pull/* already present
- * in the mirror are left untouched.
+ * advertisement size on busy repositories. Any refs/pull/* still present in
+ * the mirror from before this change are purged (see purgePullRefs).
  *
  * @param mirrorPath - Path to the bare git mirror
  * @param repoUrl - URL of the repository to mirror
@@ -731,9 +774,14 @@ export async function syncMirrorFromRemote(
       `[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`
     )
 
+    // Purge legacy refs/pull/* before fetching so the fetch's local ref
+    // walk no longer covers them. A purge is a real mirror change that
+    // must be committed even when the branch/tag refs are already current.
+    const purgedRefs = await purgePullRefs(mirrorPath)
+
     if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
       core.info('[git-mirror] Mirror is already up to date with the remote')
-      return {success: true, timedOut: false, changed: false}
+      return {success: true, timedOut: false, changed: purgedRefs > 0}
     }
 
     if (diff.updatedRefSpecs.length > 0) {
