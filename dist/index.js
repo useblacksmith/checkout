@@ -50,6 +50,7 @@ exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.purgePullRefs = purgePullRefs;
+exports.parseMissingRemoteRefs = parseMissingRemoteRefs;
 exports.syncMirrorFromRemote = syncMirrorFromRemote;
 exports.mapMirrorRefToWorkspace = mapMirrorRefToWorkspace;
 exports.buildRefCopyInstructions = buildRefCopyInstructions;
@@ -86,6 +87,9 @@ const TIMEOUT_EXIT_CODE = 124;
 // Cap on --negotiation-tip arguments passed to the mirror sync fetch, to
 // bound the command line length when many refs changed at once.
 const MAX_NEGOTIATION_TIPS = 1000;
+// Maximum number of times a mirror sync fetch is re-run after pruning refs
+// that were deleted on the remote between ls-remote and fetch.
+const MAX_VANISHED_REF_RETRIES = 5;
 /**
  * Get the mount point for a specific repository.
  * Each repository gets its own mount point to support multiple checkouts.
@@ -616,6 +620,20 @@ function purgePullRefs(mirrorPath) {
  * @param authToken - Authentication token for the repository
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  */
+/**
+ * Parse the refs git reports as missing from a fetch's stderr. When a ref is
+ * deleted on the remote between our ls-remote and the fetch, git fails with
+ * `fatal: couldn't find remote ref <ref>`.
+ */
+function parseMissingRemoteRefs(stderr) {
+    const refs = [];
+    const re = /couldn't find remote ref (\S+)/g;
+    let match;
+    while ((match = re.exec(stderr)) !== null) {
+        refs.push(match[1]);
+    }
+    return refs;
+}
 function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false, timeoutSecs = REFRESH_TIMEOUT_SECS) {
         if (!fs.existsSync(mirrorPath)) {
@@ -670,7 +688,12 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                 core.info('[git-mirror] Mirror is already up to date with the remote');
                 return { success: true, timedOut: false, changed: purgedRefs > 0 };
             }
-            if (diff.updatedRefSpecs.length > 0) {
+            // Refs deleted on the remote between ls-remote and the fetch make git
+            // fail with "couldn't find remote ref". Prune those refs and re-run the
+            // fetch so one vanished ref doesn't abort the whole sync.
+            let refSpecs = diff.updatedRefSpecs;
+            const vanishedRefs = [];
+            if (refSpecs.length > 0) {
                 const fetchStart = Date.now();
                 yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
                     // gc.auto=0: disable git's internal auto-gc that porcelain commands
@@ -715,33 +738,59 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                     if (verbose) {
                         fetchArgs.splice(fetchArgs.indexOf('origin'), 0, '--progress', '--verbose');
                     }
-                    const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], {
-                        env: gitEnv,
-                        ignoreReturnCode: true,
-                        silent: !verbose,
-                        input: Buffer.from(`${diff.updatedRefSpecs.join('\n')}\n`)
-                    });
-                    if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                        throw new Error(`git fetch timed out after ${timeoutSecs}s`);
-                    }
-                    if (result.exitCode !== 0) {
+                    for (let vanishedRetry = 0; vanishedRetry <= MAX_VANISHED_REF_RETRIES; vanishedRetry++) {
+                        if (refSpecs.length === 0) {
+                            return;
+                        }
+                        const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...fetchArgs], {
+                            env: gitEnv,
+                            ignoreReturnCode: true,
+                            silent: !verbose,
+                            input: Buffer.from(`${refSpecs.join('\n')}\n`)
+                        });
+                        if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                            throw new Error(`git fetch timed out after ${timeoutSecs}s`);
+                        }
+                        if (result.exitCode === 0) {
+                            return;
+                        }
                         // Include stderr in error message so failure details are visible even when silent
                         const stderr = result.stderr.trim();
+                        const missingRefs = parseMissingRemoteRefs(stderr);
+                        if (missingRefs.length > 0 &&
+                            vanishedRetry < MAX_VANISHED_REF_RETRIES) {
+                            const missingSet = new Set(missingRefs);
+                            refSpecs = refSpecs.filter(spec => !missingSet.has(spec.slice(1).split(':')[0]));
+                            vanishedRefs.push(...missingRefs);
+                            core.info(`[git-mirror] ${missingRefs.length} ref(s) deleted on the remote mid-sync (${missingRefs.join(', ')}), retrying fetch without them`);
+                            continue;
+                        }
                         const details = stderr ? `: ${stderr}` : '';
                         throw new Error(`git fetch failed with exit code ${result.exitCode}${details}`);
                     }
                 }));
-                core.info(`[git-mirror] Fetched ${diff.updatedRefSpecs.length} changed refs in ${Date.now() - fetchStart}ms`);
+                core.info(`[git-mirror] Fetched ${refSpecs.length} changed refs in ${Date.now() - fetchStart}ms`);
                 if (trace2PerfPath) {
                     summarizeTrace2Perf(trace2PerfPath, 'mirror sync');
                 }
             }
-            if (diff.deletedRefs.length > 0) {
+            // Refs that vanished mid-sync are deleted locally like any other
+            // remotely-deleted ref, but only if they exist in the mirror (a vanished
+            // ref may have been brand new and never fetched).
+            const localRefNames = new Set(localRefsResult.stdout
+                .split('\n')
+                .map(line => line.trim().split(' ')[1])
+                .filter(Boolean));
+            const refsToDelete = [
+                ...diff.deletedRefs,
+                ...vanishedRefs.filter(ref => localRefNames.has(ref))
+            ];
+            if (refsToDelete.length > 0) {
                 yield exec.getExecOutput('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
                     silent: true,
-                    input: Buffer.from(diff.deletedRefs.map(ref => `delete ${ref}\n`).join(''))
+                    input: Buffer.from(refsToDelete.map(ref => `delete ${ref}\n`).join(''))
                 });
-                core.info(`[git-mirror] Deleted ${diff.deletedRefs.length} refs removed on the remote`);
+                core.info(`[git-mirror] Deleted ${refsToDelete.length} refs removed on the remote`);
             }
             core.info('[git-mirror] Mirror sync complete');
             return { success: true, timedOut: false, changed: true };
