@@ -49,13 +49,13 @@ describe('blacksmith-cache tests', () => {
 
     it('includes owner and repo in mount point path', () => {
       const mountPoint = blacksmithCache.getMountPoint(
-        'descriptinc',
-        'descript'
+        'testorg',
+        'bigrepo'
       )
 
-      expect(mountPoint).toContain('descriptinc')
-      expect(mountPoint).toContain('descript')
-      expect(mountPoint).toBe('/blacksmith-git-mirror/descriptinc/descript')
+      expect(mountPoint).toContain('testorg')
+      expect(mountPoint).toContain('bigrepo')
+      expect(mountPoint).toBe('/blacksmith-git-mirror/testorg/bigrepo')
     })
 
     it('avoids collisions from hyphenated names', () => {
@@ -103,12 +103,12 @@ describe('blacksmith-cache tests', () => {
 
     it('returns expected full path format', () => {
       const mirrorPath = blacksmithCache.getMirrorPath(
-        'descriptinc',
-        'descript'
+        'testorg',
+        'bigrepo'
       )
 
       expect(mirrorPath).toBe(
-        '/blacksmith-git-mirror/descriptinc/descript/v1/descriptinc-descript.git'
+        '/blacksmith-git-mirror/testorg/bigrepo/v1/testorg-bigrepo.git'
       )
     })
   })
@@ -468,11 +468,11 @@ describe('blacksmith-cache tests', () => {
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:
-      // 1. First checkout: descriptinc/descript (workflow repo)
-      // 2. Second checkout: descriptinc/shared-actions
+      // 1. First checkout: testorg/bigrepo (workflow repo)
+      // 2. Second checkout: testorg/shared-actions
 
-      const repo1 = {owner: 'descriptinc', repo: 'descript'}
-      const repo2 = {owner: 'descriptinc', repo: 'shared-actions'}
+      const repo1 = {owner: 'testorg', repo: 'bigrepo'}
+      const repo2 = {owner: 'testorg', repo: 'shared-actions'}
 
       const mountPoint1 = blacksmithCache.getMountPoint(repo1.owner, repo1.repo)
       const mountPoint2 = blacksmithCache.getMountPoint(repo2.owner, repo2.repo)
@@ -481,9 +481,9 @@ describe('blacksmith-cache tests', () => {
       const mirrorPath2 = blacksmithCache.getMirrorPath(repo2.owner, repo2.repo)
 
       // Mount points should be different
-      expect(mountPoint1).toBe('/blacksmith-git-mirror/descriptinc/descript')
+      expect(mountPoint1).toBe('/blacksmith-git-mirror/testorg/bigrepo')
       expect(mountPoint2).toBe(
-        '/blacksmith-git-mirror/descriptinc/shared-actions'
+        '/blacksmith-git-mirror/testorg/shared-actions'
       )
       expect(mountPoint1).not.toBe(mountPoint2)
 
