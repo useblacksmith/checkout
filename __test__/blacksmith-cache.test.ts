@@ -343,6 +343,37 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('parseMissingRemoteRefs', () => {
+    it('extracts a single missing ref', () => {
+      const stderr =
+        "fatal: couldn't find remote ref refs/heads/trunk-temp/pr-41568/f00ba4"
+      expect(blacksmithCache.parseMissingRemoteRefs(stderr)).toEqual([
+        'refs/heads/trunk-temp/pr-41568/f00ba4'
+      ])
+    })
+
+    it('extracts multiple missing refs across lines', () => {
+      const stderr = [
+        "fatal: couldn't find remote ref refs/heads/a",
+        'error: some other line',
+        "fatal: couldn't find remote ref refs/tags/b"
+      ].join('\n')
+      expect(blacksmithCache.parseMissingRemoteRefs(stderr)).toEqual([
+        'refs/heads/a',
+        'refs/tags/b'
+      ])
+    })
+
+    it('returns empty for unrelated errors', () => {
+      expect(
+        blacksmithCache.parseMissingRemoteRefs(
+          'fatal: unable to access remote: 403'
+        )
+      ).toEqual([])
+      expect(blacksmithCache.parseMissingRemoteRefs('')).toEqual([])
+    })
+  })
+
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:
