@@ -48,10 +48,7 @@ describe('blacksmith-cache tests', () => {
     })
 
     it('includes owner and repo in mount point path', () => {
-      const mountPoint = blacksmithCache.getMountPoint(
-        'testorg',
-        'bigrepo'
-      )
+      const mountPoint = blacksmithCache.getMountPoint('testorg', 'bigrepo')
 
       expect(mountPoint).toContain('testorg')
       expect(mountPoint).toContain('bigrepo')
@@ -102,10 +99,7 @@ describe('blacksmith-cache tests', () => {
     })
 
     it('returns expected full path format', () => {
-      const mirrorPath = blacksmithCache.getMirrorPath(
-        'testorg',
-        'bigrepo'
-      )
+      const mirrorPath = blacksmithCache.getMirrorPath('testorg', 'bigrepo')
 
       expect(mirrorPath).toBe(
         '/blacksmith-git-mirror/testorg/bigrepo/v1/testorg-bigrepo.git'
@@ -482,9 +476,7 @@ describe('blacksmith-cache tests', () => {
 
       // Mount points should be different
       expect(mountPoint1).toBe('/blacksmith-git-mirror/testorg/bigrepo')
-      expect(mountPoint2).toBe(
-        '/blacksmith-git-mirror/testorg/shared-actions'
-      )
+      expect(mountPoint2).toBe('/blacksmith-git-mirror/testorg/shared-actions')
       expect(mountPoint1).not.toBe(mountPoint2)
 
       // Mirror paths should be under their respective mount points
