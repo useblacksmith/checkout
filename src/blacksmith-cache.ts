@@ -20,8 +20,9 @@ const MIRROR_VERSION = 'v1'
 // from the mirror's last good state plus a targeted fetch of the job's own
 // ref - and the next job on the mirror picks the refs up. Healthy syncs
 // finish in seconds even on large repositories, so waiting longer mostly
-// burns checkout time on a mirror disk that is having a bad day.
-const REFRESH_TIMEOUT_SECS = 60 // 1 minute, single attempt
+// burns checkout time on a mirror disk that is having a bad day. The
+// window is kept generous so slow-but-healthy syncs still complete.
+const REFRESH_TIMEOUT_SECS = 120 // 2 minutes, single attempt
 const GC_TIMEOUT_SECS = 120 // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
