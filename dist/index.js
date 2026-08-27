@@ -52,6 +52,7 @@ exports.diffMirrorRefs = diffMirrorRefs;
 exports.syncMirrorFromRemote = syncMirrorFromRemote;
 exports.mapMirrorRefToWorkspace = mapMirrorRefToWorkspace;
 exports.buildRefCopyInstructions = buildRefCopyInstructions;
+exports.buildPackedRefsContent = buildPackedRefsContent;
 exports.copyRefsFromMirror = copyRefsFromMirror;
 exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
@@ -724,8 +725,11 @@ function mapMirrorRefToWorkspace(ref) {
  * refs/remotes/origin/* and refs/tags/* exactly mirror the mirror's
  * refs/heads/* and refs/tags/*. Both inputs are `for-each-ref` output in
  * '<objectname> <refname>' format. Workspace refs not present in the mirror
- * are deleted (the equivalent of `fetch --prune`); everything else is set
- * unconditionally (the equivalent of a `+` force refspec).
+ * are deleted (the equivalent of `fetch --prune`); refs whose value differs
+ * are set unconditionally (the equivalent of a `+` force refspec); refs
+ * already at the right value are skipped, because update-ref verifies the
+ * object of every ref it writes and those reads are expensive on a cold
+ * mirror.
  */
 function buildRefCopyInstructions(mirrorRefs, workspaceRefs) {
     const desired = new Map();
@@ -745,10 +749,16 @@ function buildRefCopyInstructions(mirrorRefs, workspaceRefs) {
         if (!sha || !ref) {
             continue;
         }
-        if ((ref.startsWith('refs/remotes/origin/') ||
-            ref.startsWith('refs/tags/')) &&
-            !desired.has(ref)) {
+        if (!ref.startsWith('refs/remotes/origin/') &&
+            !ref.startsWith('refs/tags/')) {
+            continue;
+        }
+        const desiredSha = desired.get(ref);
+        if (desiredSha === undefined) {
             instructions.push(`delete ${ref}`);
+        }
+        else if (desiredSha === sha) {
+            desired.delete(ref);
         }
     }
     for (const [ref, sha] of desired) {
@@ -757,15 +767,50 @@ function buildRefCopyInstructions(mirrorRefs, workspaceRefs) {
     return instructions;
 }
 /**
- * Copy branch and tag refs from the local mirror into the workspace by
- * writing them directly with `git update-ref --stdin`, then packing them.
- * Because the workspace shares the mirror's object store via alternates, no
- * object data needs to move - and unlike `git fetch <mirrorPath>`, this
- * skips the fetch machinery entirely (ref advertisement of the full mirror
- * ref set, the mark_complete walk that parses every local tip out of the
- * cold pack, and the connectivity check), which is minutes of serialized
- * reads on a large cold mirror. update-ref still verifies each object
- * exists (a pack-index lookup, no inflation).
+ * Build the contents of a packed-refs file holding the mirror's branch and
+ * tag refs mapped into the workspace's namespaces (refs/remotes/origin/*
+ * and refs/tags/*). The input is `for-each-ref` output in
+ * '<objectname> <refname>' format.
+ *
+ * The header intentionally omits the peeled traits: emitting peel lines
+ * would require dereferencing every annotated tag (one cold object read
+ * per tag); without the traits git peels lazily on use instead. Entries
+ * are byte-sorted by refname as the 'sorted' trait requires.
+ */
+function buildPackedRefsContent(mirrorRefs) {
+    const entries = [];
+    for (const line of mirrorRefs.split('\n')) {
+        const [sha, ref] = line.trim().split(' ');
+        if (!sha || !ref) {
+            continue;
+        }
+        const target = mapMirrorRefToWorkspace(ref);
+        if (target) {
+            entries.push([target, sha]);
+        }
+    }
+    entries.sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    const lines = entries.map(([ref, sha]) => `${sha} ${ref}`);
+    return `${['# pack-refs with: sorted', ...lines].join('\n')}\n`;
+}
+/**
+ * Copy branch and tag refs from the local mirror into the workspace without
+ * running the fetch machinery. Because the workspace shares the mirror's
+ * object store via alternates, no object data needs to move - only ref
+ * name -> sha pairs. Unlike `git fetch <mirrorPath>`, this skips the ref
+ * advertisement of the full mirror ref set, the mark_complete walk that
+ * parses every local tip out of the cold pack, and the connectivity check -
+ * which is minutes of serialized reads on a large cold mirror.
+ *
+ * Fresh workspace (no packed-refs file and nothing in the target
+ * namespaces - the normal checkout path): the refs are written as the
+ * workspace's packed-refs file directly. This touches no objects at all;
+ * the only mirror reads are its own ref listing.
+ *
+ * Reused workspace: the refs are reconciled with `git update-ref --stdin`,
+ * updating only refs that changed and pruning ones that disappeared.
+ * update-ref verifies the object of each ref it writes, so this costs one
+ * pack-index lookup per *changed* ref rather than per ref.
  *
  * @returns true on success, false if the caller should fall back
  */
@@ -789,6 +834,15 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
                 'refs/remotes/origin',
                 'refs/tags'
             ], { silent: true });
+            const packedRefsPath = path.join(workspacePath, '.git', 'packed-refs');
+            const freshWorkspace = workspaceRefs.stdout.trim() === '' && !fs.existsSync(packedRefsPath);
+            if (freshWorkspace) {
+                const content = buildPackedRefsContent(mirrorRefs.stdout);
+                yield fs.promises.writeFile(packedRefsPath, content);
+                const refCount = content.trimEnd().split('\n').length - 1;
+                core.info(`[git-mirror] Wrote ${refCount} refs from mirror as packed-refs in ${Date.now() - start}ms`);
+                return true;
+            }
             const instructions = buildRefCopyInstructions(mirrorRefs.stdout, workspaceRefs.stdout);
             if (instructions.length > 0) {
                 yield exec.exec('git', ['-C', workspacePath, 'update-ref', '--stdin'], {
@@ -799,7 +853,7 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
                     silent: true
                 });
             }
-            core.info(`[git-mirror] Copied ${instructions.length} refs from mirror in ${Date.now() - start}ms`);
+            core.info(`[git-mirror] Reconciled ${instructions.length} refs from mirror in ${Date.now() - start}ms`);
             return true;
         }
         catch (error) {

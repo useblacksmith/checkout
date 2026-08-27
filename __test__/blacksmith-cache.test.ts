@@ -381,11 +381,15 @@ describe('blacksmith-cache tests', () => {
       const workspace = `${shaA} refs/remotes/origin/main\n${shaB} refs/remotes/origin/gone\n${shaC} refs/tags/v0\n`
       expect(
         blacksmithCache.buildRefCopyInstructions(mirror, workspace)
-      ).toEqual([
-        'delete refs/remotes/origin/gone',
-        'delete refs/tags/v0',
-        `update refs/remotes/origin/main ${shaA}`
-      ])
+      ).toEqual(['delete refs/remotes/origin/gone', 'delete refs/tags/v0'])
+    })
+
+    it('skips refs already at the desired value and updates changed ones', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/heads/dev\n`
+      const workspace = `${shaA} refs/remotes/origin/main\n${shaC} refs/remotes/origin/dev\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/dev ${shaB}`])
     })
 
     it('does not copy or delete non-branch non-tag refs', () => {
@@ -398,6 +402,35 @@ describe('blacksmith-cache tests', () => {
 
     it('handles empty inputs', () => {
       expect(blacksmithCache.buildRefCopyInstructions('', '')).toEqual([])
+    })
+  })
+
+  describe('buildPackedRefsContent', () => {
+    const shaA = 'a'.repeat(40)
+    const shaB = 'b'.repeat(40)
+    const shaC = 'c'.repeat(40)
+
+    it('maps heads and tags and byte-sorts by refname', () => {
+      const mirror = `${shaB} refs/tags/v1\n${shaA} refs/heads/main\n${shaC} refs/heads/dev\n`
+      expect(blacksmithCache.buildPackedRefsContent(mirror)).toBe(
+        '# pack-refs with: sorted\n' +
+          `${shaC} refs/remotes/origin/dev\n` +
+          `${shaA} refs/remotes/origin/main\n` +
+          `${shaB} refs/tags/v1\n`
+      )
+    })
+
+    it('skips refs outside heads and tags', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/pull/1/merge\n`
+      expect(blacksmithCache.buildPackedRefsContent(mirror)).toBe(
+        `# pack-refs with: sorted\n${shaA} refs/remotes/origin/main\n`
+      )
+    })
+
+    it('handles empty input', () => {
+      expect(blacksmithCache.buildPackedRefsContent('')).toBe(
+        '# pack-refs with: sorted\n'
+      )
     })
   })
 
