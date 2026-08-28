@@ -48,14 +48,11 @@ describe('blacksmith-cache tests', () => {
     })
 
     it('includes owner and repo in mount point path', () => {
-      const mountPoint = blacksmithCache.getMountPoint(
-        'descriptinc',
-        'descript'
-      )
+      const mountPoint = blacksmithCache.getMountPoint('testorg', 'bigrepo')
 
-      expect(mountPoint).toContain('descriptinc')
-      expect(mountPoint).toContain('descript')
-      expect(mountPoint).toBe('/blacksmith-git-mirror/descriptinc/descript')
+      expect(mountPoint).toContain('testorg')
+      expect(mountPoint).toContain('bigrepo')
+      expect(mountPoint).toBe('/blacksmith-git-mirror/testorg/bigrepo')
     })
 
     it('avoids collisions from hyphenated names', () => {
@@ -102,13 +99,10 @@ describe('blacksmith-cache tests', () => {
     })
 
     it('returns expected full path format', () => {
-      const mirrorPath = blacksmithCache.getMirrorPath(
-        'descriptinc',
-        'descript'
-      )
+      const mirrorPath = blacksmithCache.getMirrorPath('testorg', 'bigrepo')
 
       expect(mirrorPath).toBe(
-        '/blacksmith-git-mirror/descriptinc/descript/v1/descriptinc-descript.git'
+        '/blacksmith-git-mirror/testorg/bigrepo/v1/testorg-bigrepo.git'
       )
     })
   })
@@ -343,14 +337,156 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('mapMirrorRefToWorkspace', () => {
+    it('maps branches to remote-tracking refs', () => {
+      expect(
+        blacksmithCache.mapMirrorRefToWorkspace('refs/heads/feature/x')
+      ).toBe('refs/remotes/origin/feature/x')
+    })
+
+    it('keeps tags as tags', () => {
+      expect(blacksmithCache.mapMirrorRefToWorkspace('refs/tags/v1.2')).toBe(
+        'refs/tags/v1.2'
+      )
+    })
+
+    it('skips other refs', () => {
+      expect(
+        blacksmithCache.mapMirrorRefToWorkspace('refs/pull/12/merge')
+      ).toBeNull()
+    })
+  })
+
+  describe('buildRefCopyInstructions', () => {
+    const shaA = 'a'.repeat(40)
+    const shaB = 'b'.repeat(40)
+    const shaC = 'c'.repeat(40)
+
+    it('updates all mirror heads and tags into an empty workspace', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/tags/v1\n`
+      expect(blacksmithCache.buildRefCopyInstructions(mirror, '')).toEqual([
+        `update refs/remotes/origin/main ${shaA}`,
+        `update refs/tags/v1 ${shaB}`
+      ])
+    })
+
+    it('deletes workspace refs no longer in the mirror (prune)', () => {
+      const mirror = `${shaA} refs/heads/main\n`
+      const workspace = `${shaA} refs/remotes/origin/main\n${shaB} refs/remotes/origin/gone\n${shaC} refs/tags/v0\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual(['delete refs/remotes/origin/gone', 'delete refs/tags/v0'])
+    })
+
+    it('skips refs already at the desired value and updates changed ones', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/heads/dev\n`
+      const workspace = `${shaA} refs/remotes/origin/main\n${shaC} refs/remotes/origin/dev\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/dev ${shaB}`])
+    })
+
+    it('does not copy or delete non-branch non-tag refs', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/pull/1/merge\n`
+      const workspace = `${shaC} refs/heads/local-branch\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/main ${shaA}`])
+    })
+
+    it('handles empty inputs', () => {
+      expect(blacksmithCache.buildRefCopyInstructions('', '')).toEqual([])
+    })
+
+    it('never deletes or rewrites symbolic refs like origin/HEAD', () => {
+      const mirror = `${shaA} refs/heads/main\n`
+      const workspace =
+        `${shaA} refs/remotes/origin/HEAD refs/remotes/origin/main\n` +
+        `${shaA} refs/remotes/origin/main\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([])
+    })
+
+    it('still updates the branch behind a symbolic ref', () => {
+      const mirror = `${shaB} refs/heads/main\n`
+      const workspace =
+        `${shaA} refs/remotes/origin/HEAD refs/remotes/origin/main\n` +
+        `${shaA} refs/remotes/origin/main\n`
+      expect(
+        blacksmithCache.buildRefCopyInstructions(mirror, workspace)
+      ).toEqual([`update refs/remotes/origin/main ${shaB}`])
+    })
+  })
+
+  describe('buildPackedRefsContent', () => {
+    const shaA = 'a'.repeat(40)
+    const shaB = 'b'.repeat(40)
+    const shaC = 'c'.repeat(40)
+
+    it('maps heads and tags and byte-sorts by refname', () => {
+      const mirror = `${shaB} refs/tags/v1\n${shaA} refs/heads/main\n${shaC} refs/heads/dev\n`
+      expect(blacksmithCache.buildPackedRefsContent(mirror)).toBe(
+        '# pack-refs with: sorted\n' +
+          `${shaC} refs/remotes/origin/dev\n` +
+          `${shaA} refs/remotes/origin/main\n` +
+          `${shaB} refs/tags/v1\n`
+      )
+    })
+
+    it('skips refs outside heads and tags', () => {
+      const mirror = `${shaA} refs/heads/main\n${shaB} refs/pull/1/merge\n`
+      expect(blacksmithCache.buildPackedRefsContent(mirror)).toBe(
+        `# pack-refs with: sorted\n${shaA} refs/remotes/origin/main\n`
+      )
+    })
+
+    it('handles empty input', () => {
+      expect(blacksmithCache.buildPackedRefsContent('')).toBe(
+        '# pack-refs with: sorted\n'
+      )
+    })
+  })
+
+  describe('parseMissingRemoteRefs', () => {
+    it('extracts a single missing ref', () => {
+      const stderr =
+        "fatal: couldn't find remote ref refs/heads/trunk-temp/pr-41568/f00ba4"
+      expect(blacksmithCache.parseMissingRemoteRefs(stderr)).toEqual([
+        'refs/heads/trunk-temp/pr-41568/f00ba4'
+      ])
+    })
+
+    it('extracts multiple missing refs across lines', () => {
+      const stderr = [
+        "fatal: couldn't find remote ref refs/heads/a",
+        'error: some other line',
+        "fatal: couldn't find remote ref refs/tags/b"
+      ].join('\n')
+      expect(blacksmithCache.parseMissingRemoteRefs(stderr)).toEqual([
+        'refs/heads/a',
+        'refs/tags/b'
+      ])
+    })
+
+    it('returns empty for unrelated errors', () => {
+      expect(
+        blacksmithCache.parseMissingRemoteRefs(
+          'fatal: unable to access remote: 403'
+        )
+      ).toEqual([])
+      expect(blacksmithCache.parseMissingRemoteRefs('')).toEqual([])
+    })
+  })
+
   describe('multiple checkout scenario', () => {
     it('each repo gets isolated paths that do not conflict', () => {
       // Simulate the multiple checkout scenario from the customer issue:
-      // 1. First checkout: descriptinc/descript (workflow repo)
-      // 2. Second checkout: descriptinc/shared-actions
+      // 1. First checkout: testorg/bigrepo (workflow repo)
+      // 2. Second checkout: testorg/shared-actions
 
-      const repo1 = {owner: 'descriptinc', repo: 'descript'}
-      const repo2 = {owner: 'descriptinc', repo: 'shared-actions'}
+      const repo1 = {owner: 'testorg', repo: 'bigrepo'}
+      const repo2 = {owner: 'testorg', repo: 'shared-actions'}
 
       const mountPoint1 = blacksmithCache.getMountPoint(repo1.owner, repo1.repo)
       const mountPoint2 = blacksmithCache.getMountPoint(repo2.owner, repo2.repo)
@@ -359,10 +495,8 @@ describe('blacksmith-cache tests', () => {
       const mirrorPath2 = blacksmithCache.getMirrorPath(repo2.owner, repo2.repo)
 
       // Mount points should be different
-      expect(mountPoint1).toBe('/blacksmith-git-mirror/descriptinc/descript')
-      expect(mountPoint2).toBe(
-        '/blacksmith-git-mirror/descriptinc/shared-actions'
-      )
+      expect(mountPoint1).toBe('/blacksmith-git-mirror/testorg/bigrepo')
+      expect(mountPoint2).toBe('/blacksmith-git-mirror/testorg/shared-actions')
       expect(mountPoint1).not.toBe(mountPoint2)
 
       // Mirror paths should be under their respective mount points

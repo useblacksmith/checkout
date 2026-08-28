@@ -15,7 +15,14 @@ const AGENT_RPC_TIMEOUT_MS = 45000
 const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
-const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
+// A sync that doesn't finish within this window is abandoned (single
+// attempt, no retries): sync failure is soft - the workspace is populated
+// from the mirror's last good state plus a targeted fetch of the job's own
+// ref - and the next job on the mirror picks the refs up. Healthy syncs
+// finish in seconds even on large repositories, so waiting longer mostly
+// burns checkout time on a mirror disk that is having a bad day. The
+// window is kept generous so slow-but-healthy syncs still complete.
+const REFRESH_TIMEOUT_SECS = 120 // 2 minutes, single attempt
 const GC_TIMEOUT_SECS = 120 // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
@@ -29,6 +36,10 @@ const TIMEOUT_EXIT_CODE = 124
 // Cap on --negotiation-tip arguments passed to the mirror sync fetch, to
 // bound the command line length when many refs changed at once.
 const MAX_NEGOTIATION_TIPS = 1000
+
+// Maximum number of times a mirror sync fetch is re-run after pruning refs
+// that were deleted on the remote between ls-remote and fetch.
+const MAX_VANISHED_REF_RETRIES = 5
 
 /**
  * Result of a git mirror operation that may fail or time out.
@@ -525,6 +536,11 @@ export async function ensureMirror(
     await exec.exec('git', cloneArgs, {env: gitEnv})
   })
   core.info('[git-mirror] Initial mirror clone complete')
+  // `clone --mirror` brings in every advertised ref, including refs/pull/*,
+  // which are never synchronized afterwards. Drop them so the mirror starts
+  // with only the refs it maintains.
+  await purgePullRefs(mirrorPath)
+  await writeCommitGraph(mirrorPath)
   if (trace2PerfPath) {
     summarizeTrace2Perf(trace2PerfPath, 'initial mirror clone')
   }
@@ -633,6 +649,52 @@ export function diffMirrorRefs(
 }
 
 /**
+ * Delete all refs/pull/* from the mirror. Pull refs are no longer
+ * synchronized (a job that needs one fetches it directly into its
+ * workspace), but mirrors created before that change still carry a ref for
+ * every pull request ever opened - often several times more refs than live
+ * branches and tags. Every ref in the mirror has a cost: git's fetch
+ * machinery walks all local refs (mark_complete_local_refs), and the ref
+ * advertisement and packed-refs scans grow with the total count.
+ *
+ * Deleting only touches the ref database (one packed-refs rewrite plus
+ * loose ref unlinks) - no object access - and is a no-op on mirrors that
+ * have no pull refs left.
+ *
+ * @returns the number of refs deleted
+ */
+export async function purgePullRefs(mirrorPath: string): Promise<number> {
+  try {
+    const pullRefs = await exec.getExecOutput(
+      'git',
+      ['-C', mirrorPath, 'for-each-ref', '--format=%(refname)', 'refs/pull'],
+      {silent: true}
+    )
+    const refs = pullRefs.stdout
+      .split('\n')
+      .map(line => line.trim())
+      .filter(ref => ref.length > 0)
+    if (refs.length === 0) {
+      return 0
+    }
+    const start = Date.now()
+    await exec.exec('git', ['-C', mirrorPath, 'update-ref', '--stdin'], {
+      silent: true,
+      input: Buffer.from(refs.map(ref => `delete ${ref}\n`).join(''))
+    })
+    core.info(
+      `[git-mirror] Purged ${refs.length} refs/pull/* refs from the mirror in ${Date.now() - start}ms`
+    )
+    return refs.length
+  } catch (error) {
+    // The purge is an optimization on an already-valid mirror; never let it
+    // fail the operation that invoked it (e.g. discard a completed clone).
+    core.warning(`[git-mirror] refs/pull/* purge failed: ${error}`)
+    return 0
+  }
+}
+
+/**
  * Synchronize the mirror with the remote before the workspace is populated
  * from it. Instead of a full `git fetch --prune origin` (whose cost is
  * proportional to the total ref count even when nothing changed), this:
@@ -650,14 +712,29 @@ export function diffMirrorRefs(
  *
  * refs/pull/* are not synchronized: a job that needs a pull ref fetches it
  * directly into its workspace, and pull refs would otherwise dominate the
- * advertisement size on busy repositories. Any refs/pull/* already present
- * in the mirror are left untouched.
+ * advertisement size on busy repositories. Any refs/pull/* still present in
+ * the mirror from before this change are purged (see purgePullRefs).
  *
  * @param mirrorPath - Path to the bare git mirror
  * @param repoUrl - URL of the repository to mirror
  * @param authToken - Authentication token for the repository
  * @param verbose - Enable verbose output with GIT_TRACE and GIT_CURL_VERBOSE
  */
+/**
+ * Parse the refs git reports as missing from a fetch's stderr. When a ref is
+ * deleted on the remote between our ls-remote and the fetch, git fails with
+ * `fatal: couldn't find remote ref <ref>`.
+ */
+export function parseMissingRemoteRefs(stderr: string): string[] {
+  const refs: string[] = []
+  const re = /couldn't find remote ref (\S+)/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(stderr)) !== null) {
+    refs.push(match[1])
+  }
+  return refs
+}
+
 export async function syncMirrorFromRemote(
   mirrorPath: string,
   repoUrl: string,
@@ -673,8 +750,21 @@ export async function syncMirrorFromRemote(
   }
 
   core.info(
-    `[git-mirror] Syncing mirror at ${mirrorPath} with remote (timeout: ${timeoutSecs}s per attempt)`
+    `[git-mirror] Syncing mirror at ${mirrorPath} with remote (budget: ${timeoutSecs}s)`
   )
+
+  // One deadline bounds the whole sync: ls-remote and every fetch
+  // invocation (including vanished-ref reruns) draw from the same budget,
+  // so the sync's worst case is timeoutSecs regardless of how many
+  // subprocesses run.
+  const deadline = Date.now() + timeoutSecs * 1000
+  const remainingSecs = (): number => {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000)
+    if (remaining <= 0) {
+      throw new Error(`mirror sync timed out after ${timeoutSecs}s`)
+    }
+    return remaining
+  }
 
   try {
     const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
@@ -682,36 +772,33 @@ export async function syncMirrorFromRemote(
     const gitEnv = buildGitEnv(verbose, trace2PerfPath)
 
     const lsRemoteStart = Date.now()
-    let lsRemoteOutput = ''
-    await retryHelper.execute(async () => {
-      const result = await exec.getExecOutput(
-        'timeout',
-        [
-          String(timeoutSecs),
-          'git',
-          '-c',
-          `${configKey}=${configValue}`,
-          '-C',
-          mirrorPath,
-          'ls-remote',
-          '--heads',
-          '--tags',
-          'origin'
-        ],
-        {env: gitEnv, ignoreReturnCode: true, silent: true}
+    const lsRemoteResult = await exec.getExecOutput(
+      'timeout',
+      [
+        String(remainingSecs()),
+        'git',
+        '-c',
+        `${configKey}=${configValue}`,
+        '-C',
+        mirrorPath,
+        'ls-remote',
+        '--heads',
+        '--tags',
+        'origin'
+      ],
+      {env: gitEnv, ignoreReturnCode: true, silent: true}
+    )
+    if (lsRemoteResult.exitCode === TIMEOUT_EXIT_CODE) {
+      throw new Error(`git ls-remote timed out (budget ${timeoutSecs}s)`)
+    }
+    if (lsRemoteResult.exitCode !== 0) {
+      const stderr = lsRemoteResult.stderr.trim()
+      const details = stderr ? `: ${stderr}` : ''
+      throw new Error(
+        `git ls-remote failed with exit code ${lsRemoteResult.exitCode}${details}`
       )
-      if (result.exitCode === TIMEOUT_EXIT_CODE) {
-        throw new Error(`git ls-remote timed out after ${timeoutSecs}s`)
-      }
-      if (result.exitCode !== 0) {
-        const stderr = result.stderr.trim()
-        const details = stderr ? `: ${stderr}` : ''
-        throw new Error(
-          `git ls-remote failed with exit code ${result.exitCode}${details}`
-        )
-      }
-      lsRemoteOutput = result.stdout
-    })
+    }
+    const lsRemoteOutput = lsRemoteResult.stdout
 
     const localRefsResult = await exec.getExecOutput(
       'git',
@@ -731,14 +818,25 @@ export async function syncMirrorFromRemote(
       `[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`
     )
 
+    // Purge legacy refs/pull/* before fetching so the fetch's local ref
+    // walk no longer covers them. A purge is a real mirror change that
+    // must be committed even when the branch/tag refs are already current.
+    const purgedRefs = await purgePullRefs(mirrorPath)
+
     if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
       core.info('[git-mirror] Mirror is already up to date with the remote')
-      return {success: true, timedOut: false, changed: false}
+      return {success: true, timedOut: false, changed: purgedRefs > 0}
     }
 
-    if (diff.updatedRefSpecs.length > 0) {
+    // Refs deleted on the remote between ls-remote and the fetch make git
+    // fail with "couldn't find remote ref". Prune those refs and re-run the
+    // fetch so one vanished ref doesn't abort the whole sync.
+    let refSpecs = diff.updatedRefSpecs
+    const vanishedRefs: string[] = []
+
+    if (refSpecs.length > 0) {
       const fetchStart = Date.now()
-      await retryHelper.execute(async () => {
+      {
         // gc.auto=0: disable git's internal auto-gc that porcelain commands
         // like fetch run after completing. Without this, fetch can spawn a
         // background gc daemon (gc.autoDetach defaults to true) that holds
@@ -754,6 +852,18 @@ export async function syncMirrorFromRemote(
           'gc.auto=0',
           '-c',
           'fetch.negotiationAlgorithm=skipping',
+          // Keep the commit-graph current so ref-tip commit parsing
+          // (mark_complete_local_refs and negotiation walks) reads one
+          // compact mmap'd file instead of scattered pack entries. Only
+          // enabled when a graph already exists: then the write is
+          // incremental (split chains), proportional to the commits just
+          // fetched. When no graph exists yet the write would be a full
+          // reachable walk that could blow the fetch timeout, so the
+          // initial graph is written outside the fetch instead (after the
+          // clone, or by the post-step catch-up for pre-existing mirrors).
+          ...(hasCommitGraph(mirrorPath)
+            ? ['-c', 'fetch.writeCommitGraph=true']
+            : []),
           '-C',
           mirrorPath,
           'fetch',
@@ -777,49 +887,87 @@ export async function syncMirrorFromRemote(
             '--verbose'
           )
         }
-        const result = await exec.getExecOutput(
-          'timeout',
-          [String(timeoutSecs), 'git', ...fetchArgs],
-          {
-            env: gitEnv,
-            ignoreReturnCode: true,
-            silent: !verbose,
-            input: Buffer.from(`${diff.updatedRefSpecs.join('\n')}\n`)
+        for (
+          let vanishedRetry = 0;
+          vanishedRetry <= MAX_VANISHED_REF_RETRIES;
+          vanishedRetry++
+        ) {
+          if (refSpecs.length === 0) {
+            break
           }
-        )
-        if (result.exitCode === TIMEOUT_EXIT_CODE) {
-          throw new Error(`git fetch timed out after ${timeoutSecs}s`)
-        }
-        if (result.exitCode !== 0) {
+          const result = await exec.getExecOutput(
+            'timeout',
+            [String(remainingSecs()), 'git', ...fetchArgs],
+            {
+              env: gitEnv,
+              ignoreReturnCode: true,
+              silent: !verbose,
+              input: Buffer.from(`${refSpecs.join('\n')}\n`)
+            }
+          )
+          if (result.exitCode === TIMEOUT_EXIT_CODE) {
+            throw new Error(`git fetch timed out (budget ${timeoutSecs}s)`)
+          }
+          if (result.exitCode === 0) {
+            break
+          }
           // Include stderr in error message so failure details are visible even when silent
           const stderr = result.stderr.trim()
+          const missingRefs = parseMissingRemoteRefs(stderr)
+          if (
+            missingRefs.length > 0 &&
+            vanishedRetry < MAX_VANISHED_REF_RETRIES
+          ) {
+            const missingSet = new Set(missingRefs)
+            refSpecs = refSpecs.filter(
+              spec => !missingSet.has(spec.slice(1).split(':')[0])
+            )
+            vanishedRefs.push(...missingRefs)
+            core.info(
+              `[git-mirror] ${missingRefs.length} ref(s) deleted on the remote mid-sync (${missingRefs.join(', ')}), retrying fetch without them`
+            )
+            continue
+          }
           const details = stderr ? `: ${stderr}` : ''
           throw new Error(
             `git fetch failed with exit code ${result.exitCode}${details}`
           )
         }
-      })
+      }
       core.info(
-        `[git-mirror] Fetched ${diff.updatedRefSpecs.length} changed refs in ${Date.now() - fetchStart}ms`
+        `[git-mirror] Fetched ${refSpecs.length} changed refs in ${Date.now() - fetchStart}ms`
       )
       if (trace2PerfPath) {
         summarizeTrace2Perf(trace2PerfPath, 'mirror sync')
       }
     }
 
-    if (diff.deletedRefs.length > 0) {
+    // Refs that vanished mid-sync are deleted locally like any other
+    // remotely-deleted ref, but only if they exist in the mirror (a vanished
+    // ref may have been brand new and never fetched).
+    const localRefNames = new Set(
+      localRefsResult.stdout
+        .split('\n')
+        .map(line => line.trim().split(' ')[1])
+        .filter(Boolean)
+    )
+    const refsToDelete = [
+      ...diff.deletedRefs,
+      ...vanishedRefs.filter(ref => localRefNames.has(ref))
+    ]
+    if (refsToDelete.length > 0) {
       await exec.getExecOutput(
         'git',
         ['-C', mirrorPath, 'update-ref', '--stdin'],
         {
           silent: true,
           input: Buffer.from(
-            diff.deletedRefs.map(ref => `delete ${ref}\n`).join('')
+            refsToDelete.map(ref => `delete ${ref}\n`).join('')
           )
         }
       )
       core.info(
-        `[git-mirror] Deleted ${diff.deletedRefs.length} refs removed on the remote`
+        `[git-mirror] Deleted ${refsToDelete.length} refs removed on the remote`
       )
     }
 
@@ -838,6 +986,279 @@ export async function syncMirrorFromRemote(
 }
 
 /**
+ * Map a mirror ref name to the workspace ref it should be copied to:
+ * branches become remote-tracking refs, tags stay tags. Returns null for
+ * refs that are not copied into the workspace (e.g. refs/pull).
+ */
+export function mapMirrorRefToWorkspace(ref: string): string | null {
+  if (ref.startsWith('refs/heads/')) {
+    return `refs/remotes/origin/${ref.slice('refs/heads/'.length)}`
+  }
+  if (ref.startsWith('refs/tags/')) {
+    return ref
+  }
+  return null
+}
+
+/**
+ * Build the `git update-ref --stdin` instructions that make the workspace's
+ * refs/remotes/origin/* and refs/tags/* exactly mirror the mirror's
+ * refs/heads/* and refs/tags/*. The mirror input is `for-each-ref` output in
+ * '<objectname> <refname>' format; the workspace input additionally carries
+ * a third '%(symref)' column. Workspace refs not present in the mirror
+ * are deleted (the equivalent of `fetch --prune`); refs whose value differs
+ * are set unconditionally (the equivalent of a `+` force refspec); refs
+ * already at the right value are skipped, because update-ref verifies the
+ * object of every ref it writes and those reads are expensive on a cold
+ * mirror.
+ *
+ * Symbolic refs (notably refs/remotes/origin/HEAD) are left untouched:
+ * update-ref would dereference a `delete` through the symref and delete the
+ * branch it points at instead. `git fetch --prune` also preserves
+ * origin/HEAD.
+ */
+export function buildRefCopyInstructions(
+  mirrorRefs: string,
+  workspaceRefs: string
+): string[] {
+  const desired = new Map<string, string>()
+  for (const line of mirrorRefs.split('\n')) {
+    const [sha, ref] = line.trim().split(' ')
+    if (!sha || !ref) {
+      continue
+    }
+    const target = mapMirrorRefToWorkspace(ref)
+    if (target) {
+      desired.set(target, sha)
+    }
+  }
+
+  const instructions: string[] = []
+  for (const line of workspaceRefs.split('\n')) {
+    const [sha, ref, symrefTarget] = line.trim().split(' ')
+    if (!sha || !ref) {
+      continue
+    }
+    if (
+      !ref.startsWith('refs/remotes/origin/') &&
+      !ref.startsWith('refs/tags/')
+    ) {
+      continue
+    }
+    if (symrefTarget) {
+      // Symbolic ref (e.g. origin/HEAD): never delete or rewrite it, and
+      // don't let it consume the desired entry for its target branch.
+      continue
+    }
+    const desiredSha = desired.get(ref)
+    if (desiredSha === undefined) {
+      instructions.push(`delete ${ref}`)
+    } else if (desiredSha === sha) {
+      desired.delete(ref)
+    }
+  }
+  for (const [ref, sha] of desired) {
+    instructions.push(`update ${ref} ${sha}`)
+  }
+  return instructions
+}
+
+/**
+ * Build the contents of a packed-refs file holding the mirror's branch and
+ * tag refs mapped into the workspace's namespaces (refs/remotes/origin/*
+ * and refs/tags/*). The input is `for-each-ref` output in
+ * '<objectname> <refname>' format.
+ *
+ * The header intentionally omits the peeled traits: emitting peel lines
+ * would require dereferencing every annotated tag (one cold object read
+ * per tag); without the traits git peels lazily on use instead. Entries
+ * are byte-sorted by refname as the 'sorted' trait requires.
+ */
+export function buildPackedRefsContent(mirrorRefs: string): string {
+  const entries: [string, string][] = []
+  for (const line of mirrorRefs.split('\n')) {
+    const [sha, ref] = line.trim().split(' ')
+    if (!sha || !ref) {
+      continue
+    }
+    const target = mapMirrorRefToWorkspace(ref)
+    if (target) {
+      entries.push([target, sha])
+    }
+  }
+  entries.sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+  const lines = entries.map(([ref, sha]) => `${sha} ${ref}`)
+  return `${['# pack-refs with: sorted', ...lines].join('\n')}\n`
+}
+
+/**
+ * Copy branch and tag refs from the local mirror into the workspace without
+ * running the fetch machinery. Because the workspace shares the mirror's
+ * object store via alternates, no object data needs to move - only ref
+ * name -> sha pairs. Unlike `git fetch <mirrorPath>`, this skips the ref
+ * advertisement of the full mirror ref set, the mark_complete walk that
+ * parses every local tip out of the cold pack, and the connectivity check -
+ * which is minutes of serialized reads on a large cold mirror.
+ *
+ * The copy is only valid when the workspace actually shares the mirror's
+ * object store: the copied refs are bare name -> sha pairs, so without the
+ * alternate every one of them would dangle. Eligibility is therefore
+ * verified explicitly (the alternates file must reference this mirror's
+ * objects directory) rather than inferred, and anything unexpected -
+ * missing/foreign alternates, a non-files ref backend, a gitfile worktree -
+ * falls back to the local fetch, which moves objects as well as refs.
+ *
+ * Fresh workspace (no packed-refs file and nothing in the target
+ * namespaces - the normal checkout path): the refs are written as the
+ * workspace's packed-refs file directly. This touches no objects at all;
+ * the only mirror reads are its own ref listing.
+ *
+ * Reused workspace: the refs are reconciled with `git update-ref --stdin`,
+ * updating only refs that changed and pruning ones that disappeared
+ * (symbolic refs such as origin/HEAD are preserved). update-ref verifies
+ * the object of each ref it writes, so this costs one pack-index lookup
+ * per *changed* ref rather than per ref.
+ *
+ * A successful copy removes any stale FETCH_HEAD left by an earlier
+ * checkout in a reused workspace, so scripts never read fetch output that
+ * predates this ref state.
+ *
+ * @returns true on success, false if the caller should fall back
+ */
+export async function copyRefsFromMirror(
+  workspacePath: string,
+  mirrorPath: string
+): Promise<boolean> {
+  try {
+    const start = Date.now()
+
+    const gitDir = path.join(workspacePath, '.git')
+    if (!fs.existsSync(gitDir) || !fs.statSync(gitDir).isDirectory()) {
+      core.info(
+        '[git-mirror] Workspace .git is not a directory, using local fetch instead of direct ref copy'
+      )
+      return false
+    }
+
+    const alternatesPath = path.join(gitDir, 'objects', 'info', 'alternates')
+    const expectedAlternate = `${mirrorPath}/objects`
+    let hasMirrorAlternate = false
+    try {
+      const alternates = await fs.promises.readFile(alternatesPath, 'utf8')
+      hasMirrorAlternate = alternates
+        .split('\n')
+        .some(line => line.trim() === expectedAlternate)
+    } catch {
+      hasMirrorAlternate = false
+    }
+    if (!hasMirrorAlternate) {
+      core.info(
+        '[git-mirror] Workspace does not share the mirror object store, using local fetch instead of direct ref copy'
+      )
+      return false
+    }
+
+    // Only the files ref backend stores refs in packed-refs / update-ref's
+    // default loose format the way this path assumes. A reftable
+    // repository ignores a packed-refs file entirely, so writing one would
+    // silently produce a repo with no refs.
+    const refStorage = await exec.getExecOutput(
+      'git',
+      ['-C', workspacePath, 'config', '--get', 'extensions.refstorage'],
+      {silent: true, ignoreReturnCode: true}
+    )
+    const refBackend = refStorage.stdout.trim()
+    if (refBackend !== '' && refBackend !== 'files') {
+      core.info(
+        `[git-mirror] Workspace uses ref backend '${refBackend}', using local fetch instead of direct ref copy`
+      )
+      return false
+    }
+
+    const mirrorRefs = await exec.getExecOutput(
+      'git',
+      [
+        '-C',
+        mirrorPath,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/heads',
+        'refs/tags'
+      ],
+      {silent: true}
+    )
+    const workspaceRefs = await exec.getExecOutput(
+      'git',
+      [
+        '-C',
+        workspacePath,
+        'for-each-ref',
+        '--format=%(objectname) %(refname) %(symref)',
+        'refs/remotes/origin',
+        'refs/tags'
+      ],
+      {silent: true}
+    )
+
+    const packedRefsPath = path.join(gitDir, 'packed-refs')
+    const freshWorkspace =
+      workspaceRefs.stdout.trim() === '' && !fs.existsSync(packedRefsPath)
+
+    if (freshWorkspace) {
+      const content = buildPackedRefsContent(mirrorRefs.stdout)
+      // Write-then-rename so no reader (or fallback path, if the write
+      // fails partway) ever sees a truncated packed-refs file.
+      const tmpPath = `${packedRefsPath}.new`
+      await fs.promises.writeFile(tmpPath, content)
+      await fs.promises.rename(tmpPath, packedRefsPath)
+      const refCount = content.trimEnd().split('\n').length - 1
+      core.info(
+        `[git-mirror] Wrote ${refCount} refs from mirror as packed-refs in ${Date.now() - start}ms`
+      )
+      await removeStaleFetchHead(gitDir)
+      return true
+    }
+
+    const instructions = buildRefCopyInstructions(
+      mirrorRefs.stdout,
+      workspaceRefs.stdout
+    )
+    if (instructions.length > 0) {
+      await exec.exec('git', ['-C', workspacePath, 'update-ref', '--stdin'], {
+        silent: true,
+        input: Buffer.from(`${instructions.join('\n')}\n`)
+      })
+      await exec.exec('git', ['-C', workspacePath, 'pack-refs', '--all'], {
+        silent: true
+      })
+    }
+    core.info(
+      `[git-mirror] Reconciled ${instructions.length} refs from mirror in ${Date.now() - start}ms`
+    )
+    await removeStaleFetchHead(gitDir)
+    return true
+  } catch (error) {
+    core.warning(
+      `[git-mirror] Direct ref copy from mirror failed, falling back to local fetch: ${error}`
+    )
+    return false
+  }
+}
+
+/**
+ * The direct ref copy does not run the fetch machinery, so it never writes
+ * FETCH_HEAD. Remove one left over from an earlier checkout in a reused
+ * workspace rather than letting scripts read stale fetch output.
+ */
+async function removeStaleFetchHead(gitDir: string): Promise<void> {
+  try {
+    await fs.promises.unlink(path.join(gitDir, 'FETCH_HEAD'))
+  } catch {
+    // Usually ENOENT (fresh workspace); FETCH_HEAD removal is best-effort.
+  }
+}
+
+/**
  * Fetch branch and tag refs into the workspace from the local mirror.
  * Because the workspace shares the mirror's object store via alternates,
  * this transfers no object data - it only copies refs. This replaces the
@@ -846,6 +1267,11 @@ export async function syncMirrorFromRemote(
  * syncMirrorFromRemote) and still verifies/fetches the specific ref/commit
  * it needs from the network afterwards as a safety net.
  *
+ * Refs are copied directly with update-ref (see copyRefsFromMirror); if
+ * that fails for any reason, fall back to a local `git fetch` from the
+ * mirror, which produces the same end state through the slower fetch
+ * machinery.
+ *
  * @returns true on success, false if the local fetch failed and the caller
  * should fall back to a network fetch
  */
@@ -853,8 +1279,11 @@ export async function fetchRefsFromMirror(
   workspacePath: string,
   mirrorPath: string
 ): Promise<boolean> {
+  core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`)
+  if (await copyRefsFromMirror(workspacePath, mirrorPath)) {
+    return true
+  }
   try {
-    core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`)
     await exec.exec('git', [
       '-C',
       workspacePath,
@@ -918,6 +1347,70 @@ export async function dissociate(workspacePath: string): Promise<void> {
   } catch {
     // File may not exist, that's fine
   }
+}
+
+/**
+ * Write the mirror's commit-graph so subsequent commit parsing (e.g. the
+ * per-ref walks inside fetch) is a lookup in one compact file instead of
+ * scattered pack reads. Reading commit-graphs is enabled by default in git;
+ * writing only happens during a real gc, so a freshly cloned mirror has
+ * none until the first threshold-tripping `gc --auto`. Failure is
+ * non-fatal - the graph is a pure cache.
+ */
+async function writeCommitGraph(
+  mirrorPath: string,
+  timeoutSecs: number = GC_TIMEOUT_SECS
+): Promise<void> {
+  try {
+    const start = Date.now()
+    const result = await exec.getExecOutput(
+      'timeout',
+      [
+        String(timeoutSecs),
+        'git',
+        '-C',
+        mirrorPath,
+        'commit-graph',
+        'write',
+        '--reachable'
+      ],
+      {silent: true, ignoreReturnCode: true}
+    )
+    if (result.exitCode === TIMEOUT_EXIT_CODE) {
+      core.warning(
+        `[git-mirror] commit-graph write timed out after ${timeoutSecs}s`
+      )
+      return
+    }
+    if (result.exitCode !== 0) {
+      core.warning(
+        `[git-mirror] commit-graph write failed with exit code ${result.exitCode}`
+      )
+      return
+    }
+    core.info(`[git-mirror] Wrote commit-graph in ${Date.now() - start}ms`)
+  } catch (error) {
+    core.warning(`[git-mirror] commit-graph write failed: ${error}`)
+  }
+}
+
+/**
+ * Whether the mirror has a commit-graph (single file or split chain).
+ * Determines if the sync fetch can write incrementally.
+ */
+export function hasCommitGraph(mirrorPath: string): boolean {
+  return (
+    fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graph')) ||
+    fs.existsSync(
+      path.join(
+        mirrorPath,
+        'objects',
+        'info',
+        'commit-graphs',
+        'commit-graph-chain'
+      )
+    )
+  )
 }
 
 /**
@@ -1162,6 +1655,13 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       )
       shouldCommit = false
       vmHydratedGitMirror = false
+    }
+    // Catch-up for mirrors that predate commit-graph writing: build the
+    // initial graph here in the post step, off the checkout critical path.
+    // Once it exists, the sync fetch keeps it current incrementally. Only
+    // worth doing when the disk is being committed; failure is non-fatal.
+    if (shouldCommit && !hasCommitGraph(mirrorPath)) {
+      await writeCommitGraph(mirrorPath)
     }
   }
 
