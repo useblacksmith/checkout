@@ -1220,6 +1220,31 @@ function supportsGeometricRepack() {
     });
 }
 /**
+ * Log the mirror's pack and loose object counts so maintenance cost can be
+ * correlated with object store shape. Best effort.
+ */
+function logMirrorObjectCounts(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('git', ['-C', mirrorPath, 'count-objects', '-v'], { silent: true, ignoreReturnCode: true });
+            if (result.exitCode !== 0) {
+                return;
+            }
+            const counts = new Map();
+            for (const line of result.stdout.split('\n')) {
+                const [key, value] = line.split(':');
+                if (key && value !== undefined) {
+                    counts.set(key.trim(), value.trim());
+                }
+            }
+            core.info(`[git-mirror] Object store: packs=${counts.get('packs')}, size-pack=${counts.get('size-pack')}KiB, loose=${counts.get('count')}, size-loose=${counts.get('size')}KiB`);
+        }
+        catch (_a) {
+            // Diagnostic only.
+        }
+    });
+}
+/**
  * Keep the mirror's object store tidy after a sync.
  *
  * Every sync fetch lands its objects in a new pack, so the pack count grows
@@ -1239,6 +1264,7 @@ function supportsGeometricRepack() {
  */
 function runMirrorGC(mirrorPath_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
+        yield logMirrorObjectCounts(mirrorPath);
         const geometric = yield supportsGeometricRepack();
         const mode = geometric ? 'geometric repack' : 'auto garbage collection';
         core.info(`[git-mirror] Running ${mode} (timeout: ${timeoutSecs}s)`);
