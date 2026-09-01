@@ -90,8 +90,8 @@ const GC_TIMEOUT_SECS = 120; // 2 minutes
 // the next-smaller pack; `repack --geometric` rolls up only the packs that
 // violate this, leaving the large base pack untouched.
 const GEOMETRIC_REPACK_FACTOR = 2;
-// `git repack --geometric` needs 2.31+.
-const MinimumGeometricRepackGitVersion = new git_version_1.GitVersion('2.31');
+// `git repack --geometric` needs 2.32+.
+const MinimumGeometricRepackGitVersion = new git_version_1.GitVersion('2.32');
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
