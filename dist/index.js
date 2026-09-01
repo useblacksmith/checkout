@@ -71,6 +71,7 @@ const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const container_detector_1 = __nccwpck_require__(6424);
+const git_version_1 = __nccwpck_require__(3142);
 // Without a deadline, a black-holed dial stalls the checkout until the OS
 // gives up on the TCP handshake.
 const AGENT_RPC_TIMEOUT_MS = 45000;
@@ -85,6 +86,12 @@ const MIRROR_VERSION = 'v1';
 // window is kept generous so slow-but-healthy syncs still complete.
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes, single attempt
 const GC_TIMEOUT_SECS = 120; // 2 minutes
+// Each pack in the mirror must hold at least this many times the objects of
+// the next-smaller pack; `repack --geometric` rolls up only the packs that
+// violate this, leaving the large base pack untouched.
+const GEOMETRIC_REPACK_FACTOR = 2;
+// `git repack --geometric` needs 2.31+.
+const MinimumGeometricRepackGitVersion = new git_version_1.GitVersion('2.31');
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
@@ -1192,36 +1199,71 @@ function hasCommitGraph(mirrorPath) {
         fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graphs', 'commit-graph-chain')));
 }
 /**
- * Run lightweight garbage collection on the mirror.
- * Uses --auto to only run GC when git determines it's needed (based on loose object count).
- * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
+ * Whether the installed git supports `repack --geometric`.
+ */
+function supportsGeometricRepack() {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('git', ['version'], {
+                silent: true,
+                ignoreReturnCode: true
+            });
+            const match = result.stdout.match(/\d+\.\d+(\.\d+)?/);
+            if (result.exitCode !== 0 || !match) {
+                return false;
+            }
+            return new git_version_1.GitVersion(match[0]).checkMinimum(MinimumGeometricRepackGitVersion);
+        }
+        catch (_a) {
+            return false;
+        }
+    });
+}
+/**
+ * Keep the mirror's object store tidy after a sync.
+ *
+ * Every sync fetch lands its objects in a new pack, so the pack count grows
+ * with every committed sync. `git gc --auto` answers that by rewriting
+ * every pack in the repository once gc.autoPackLimit is crossed - on a
+ * large monorepo that means repacking a multi-GB base pack, which does not
+ * fit in the timeout, and a timed-out GC is never committed, so every
+ * subsequent job on the mirror attempts the same full repack again. A
+ * geometric repack instead rolls up only the small packs (and loose
+ * objects) needed to keep pack sizes in a geometric progression: the base
+ * pack is left alone and the work per run stays proportional to what recent
+ * syncs added, and is cheap when the packs already satisfy the
+ * progression. Refs are packed afterwards, as gc would, so loose refs
+ * written by sync fetches do not pile up.
+ *
+ * Falls back to `gc --auto` on git versions without `--geometric`.
  */
 function runMirrorGC(mirrorPath_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
-        core.info(`[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`);
-        try {
-            // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
-            // This is much faster than a full gc when not needed
-            // gc.autoDetach=false: prevent git from forking a background daemon for GC.
-            // Without this, the parent `git gc --auto` returns immediately while the
-            // daemonized child keeps running with cwd and mmap'd pack files on the
-            // mirror mount, causing the subsequent `umount` to fail with EBUSY.
-            const result = yield exec.getExecOutput('timeout', [
-                String(timeoutSecs),
-                'git',
-                '-c',
-                'gc.autoDetach=false',
+        const geometric = yield supportsGeometricRepack();
+        const mode = geometric ? 'geometric repack' : 'auto garbage collection';
+        core.info(`[git-mirror] Running ${mode} (timeout: ${timeoutSecs}s)`);
+        // gc.autoDetach=false: prevent git from forking a background daemon for GC.
+        // Without this, the parent `git gc --auto` returns immediately while the
+        // daemonized child keeps running with cwd and mmap'd pack files on the
+        // mirror mount, causing the subsequent `umount` to fail with EBUSY.
+        const gitArgs = geometric
+            ? [
                 '-C',
                 mirrorPath,
-                'gc',
-                '--auto'
-            ], { ignoreReturnCode: true });
+                'repack',
+                '-d',
+                `--geometric=${GEOMETRIC_REPACK_FACTOR}`
+            ]
+            : ['-c', 'gc.autoDetach=false', '-C', mirrorPath, 'gc', '--auto'];
+        try {
+            const start = Date.now();
+            const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', ...gitArgs], { ignoreReturnCode: true });
             if (result.exitCode === TIMEOUT_EXIT_CODE) {
                 core.warning(`[git-mirror] GC timed out after ${timeoutSecs}s`);
                 return {
                     success: false,
                     timedOut: true,
-                    error: `git gc timed out after ${timeoutSecs}s`
+                    error: `git ${mode} timed out after ${timeoutSecs}s`
                 };
             }
             if (result.exitCode !== 0) {
@@ -1229,16 +1271,45 @@ function runMirrorGC(mirrorPath_1) {
                 return {
                     success: false,
                     timedOut: false,
-                    error: `git gc failed with exit code ${result.exitCode}`
+                    error: `git ${mode} failed with exit code ${result.exitCode}`
                 };
             }
-            core.debug('[git-mirror] Completed git gc --auto');
+            core.info(`[git-mirror] Completed ${mode} in ${Date.now() - start}ms`);
+            if (geometric) {
+                yield packMirrorRefs(mirrorPath, timeoutSecs);
+            }
             return { success: true, timedOut: false };
         }
         catch (error) {
             const msg = error.message || String(error);
             core.warning(`[git-mirror] GC failed: ${msg}`);
             return { success: false, timedOut: false, error: msg };
+        }
+    });
+}
+/**
+ * Pack the mirror's loose refs. Loose refs take precedence over packed-refs
+ * and both hold the same values, so an interrupted run leaves the refs
+ * intact; failure is non-fatal.
+ */
+function packMirrorRefs(mirrorPath, timeoutSecs) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('timeout', [
+                String(timeoutSecs),
+                'git',
+                '-C',
+                mirrorPath,
+                'pack-refs',
+                '--all',
+                '--prune'
+            ], { silent: true, ignoreReturnCode: true });
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] pack-refs failed with exit code ${result.exitCode}`);
+            }
+        }
+        catch (error) {
+            core.warning(`[git-mirror] pack-refs failed: ${error}`);
         }
     });
 }
