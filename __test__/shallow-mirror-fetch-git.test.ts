@@ -342,4 +342,29 @@ describe('shallow fetch with mirror alternates and real git', () => {
     ).toBe(sourceMain)
     git(workspace, 'checkout', '-q', '--detach', sourceMain)
   })
+
+  it('fetches a commit the mirror is already ahead of without transferring objects', async () => {
+    const workspace = initWorkspace(true)
+    const wanted = git(mirrorPath, 'rev-parse', 'HEAD~2')
+    const tips = await blacksmithCache.resolveShallowNegotiationTips(
+      mirrorPath,
+      '',
+      ''
+    )
+    const run = await shallowFetch(workspace, [wanted], {
+      ignoreAlternateRefs: true,
+      negotiationTips: tips
+    })
+    expect(run.listedAlternateRefs).toBe(false)
+    expect(run.haves.has(mirrorMain)).toBe(true)
+    expect(git(workspace, 'rev-parse', 'FETCH_HEAD')).toBe(wanted)
+    expect(
+      fs.readFileSync(path.join(workspace, '.git', 'shallow'), 'utf8').trim()
+    ).toBe(wanted)
+    expect(git(workspace, 'count-objects', '-v')).toMatch(/^count: 0$/m)
+    expect(git(workspace, 'count-objects', '-v')).toMatch(/^in-pack: 0$/m)
+    git(workspace, 'fsck', '--connectivity-only', '--no-dangling')
+    git(workspace, 'checkout', '-q', '--detach', wanted)
+    expect(git(workspace, 'rev-parse', 'HEAD')).toBe(wanted)
+  })
 })
