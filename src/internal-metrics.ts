@@ -14,6 +14,37 @@ export async function reportInternalMetric(
   value: number,
   attributes: Record<string, string>
 ): Promise<void> {
+  await postInternalMetric(metricType, {
+    metric_type: metricType,
+    value,
+    vm_id: VM_ID,
+    attributes
+  })
+}
+
+/**
+ * Report a structured telemetry payload to the Blacksmith agent.
+ * Same fail-soft, fire-and-forget contract as reportInternalMetric: the
+ * payload rides the /internal envelope in a `payload` field alongside the
+ * metric_type, and every error is swallowed.
+ */
+export async function reportStructuredMetric(
+  metricType: string,
+  structuredPayload: unknown
+): Promise<void> {
+  await postInternalMetric(metricType, {
+    metric_type: metricType,
+    value: 0,
+    vm_id: VM_ID,
+    attributes: {},
+    payload: structuredPayload
+  })
+}
+
+async function postInternalMetric(
+  metricType: string,
+  body: Record<string, unknown>
+): Promise<void> {
   if (!METRICS_PORT) {
     core.debug(
       '[metrics] BLACKSMITH_METRICS_HTTP_PORT not set, skipping metric'
@@ -25,12 +56,7 @@ export async function reportInternalMetric(
     return
   }
 
-  const payload = JSON.stringify({
-    metric_type: metricType,
-    value,
-    vm_id: VM_ID,
-    attributes
-  })
+  const payload = JSON.stringify(body)
 
   try {
     await new Promise<void>((resolve, reject) => {
