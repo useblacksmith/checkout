@@ -14,6 +14,22 @@ import {GitVersion} from './git-version'
 // sparse-checkout not [well-]supported before 2.28 (see https://github.com/actions/checkout/issues/1386)
 export const MinimumGitVersion = new GitVersion('2.18')
 export const MinimumGitSparseCheckoutVersion = new GitVersion('2.28')
+// core.alternateRefsCommand not supported before 2.19
+export const MinimumGitAlternateRefsCommandVersion = new GitVersion('2.19')
+
+export interface FetchOptions {
+  filter?: string
+  fetchDepth?: number
+  fetchTags?: boolean
+  showProgress?: boolean
+  // Commits to offer the server as `have`s instead of the tips of every
+  // local and alternate ref.
+  negotiationTips?: string[]
+  // Keep alternate object stores for object lookup but do not treat their
+  // refs as known-reachable tips during negotiation or the post-fetch
+  // connectivity check.
+  ignoreAlternateRefs?: boolean
+}
 
 export interface IGitCommandManager {
   branchDelete(remote: boolean, branch: string): Promise<void>
@@ -32,15 +48,7 @@ export interface IGitCommandManager {
     configFile?: string
   ): Promise<void>
   configExists(configKey: string, globalConfig?: boolean): Promise<boolean>
-  fetch(
-    refSpec: string[],
-    options: {
-      filter?: string
-      fetchDepth?: number
-      fetchTags?: boolean
-      showProgress?: boolean
-    }
-  ): Promise<void>
+  fetch(refSpec: string[], options: FetchOptions): Promise<void>
   getDefaultBranch(repositoryUrl: string): Promise<string>
   getSubmoduleConfigPaths(recursive: boolean): Promise<string[]>
   getWorkingDirectory(): string
@@ -284,16 +292,13 @@ class GitCommandManager {
     return output.exitCode === 0
   }
 
-  async fetch(
-    refSpec: string[],
-    options: {
-      filter?: string
-      fetchDepth?: number
-      fetchTags?: boolean
-      showProgress?: boolean
+  async fetch(refSpec: string[], options: FetchOptions): Promise<void> {
+    const args = ['-c', 'protocol.version=2']
+    if (options.ignoreAlternateRefs) {
+      // A no-op command yields no refs, so alternates contribute objects only.
+      args.push('-c', 'core.alternateRefsCommand=true')
     }
-  ): Promise<void> {
-    const args = ['-c', 'protocol.version=2', 'fetch']
+    args.push('fetch')
     if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
       args.push('--no-tags')
     }
@@ -305,6 +310,10 @@ class GitCommandManager {
 
     if (options.filter) {
       args.push(`--filter=${options.filter}`)
+    }
+
+    for (const tip of options.negotiationTips || []) {
+      args.push(`--negotiation-tip=${tip}`)
     }
 
     if (options.fetchDepth && options.fetchDepth > 0) {

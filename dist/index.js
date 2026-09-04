@@ -56,6 +56,9 @@ exports.mapMirrorRefToWorkspace = mapMirrorRefToWorkspace;
 exports.buildRefCopyInstructions = buildRefCopyInstructions;
 exports.buildPackedRefsContent = buildPackedRefsContent;
 exports.copyRefsFromMirror = copyRefsFromMirror;
+exports.sharesMirrorObjects = sharesMirrorObjects;
+exports.shallowNegotiationTipRefs = shallowNegotiationTipRefs;
+exports.resolveShallowNegotiationTips = resolveShallowNegotiationTips;
 exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
@@ -977,19 +980,7 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
                 core.info('[git-mirror] Workspace .git is not a directory, using local fetch instead of direct ref copy');
                 return false;
             }
-            const alternatesPath = path.join(gitDir, 'objects', 'info', 'alternates');
-            const expectedAlternate = `${mirrorPath}/objects`;
-            let hasMirrorAlternate = false;
-            try {
-                const alternates = yield fs.promises.readFile(alternatesPath, 'utf8');
-                hasMirrorAlternate = alternates
-                    .split('\n')
-                    .some(line => line.trim() === expectedAlternate);
-            }
-            catch (_a) {
-                hasMirrorAlternate = false;
-            }
-            if (!hasMirrorAlternate) {
+            if (!(yield sharesMirrorObjects(workspacePath, mirrorPath))) {
                 core.info('[git-mirror] Workspace does not share the mirror object store, using local fetch instead of direct ref copy');
                 return false;
             }
@@ -1051,6 +1042,91 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
             core.warning(`[git-mirror] Direct ref copy from mirror failed, falling back to local fetch: ${error}`);
             return false;
         }
+    });
+}
+/**
+ * Whether the workspace's alternates file references this mirror's object
+ * directory, i.e. objects known to the mirror are readable from the
+ * workspace without being copied.
+ */
+function sharesMirrorObjects(workspacePath, mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const alternatesPath = path.join(workspacePath, '.git', 'objects', 'info', 'alternates');
+        const expectedAlternate = `${mirrorPath}/objects`;
+        try {
+            const alternates = yield fs.promises.readFile(alternatesPath, 'utf8');
+            return alternates
+                .split('\n')
+                .some(line => line.trim() === expectedAlternate);
+        }
+        catch (_a) {
+            return false;
+        }
+    });
+}
+/**
+ * Mirror refs whose tips are worth offering as negotiation tips for a
+ * shallow fetch of `ref`: the mirror's copy of the same branch or tag, the
+ * pull request's base branch for refs/pull/*, and the mirror HEAD as the
+ * nearest commit for anything else (bare SHAs, new branches). Candidates
+ * are ordered by expected proximity to the wanted commit.
+ */
+function shallowNegotiationTipRefs(ref, baseRef) {
+    const upperRef = (ref || '').toUpperCase();
+    const candidates = [];
+    if (ref && !upperRef.startsWith('REFS/')) {
+        candidates.push(`refs/heads/${ref}`, `refs/tags/${ref}`);
+    }
+    else if (upperRef.startsWith('REFS/HEADS/') ||
+        upperRef.startsWith('REFS/TAGS/')) {
+        candidates.push(ref);
+    }
+    else if (upperRef.startsWith('REFS/PULL/') && baseRef) {
+        candidates.push(baseRef.toUpperCase().startsWith('REFS/')
+            ? baseRef
+            : `refs/heads/${baseRef}`);
+    }
+    candidates.push('HEAD');
+    return candidates;
+}
+/**
+ * Resolve the negotiation tips for a shallow fetch of `ref` to commit ids
+ * present in the mirror (see shallowNegotiationTipRefs). Only tips that
+ * resolve are returned, deduplicated; an empty result means the fetch should
+ * negotiate without mirror knowledge.
+ *
+ * The tips are how the mirror pays off on the shallow path. Alternates make
+ * the mirror's objects readable from the workspace, but git also treats
+ * every alternate ref as a known-reachable tip: in a deepening fetch the
+ * post-fetch connectivity check then enumerates the entire mirror object
+ * graph (minutes of cold reads on a large mirror), and negotiation offers
+ * every mirror ref as a `have`. Disabling alternate ref discovery removes
+ * both, and these explicit tips restore the negotiation benefit - the
+ * server sends only the delta from the mirror's tip - bounded to a handful
+ * of commits. The tips never affect correctness: the shallow boundary, the
+ * fetched refs and the objects sent are decided by the server from the
+ * wants; a stale mirror only makes the pack larger.
+ */
+function resolveShallowNegotiationTips(mirrorPath, ref, baseRef) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const tips = [];
+        for (const candidate of shallowNegotiationTipRefs(ref, baseRef)) {
+            const result = yield exec.getExecOutput('git', [
+                '-C',
+                mirrorPath,
+                'rev-parse',
+                '--verify',
+                '--quiet',
+                `${candidate}^{commit}`
+            ], { silent: true, ignoreReturnCode: true });
+            const sha = result.stdout.trim();
+            if (result.exitCode === 0 && /^[0-9a-f]{40,64}$/.test(sha)) {
+                if (!tips.includes(sha)) {
+                    tips.push(sha);
+                }
+            }
+        }
+        return tips;
     });
 }
 /**
@@ -2203,7 +2279,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MinimumGitSparseCheckoutVersion = exports.MinimumGitVersion = void 0;
+exports.MinimumGitAlternateRefsCommandVersion = exports.MinimumGitSparseCheckoutVersion = exports.MinimumGitVersion = void 0;
 exports.createCommandManager = createCommandManager;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -2220,6 +2296,8 @@ const git_version_1 = __nccwpck_require__(3142);
 // sparse-checkout not [well-]supported before 2.28 (see https://github.com/actions/checkout/issues/1386)
 exports.MinimumGitVersion = new git_version_1.GitVersion('2.18');
 exports.MinimumGitSparseCheckoutVersion = new git_version_1.GitVersion('2.28');
+// core.alternateRefsCommand not supported before 2.19
+exports.MinimumGitAlternateRefsCommandVersion = new git_version_1.GitVersion('2.19');
 function createCommandManager(workingDirectory, lfs, doSparseCheckout) {
     return __awaiter(this, void 0, void 0, function* () {
         return yield GitCommandManager.createCommandManager(workingDirectory, lfs, doSparseCheckout);
@@ -2397,7 +2475,12 @@ class GitCommandManager {
     }
     fetch(refSpec, options) {
         return __awaiter(this, void 0, void 0, function* () {
-            const args = ['-c', 'protocol.version=2', 'fetch'];
+            const args = ['-c', 'protocol.version=2'];
+            if (options.ignoreAlternateRefs) {
+                // A no-op command yields no refs, so alternates contribute objects only.
+                args.push('-c', 'core.alternateRefsCommand=true');
+            }
+            args.push('fetch');
             if (!refSpec.some(x => x === refHelper.tagsRefSpec) && !options.fetchTags) {
                 args.push('--no-tags');
             }
@@ -2407,6 +2490,9 @@ class GitCommandManager {
             }
             if (options.filter) {
                 args.push(`--filter=${options.filter}`);
+            }
+            for (const tip of options.negotiationTips || []) {
+                args.push(`--negotiation-tip=${tip}`);
             }
             if (options.fetchDepth && options.fetchDepth > 0) {
                 args.push(`--depth=${options.fetchDepth}`);
@@ -3207,6 +3293,20 @@ function getSource(settings) {
             else {
                 fetchOptions.fetchDepth = settings.fetchDepth;
                 fetchOptions.fetchTags = settings.fetchTags;
+                // With the mirror attached as an alternate, git would treat every
+                // mirror ref as a known tip: the deepening fetch's connectivity check
+                // walks the whole mirror object graph and negotiation offers every
+                // mirror ref. Turn alternate ref discovery off and offer a few mirror
+                // tips explicitly instead, so the server still sends only the delta
+                // from the mirror (see resolveShallowNegotiationTips).
+                if (cacheInfo &&
+                    (yield git.version()).checkMinimum(git_command_manager_1.MinimumGitAlternateRefsCommandVersion) &&
+                    (yield blacksmithCache.sharesMirrorObjects(settings.repositoryPath, cacheInfo.mirrorPath))) {
+                    fetchOptions.ignoreAlternateRefs = true;
+                    fetchOptions.negotiationTips =
+                        yield blacksmithCache.resolveShallowNegotiationTips(cacheInfo.mirrorPath, settings.ref, process.env['GITHUB_BASE_REF'] || '');
+                    core.info(`[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`);
+                }
                 const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
                 yield git.fetch(refSpec, fetchOptions);
             }

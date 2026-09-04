@@ -448,6 +448,49 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('shallowNegotiationTipRefs', () => {
+    it('offers the same branch then HEAD', () => {
+      expect(
+        blacksmithCache.shallowNegotiationTipRefs('refs/heads/feature', '')
+      ).toEqual(['refs/heads/feature', 'HEAD'])
+    })
+
+    it('offers the same tag then HEAD', () => {
+      expect(
+        blacksmithCache.shallowNegotiationTipRefs('refs/tags/v1', 'main')
+      ).toEqual(['refs/tags/v1', 'HEAD'])
+    })
+
+    it('offers the base branch for pull request refs', () => {
+      expect(
+        blacksmithCache.shallowNegotiationTipRefs('refs/pull/42/merge', 'main')
+      ).toEqual(['refs/heads/main', 'HEAD'])
+      expect(
+        blacksmithCache.shallowNegotiationTipRefs(
+          'refs/pull/42/head',
+          'refs/heads/release'
+        )
+      ).toEqual(['refs/heads/release', 'HEAD'])
+    })
+
+    it('falls back to HEAD for pull request refs without a base and for bare SHAs', () => {
+      expect(
+        blacksmithCache.shallowNegotiationTipRefs('refs/pull/42/merge', '')
+      ).toEqual(['HEAD'])
+      expect(blacksmithCache.shallowNegotiationTipRefs('', '')).toEqual([
+        'HEAD'
+      ])
+    })
+
+    it('tries both branch and tag for an unqualified ref', () => {
+      expect(blacksmithCache.shallowNegotiationTipRefs('v1', '')).toEqual([
+        'refs/heads/v1',
+        'refs/tags/v1',
+        'HEAD'
+      ])
+    })
+  })
+
   describe('parseMissingRemoteRefs', () => {
     it('extracts a single missing ref', () => {
       const stderr =
