@@ -2296,8 +2296,8 @@ const git_version_1 = __nccwpck_require__(3142);
 // sparse-checkout not [well-]supported before 2.28 (see https://github.com/actions/checkout/issues/1386)
 exports.MinimumGitVersion = new git_version_1.GitVersion('2.18');
 exports.MinimumGitSparseCheckoutVersion = new git_version_1.GitVersion('2.28');
-// core.alternateRefsCommand not supported before 2.19
-exports.MinimumGitAlternateRefsCommandVersion = new git_version_1.GitVersion('2.19');
+// core.alternateRefsCommand not supported before 2.20
+exports.MinimumGitAlternateRefsCommandVersion = new git_version_1.GitVersion('2.20');
 function createCommandManager(workingDirectory, lfs, doSparseCheckout) {
     return __awaiter(this, void 0, void 0, function* () {
         return yield GitCommandManager.createCommandManager(workingDirectory, lfs, doSparseCheckout);

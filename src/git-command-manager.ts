@@ -14,8 +14,8 @@ import {GitVersion} from './git-version'
 // sparse-checkout not [well-]supported before 2.28 (see https://github.com/actions/checkout/issues/1386)
 export const MinimumGitVersion = new GitVersion('2.18')
 export const MinimumGitSparseCheckoutVersion = new GitVersion('2.28')
-// core.alternateRefsCommand not supported before 2.19
-export const MinimumGitAlternateRefsCommandVersion = new GitVersion('2.19')
+// core.alternateRefsCommand not supported before 2.20
+export const MinimumGitAlternateRefsCommandVersion = new GitVersion('2.20')
 
 export interface FetchOptions {
   filter?: string
