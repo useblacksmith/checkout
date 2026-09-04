@@ -7,6 +7,7 @@ import * as stateHelper from './state-helper'
 import * as blacksmithCache from './blacksmith-cache'
 import {checkPreviousStepFailures} from './step-checker'
 import {reportInternalMetric} from './internal-metrics'
+import * as mirrorTelemetry from './mirror-telemetry'
 
 async function run(): Promise<void> {
   try {
@@ -50,6 +51,8 @@ async function cleanup(): Promise<void> {
   let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed
   let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut
   if (exposeId && stickyDiskKey) {
+    // Sync result kept for the structured refresh maintenance row below.
+    let deferredSyncResult: blacksmithCache.MirrorSyncResult | null = null
     // For shallow checkouts the checkout step never populates the workspace
     // from mirror refs, so the mirror sync is deferred here to keep the
     // checkout step fast.
@@ -65,6 +68,7 @@ async function cleanup(): Promise<void> {
           authToken,
           stateHelper.BlacksmithCacheVerbose
         )
+        deferredSyncResult = syncResult
         mirrorChanged = syncResult.changed
         mirrorSyncFailed = !syncResult.success && !syncResult.timedOut
         mirrorSyncTimedOut = syncResult.timedOut
@@ -159,6 +163,26 @@ async function cleanup(): Promise<void> {
           reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
         })
       }
+    }
+
+    // Structured maintenance rows (fire-and-forget; errors swallowed inside).
+    if (deferredSyncResult && !deferredSyncResult.skipped) {
+      await mirrorTelemetry.reportMaintenance(
+        mirrorTelemetry.maintenanceRunFromResult(
+          'refresh',
+          stickyDiskKey,
+          deferredSyncResult
+        )
+      )
+    }
+    if (cleanupResult && mirrorPath && !cleanupResult.gcResult.skipped) {
+      await mirrorTelemetry.reportMaintenance(
+        mirrorTelemetry.maintenanceRunFromResult(
+          'gc',
+          stickyDiskKey,
+          cleanupResult.gcResult
+        )
+      )
     }
   }
 }

@@ -46,6 +46,7 @@ exports.getGrpcPort = getGrpcPort;
 exports.isAllowedInsideContainer = isAllowedInsideContainer;
 exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
+exports.stickyDiskKeyFor = stickyDiskKeyFor;
 exports.setupCache = setupCache;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
@@ -74,6 +75,7 @@ const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(2880);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const container_detector_1 = __nccwpck_require__(6424);
+const mirror_telemetry_1 = __nccwpck_require__(7185);
 // Without a deadline, a black-holed dial stalls the checkout until the OS
 // gives up on the TCP handshake.
 const AGENT_RPC_TIMEOUT_MS = 45000;
@@ -255,6 +257,10 @@ function maybeFormatDevice(device) {
         core.debug(`Successfully formatted ${device} with ext4`);
     });
 }
+/** Sticky disk key of a repository's git mirror; one mirror per repository. */
+function stickyDiskKeyFor(owner, repo) {
+    return `${owner}-${repo}`;
+}
 /**
  * Request a sticky disk from the VM agent, format if needed, and mount it.
  * Returns CacheInfo with hydrationInProgress=true if another job is hydrating,
@@ -263,7 +269,7 @@ function maybeFormatDevice(device) {
 function setupCache(owner, repo) {
     return __awaiter(this, void 0, void 0, function* () {
         const client = createBlacksmithClient();
-        const stickyDiskKey = `${owner}-${repo}`;
+        const stickyDiskKey = stickyDiskKeyFor(owner, repo);
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), AGENT_RPC_TIMEOUT_MS);
         // Rethrow the original error so callers can classify it from the gRPC code.
@@ -657,9 +663,14 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false, timeoutSecs = REFRESH_TIMEOUT_SECS) {
         if (!fs.existsSync(mirrorPath)) {
             core.debug(`[git-mirror] Mirror does not exist at ${mirrorPath}, skipping sync`);
-            return { success: true, timedOut: false, changed: false };
+            return { success: true, timedOut: false, changed: false, skipped: true };
         }
         core.info(`[git-mirror] Syncing mirror at ${mirrorPath} with remote (budget: ${timeoutSecs}s)`);
+        // Mirror size delta across the sync approximates the bytes landed —
+        // the steady-state freshness cost between commits. Walked before the
+        // deadline is set so measurement never eats into the sync budget.
+        const sizeBefore = yield (0, mirror_telemetry_1.dirSizeBytesOrNull)(mirrorPath);
+        const syncStart = Date.now();
         // One deadline bounds the whole sync: ls-remote and every fetch
         // invocation (including vanished-ref reruns) draw from the same budget,
         // so the sync's worst case is timeoutSecs regardless of how many
@@ -714,7 +725,14 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
             const purgedRefs = yield purgePullRefs(mirrorPath);
             if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
                 core.info('[git-mirror] Mirror is already up to date with the remote');
-                return { success: true, timedOut: false, changed: purgedRefs > 0 };
+                return {
+                    success: true,
+                    timedOut: false,
+                    changed: purgedRefs > 0,
+                    durationMs: Date.now() - syncStart,
+                    bytes: 0,
+                    mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
+                };
             }
             // Refs deleted on the remote between ls-remote and the fetch make git
             // fail with "couldn't find remote ref". Prune those refs and re-run the
@@ -824,7 +842,21 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                 core.info(`[git-mirror] Deleted ${refsToDelete.length} refs removed on the remote`);
             }
             core.info('[git-mirror] Mirror sync complete');
-            return { success: true, timedOut: false, changed: true };
+            // Duration is the sync alone; the size walk below is measurement cost.
+            const durationMs = Date.now() - syncStart;
+            const sizeAfter = yield (0, mirror_telemetry_1.dirSizeBytesOrNull)(mirrorPath);
+            return {
+                success: true,
+                timedOut: false,
+                changed: true,
+                durationMs,
+                // Only report a delta when both walks succeeded — a failed walk reads
+                // as 0 and would report the whole mirror as fetched.
+                bytes: sizeBefore !== null && sizeAfter !== null
+                    ? Math.max(0, sizeAfter - sizeBefore)
+                    : 0,
+                mirrorSizeBytes: sizeAfter !== null && sizeAfter !== void 0 ? sizeAfter : 0
+            };
         }
         catch (error) {
             const msg = error.message || String(error);
@@ -835,7 +867,15 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
             else {
                 core.warning(`[git-mirror] Mirror sync failed: ${msg}`);
             }
-            return { success: false, timedOut, error: msg, changed: false };
+            return {
+                success: false,
+                timedOut,
+                error: msg,
+                changed: false,
+                durationMs: Date.now() - syncStart,
+                bytes: 0,
+                mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
+            };
         }
     });
 }
@@ -1268,13 +1308,48 @@ function hasCommitGraph(mirrorPath) {
         fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graphs', 'commit-graph-chain')));
 }
 /**
+ * Loose-object and pack counts from `git count-objects -v`, or null when
+ * unmeasurable. A `gc --auto` that did work changes at least one of them.
+ */
+function objectCounts(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('git', ['-C', mirrorPath, 'count-objects', '-v'], { ignoreReturnCode: true, silent: true });
+            if (result.exitCode !== 0) {
+                return null;
+            }
+            const counts = {};
+            for (const line of result.stdout.split('\n')) {
+                const [key, value] = line.split(':');
+                if (key === 'count')
+                    counts.loose = parseInt(value, 10);
+                if (key === 'packs')
+                    counts.packs = parseInt(value, 10);
+            }
+            if (counts.loose === undefined || counts.packs === undefined) {
+                return null;
+            }
+            return counts;
+        }
+        catch (_a) {
+            return null;
+        }
+    });
+}
+/**
  * Run lightweight garbage collection on the mirror.
  * Uses --auto to only run GC when git determines it's needed (based on loose object count).
  * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
+ * A no-op `gc --auto` is reported as skipped so only real collections
+ * produce a maintenance row.
  */
 function runMirrorGC(mirrorPath_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
         core.info(`[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`);
+        // Mirror size delta across gc approximates the bytes reclaimed.
+        const sizeBefore = yield (0, mirror_telemetry_1.dirSizeBytesOrNull)(mirrorPath);
+        const countsBefore = yield objectCounts(mirrorPath);
+        const gcStart = Date.now();
         try {
             // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
             // This is much faster than a full gc when not needed
@@ -1297,7 +1372,10 @@ function runMirrorGC(mirrorPath_1) {
                 return {
                     success: false,
                     timedOut: true,
-                    error: `git gc timed out after ${timeoutSecs}s`
+                    error: `git gc timed out after ${timeoutSecs}s`,
+                    durationMs: Date.now() - gcStart,
+                    bytes: 0,
+                    mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
                 };
             }
             if (result.exitCode !== 0) {
@@ -1305,16 +1383,54 @@ function runMirrorGC(mirrorPath_1) {
                 return {
                     success: false,
                     timedOut: false,
-                    error: `git gc failed with exit code ${result.exitCode}`
+                    error: `git gc failed with exit code ${result.exitCode}`,
+                    durationMs: Date.now() - gcStart,
+                    bytes: 0,
+                    mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
                 };
             }
             core.debug('[git-mirror] Completed git gc --auto');
-            return { success: true, timedOut: false };
+            // Duration is the gc alone; the walks below are measurement cost.
+            const durationMs = Date.now() - gcStart;
+            const countsAfter = yield objectCounts(mirrorPath);
+            if (countsBefore !== null &&
+                countsAfter !== null &&
+                countsBefore.loose === countsAfter.loose &&
+                countsBefore.packs === countsAfter.packs) {
+                core.debug('[git-mirror] gc --auto found nothing to collect');
+                return {
+                    success: true,
+                    timedOut: false,
+                    skipped: true,
+                    durationMs,
+                    bytes: 0,
+                    mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
+                };
+            }
+            const sizeAfter = yield (0, mirror_telemetry_1.dirSizeBytesOrNull)(mirrorPath);
+            return {
+                success: true,
+                timedOut: false,
+                durationMs,
+                // Only report a delta when both walks succeeded — a failed walk reads
+                // as 0 and would report the whole mirror as reclaimed.
+                bytes: sizeBefore !== null && sizeAfter !== null
+                    ? Math.max(0, sizeBefore - sizeAfter)
+                    : 0,
+                mirrorSizeBytes: sizeAfter !== null && sizeAfter !== void 0 ? sizeAfter : 0
+            };
         }
         catch (error) {
             const msg = error.message || String(error);
             core.warning(`[git-mirror] GC failed: ${msg}`);
-            return { success: false, timedOut: false, error: msg };
+            return {
+                success: false,
+                timedOut: false,
+                error: msg,
+                durationMs: Date.now() - gcStart,
+                bytes: 0,
+                mirrorSizeBytes: sizeBefore !== null && sizeBefore !== void 0 ? sizeBefore : 0
+            };
         }
     });
 }
@@ -1426,7 +1542,9 @@ function cleanup(options) {
         // valid disk being persisted.
         let vmHydratedGitMirror = options.vmHydratedGitMirror;
         const result = {
-            gcResult: { success: true, timedOut: false }
+            // skipped until GC actually runs, so an unchanged mirror (no mirrorPath)
+            // never reports a successful zero-measurement gc row.
+            gcResult: { success: true, timedOut: false, skipped: true }
         };
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
         // If the mirror sync failed or timed out, don't commit
@@ -3073,8 +3191,41 @@ const refHelper = __importStar(__nccwpck_require__(8601));
 const stateHelper = __importStar(__nccwpck_require__(4866));
 const urlHelper = __importStar(__nccwpck_require__(9437));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
+const mirrorTelemetry = __importStar(__nccwpck_require__(7185));
 const git_command_manager_1 = __nccwpck_require__(738);
 function getSource(settings) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Structured checkout telemetry, reported to the Blacksmith agent at the
+        // end of the main step. Fail-soft: measurement or reporting problems only
+        // degrade the report, never the checkout.
+        const report = mirrorTelemetry.newCheckoutReport();
+        const totalStart = Date.now();
+        let hydrationReport = null;
+        try {
+            yield getSourceInner(settings, report, r => {
+                hydrationReport = r;
+            });
+            report.outcome = 'success';
+        }
+        catch (error) {
+            report.outcome = 'failure';
+            // Overwrite any recovered fallback error class: on failure the class must
+            // describe the error that actually failed the checkout.
+            report.error_class = mirrorTelemetry.classifyError(error);
+            throw error;
+        }
+        finally {
+            report.total_ms = Date.now() - totalStart;
+            if (blacksmithCache.isBlacksmithEnvironment()) {
+                if (hydrationReport) {
+                    yield mirrorTelemetry.reportHydration(hydrationReport);
+                }
+                yield mirrorTelemetry.reportCheckout(report);
+            }
+        }
+    });
+}
+function getSourceInner(settings, report, onHydrationReport) {
     return __awaiter(this, void 0, void 0, function* () {
         // Repository URL
         core.info(`Syncing repository: ${settings.repositoryOwner}/${settings.repositoryName}`);
@@ -3139,13 +3290,21 @@ function getSource(settings) {
             // of this run (hydrated now, or synced via ls-remote diff). Only then can
             // the workspace copy its refs from the mirror instead of the network.
             let mirrorFresh = false;
+            report.sticky_disk_key = blacksmithCache.stickyDiskKeyFor(settings.repositoryOwner, settings.repositoryName);
+            report.shallow = settings.fetchDepth > 0;
+            report.filter = !!settings.filter || settings.sparseCheckout != null;
+            report.submodules_enabled = settings.submodules;
+            report.lfs_enabled = settings.lfs;
             if (blacksmithCache.shouldUseBlacksmithCache()) {
+                const setupStart = Date.now();
                 try {
                     core.startGroup('Setting up Blacksmith git mirror cache');
                     cacheInfo = yield blacksmithCache.setupCache(settings.repositoryOwner, settings.repositoryName);
+                    report.sticky_disk_setup_ms = Date.now() - setupStart;
                     // Check if hydration is in progress - another job is doing the initial git clone --mirror
                     if (cacheInfo.hydrationInProgress) {
                         // Warning already logged by setupCache, just fall back to standard checkout
+                        report.serving_mode = 'fallback-contention';
                         cacheInfo = null;
                         core.endGroup();
                     }
@@ -3156,7 +3315,38 @@ function getSource(settings) {
                         stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                         stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint);
-                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                        const mirrorExisted = fsHelper.directoryExistsSync(cacheInfo.mirrorPath);
+                        const cloneStart = Date.now();
+                        let performedHydration = false;
+                        try {
+                            performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                        }
+                        catch (error) {
+                            if (!mirrorExisted) {
+                                onHydrationReport({
+                                    sticky_disk_key: cacheInfo.stickyDiskKey,
+                                    clone_ms: Date.now() - cloneStart,
+                                    clone_bytes: 0,
+                                    ref_count: 0,
+                                    outcome: 'failure',
+                                    error_class: mirrorTelemetry.classifyError(error)
+                                });
+                            }
+                            throw error;
+                        }
+                        if (performedHydration) {
+                            report.serving_mode = 'hydrating';
+                            onHydrationReport({
+                                sticky_disk_key: cacheInfo.stickyDiskKey,
+                                clone_ms: Date.now() - cloneStart,
+                                clone_bytes: yield mirrorTelemetry.dirSizeBytes(cacheInfo.mirrorPath),
+                                ref_count: yield mirrorTelemetry.refCount(cacheInfo.mirrorPath),
+                                outcome: 'success'
+                            });
+                        }
+                        else {
+                            report.serving_mode = 'mirror';
+                        }
                         stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
                         if (performedHydration) {
                             // A freshly-cloned mirror is exactly the remote's current state
@@ -3170,6 +3360,10 @@ function getSource(settings) {
                             // freshness as a direct network fetch.
                             const syncResult = yield blacksmithCache.syncMirrorFromRemote(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
                             mirrorFresh = syncResult.success;
+                            if (!syncResult.skipped) {
+                                // Structured refresh row (fire-and-forget; errors swallowed).
+                                yield mirrorTelemetry.reportMaintenance(mirrorTelemetry.maintenanceRunFromResult('refresh', cacheInfo.stickyDiskKey, syncResult));
+                            }
                             stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed);
                             stateHelper.setBlacksmithCacheMirrorSyncFailed(!syncResult.success && !syncResult.timedOut);
                             stateHelper.setBlacksmithCacheMirrorSyncTimedOut(syncResult.timedOut);
@@ -3189,6 +3383,13 @@ function getSource(settings) {
                 catch (error) {
                     core.endGroup();
                     core.warning(`Blacksmith cache setup failed, using standard checkout: ${error}`);
+                    // Stamp the setup duration only when setupCache itself failed; later
+                    // failures (e.g. the hydration clone) are not sticky-disk setup time.
+                    if (report.sticky_disk_setup_ms === 0) {
+                        report.sticky_disk_setup_ms = Date.now() - setupStart;
+                    }
+                    report.serving_mode = 'fallback-error';
+                    report.error_class = mirrorTelemetry.classifyError(error);
                     // Don't clear cacheInfo.exposeId/stickyDiskKey from state - they're already saved
                     // so cleanup can still call commitStickyDisk with shouldCommit: false
                     cacheInfo = null;
@@ -3197,12 +3398,16 @@ function getSource(settings) {
             // Initialize the repository
             if (!fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))) {
                 core.startGroup('Initializing the repository');
+                const initStart = Date.now();
                 yield git.init();
                 // Setup alternates to use objects from Blacksmith mirror if available
                 if (cacheInfo) {
                     yield blacksmithCache.writeAlternates(settings.repositoryPath, cacheInfo.mirrorPath);
                 }
                 yield git.remoteAdd('origin', repositoryUrl);
+                if (cacheInfo) {
+                    report.clone_from_mirror_ms += Date.now() - initStart;
+                }
                 core.endGroup();
             }
             // Disable automatic garbage collection
@@ -3236,6 +3441,11 @@ function getSource(settings) {
             }
             // Fetch
             core.startGroup('Fetching the repository');
+            const objectsDir = path.join(settings.repositoryPath, '.git', 'objects');
+            const objectsBytesBefore = cacheInfo
+                ? yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+                : null;
+            const fetchStart = Date.now();
             const fetchOptions = {};
             if (settings.filter) {
                 fetchOptions.filter = settings.filter;
@@ -3310,6 +3520,21 @@ function getSource(settings) {
                 const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
                 yield git.fetch(refSpec, fetchOptions);
             }
+            if (cacheInfo) {
+                // Mirror-served: the fetch pulls only the delta the mirror is missing.
+                report.delta_fetch_ms = Date.now() - fetchStart;
+                const objectsBytesAfter = yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir);
+                report.delta_fetch_bytes =
+                    objectsBytesBefore !== null && objectsBytesAfter !== null
+                        ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
+                        : 0;
+                report.mirror_size_bytes = yield mirrorTelemetry.dirSizeBytes(cacheInfo.mirrorPath);
+                report.ref_count = yield mirrorTelemetry.refCount(cacheInfo.mirrorPath);
+            }
+            else {
+                // Fallback/bypass: the fetch is the full checkout cost.
+                report.full_checkout_ms = Date.now() - fetchStart;
+            }
             core.endGroup();
             // Checkout info
             core.startGroup('Determining the checkout info');
@@ -3321,7 +3546,9 @@ function getSource(settings) {
             // For sparse checkouts, let `checkout` fetch the needed objects lazily.
             if (settings.lfs && !settings.sparseCheckout) {
                 core.startGroup('Fetching LFS objects');
+                const lfsStart = Date.now();
                 yield git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref);
+                report.lfs_ms = Date.now() - lfsStart;
                 core.endGroup();
             }
             // Sparse checkout
@@ -3344,7 +3571,18 @@ function getSource(settings) {
             }
             // Checkout
             core.startGroup('Checking out the ref');
+            const checkoutStart = Date.now();
             yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+            if (cacheInfo) {
+                // Materializing the working tree reads objects from the mirror through
+                // alternates — the second half of the clone-from-mirror cost.
+                report.clone_from_mirror_ms += Date.now() - checkoutStart;
+            }
+            else {
+                // Fallback/bypass: working-tree materialization is part of the full
+                // checkout cost, keeping phase totals comparable across serving modes.
+                report.full_checkout_ms += Date.now() - checkoutStart;
+            }
             core.endGroup();
             // Dissociate from Blacksmith mirror if requested
             // This copies all objects from alternates into the local repo so it's independent
@@ -3355,6 +3593,7 @@ function getSource(settings) {
             }
             // Submodules
             if (settings.submodules) {
+                const submodulesStart = Date.now();
                 // Temporarily override global config
                 core.startGroup('Setting up auth for fetching submodules');
                 yield authHelper.configureGlobalAuth();
@@ -3371,6 +3610,7 @@ function getSource(settings) {
                     yield authHelper.configureSubmoduleAuth();
                     core.endGroup();
                 }
+                report.submodules_ms = Date.now() - submodulesStart;
             }
             // Get commit information
             const commitInfo = yield git.log1();
@@ -3907,6 +4147,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.reportInternalMetric = reportInternalMetric;
+exports.reportStructuredMetric = reportStructuredMetric;
 const core = __importStar(__nccwpck_require__(2186));
 const http = __importStar(__nccwpck_require__(3685));
 const METRICS_PORT = process.env.BLACKSMITH_METRICS_HTTP_PORT || '';
@@ -3918,6 +4159,33 @@ const AGENT_IP = process.env.BLACKSMITH_AGENT_ADDR || '';
  */
 function reportInternalMetric(metricType, value, attributes) {
     return __awaiter(this, void 0, void 0, function* () {
+        yield postInternalMetric(metricType, {
+            metric_type: metricType,
+            value,
+            vm_id: VM_ID,
+            attributes
+        });
+    });
+}
+/**
+ * Report a structured telemetry payload to the Blacksmith agent.
+ * Same fail-soft, fire-and-forget contract as reportInternalMetric: the
+ * payload rides the /internal envelope in a `payload` field alongside the
+ * metric_type, and every error is swallowed.
+ */
+function reportStructuredMetric(metricType, structuredPayload) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield postInternalMetric(metricType, {
+            metric_type: metricType,
+            value: 0,
+            vm_id: VM_ID,
+            attributes: {},
+            payload: structuredPayload
+        });
+    });
+}
+function postInternalMetric(metricType, body) {
+    return __awaiter(this, void 0, void 0, function* () {
         if (!METRICS_PORT) {
             core.debug('[metrics] BLACKSMITH_METRICS_HTTP_PORT not set, skipping metric');
             return;
@@ -3926,12 +4194,7 @@ function reportInternalMetric(metricType, value, attributes) {
             core.debug('[metrics] BLACKSMITH_AGENT_ADDR not set, skipping metric');
             return;
         }
-        const payload = JSON.stringify({
-            metric_type: metricType,
-            value,
-            vm_id: VM_ID,
-            attributes
-        });
+        const payload = JSON.stringify(body);
         try {
             yield new Promise((resolve, reject) => {
                 const req = http.request({
@@ -4015,6 +4278,7 @@ const stateHelper = __importStar(__nccwpck_require__(4866));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
 const step_checker_1 = __nccwpck_require__(9716);
 const internal_metrics_1 = __nccwpck_require__(7753);
+const mirrorTelemetry = __importStar(__nccwpck_require__(7185));
 function run() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
@@ -4057,6 +4321,8 @@ function cleanup() {
         let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed;
         let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut;
         if (exposeId && stickyDiskKey) {
+            // Sync result kept for the structured refresh maintenance row below.
+            let deferredSyncResult = null;
             // For shallow checkouts the checkout step never populates the workspace
             // from mirror refs, so the mirror sync is deferred here to keep the
             // checkout step fast.
@@ -4067,6 +4333,7 @@ function cleanup() {
                 if (repoUrl && authToken) {
                     core.startGroup('Syncing Blacksmith git mirror');
                     const syncResult = yield blacksmithCache.syncMirrorFromRemote(mirrorPath, repoUrl, authToken, stateHelper.BlacksmithCacheVerbose);
+                    deferredSyncResult = syncResult;
                     mirrorChanged = syncResult.changed;
                     mirrorSyncFailed = !syncResult.success && !syncResult.timedOut;
                     mirrorSyncTimedOut = syncResult.timedOut;
@@ -4145,6 +4412,13 @@ function cleanup() {
                     });
                 }
             }
+            // Structured maintenance rows (fire-and-forget; errors swallowed inside).
+            if (deferredSyncResult && !deferredSyncResult.skipped) {
+                yield mirrorTelemetry.reportMaintenance(mirrorTelemetry.maintenanceRunFromResult('refresh', stickyDiskKey, deferredSyncResult));
+            }
+            if (cleanupResult && mirrorPath && !cleanupResult.gcResult.skipped) {
+                yield mirrorTelemetry.reportMaintenance(mirrorTelemetry.maintenanceRunFromResult('gc', stickyDiskKey, cleanupResult.gcResult));
+            }
         }
     });
 }
@@ -4155,6 +4429,193 @@ if (!stateHelper.IsPost) {
 // Post
 else {
     cleanup();
+}
+
+
+/***/ }),
+
+/***/ 7185:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.maintenanceRunFromResult = maintenanceRunFromResult;
+exports.newCheckoutReport = newCheckoutReport;
+exports.dirSizeBytesOrNull = dirSizeBytesOrNull;
+exports.dirSizeBytes = dirSizeBytes;
+exports.refCount = refCount;
+exports.classifyError = classifyError;
+exports.reportCheckout = reportCheckout;
+exports.reportHydration = reportHydration;
+exports.reportMaintenance = reportMaintenance;
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const internal_metrics_1 = __nccwpck_require__(7753);
+/**
+ * Build a maintenance row from an operation result. Measurement fields are
+ * best-effort and default to 0 when the operation didn't record them.
+ */
+function maintenanceRunFromResult(op, stickyDiskKey, result) {
+    var _a, _b, _c;
+    const run = {
+        op,
+        sticky_disk_key: stickyDiskKey,
+        duration_ms: (_a = result.durationMs) !== null && _a !== void 0 ? _a : 0,
+        bytes: (_b = result.bytes) !== null && _b !== void 0 ? _b : 0,
+        outcome: result.success
+            ? 'success'
+            : result.timedOut
+                ? 'timeout'
+                : 'failure',
+        mirror_size_bytes: (_c = result.mirrorSizeBytes) !== null && _c !== void 0 ? _c : 0
+    };
+    if (!result.success && result.error) {
+        run.error_class = result.timedOut ? 'timeout' : 'error';
+    }
+    return run;
+}
+function newCheckoutReport() {
+    return {
+        serving_mode: 'bypass',
+        outcome: 'failure',
+        sticky_disk_key: '',
+        sticky_disk_setup_ms: 0,
+        clone_from_mirror_ms: 0,
+        delta_fetch_ms: 0,
+        delta_fetch_bytes: 0,
+        full_checkout_ms: 0,
+        submodules_ms: 0,
+        lfs_ms: 0,
+        total_ms: 0,
+        mirror_size_bytes: 0,
+        ref_count: 0,
+        shallow: false,
+        filter: false,
+        submodules_enabled: false,
+        lfs_enabled: false
+    };
+}
+// Hard cap on the `du` walk so a wedged or slow disk can never stall the
+// job on a measurement — the walk is telemetry, not work.
+const DIR_SIZE_TIMEOUT_SECS = 15;
+/**
+ * Directory size in bytes via `du -sb` (time-capped). Returns null on any
+ * failure so callers can tell "unmeasurable" apart from a real size — a
+ * missing byte count degrades the report, never the job.
+ */
+function dirSizeBytesOrNull(dir) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('timeout', [String(DIR_SIZE_TIMEOUT_SECS), 'du', '-sb', dir], {
+                ignoreReturnCode: true,
+                silent: true
+            });
+            if (result.exitCode !== 0) {
+                return null;
+            }
+            const size = parseInt(result.stdout.trim().split(/\s+/)[0], 10);
+            return isNaN(size) || size < 0 ? null : size;
+        }
+        catch (_a) {
+            return null;
+        }
+    });
+}
+/** Directory size in bytes, or 0 when it cannot be measured. */
+function dirSizeBytes(dir) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        return (_a = (yield dirSizeBytesOrNull(dir))) !== null && _a !== void 0 ? _a : 0;
+    });
+}
+/** Ref count of a git repository. Returns 0 on any failure. */
+function refCount(gitDir) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('git', ['-C', gitDir, 'show-ref'], {
+                ignoreReturnCode: true,
+                silent: true
+            });
+            if (result.exitCode !== 0) {
+                return 0;
+            }
+            const out = result.stdout.trim();
+            return out === '' ? 0 : out.split('\n').length;
+        }
+        catch (_a) {
+            return 0;
+        }
+    });
+}
+/** Short closed-ish error class from an unknown error; never customer data. */
+function classifyError(error) {
+    if (error instanceof Error && error.name && error.name !== 'Error') {
+        return error.name;
+    }
+    return 'error';
+}
+function reportCheckout(report) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            yield (0, internal_metrics_1.reportStructuredMetric)('git_mirror_checkout_report', report);
+        }
+        catch (error) {
+            core.debug(`[git-mirror] checkout report failed: ${error.message}`);
+        }
+    });
+}
+function reportHydration(report) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            yield (0, internal_metrics_1.reportStructuredMetric)('git_mirror_hydration_report', report);
+        }
+        catch (error) {
+            core.debug(`[git-mirror] hydration report failed: ${error.message}`);
+        }
+    });
+}
+function reportMaintenance(run) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            yield (0, internal_metrics_1.reportStructuredMetric)('git_mirror_maintenance_run', run);
+        }
+        catch (error) {
+            core.debug(`[git-mirror] maintenance report failed: ${error.message}`);
+        }
+    });
 }
 
 
