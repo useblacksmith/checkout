@@ -1140,18 +1140,7 @@ export async function copyRefsFromMirror(
       return false
     }
 
-    const alternatesPath = path.join(gitDir, 'objects', 'info', 'alternates')
-    const expectedAlternate = `${mirrorPath}/objects`
-    let hasMirrorAlternate = false
-    try {
-      const alternates = await fs.promises.readFile(alternatesPath, 'utf8')
-      hasMirrorAlternate = alternates
-        .split('\n')
-        .some(line => line.trim() === expectedAlternate)
-    } catch {
-      hasMirrorAlternate = false
-    }
-    if (!hasMirrorAlternate) {
+    if (!(await sharesMirrorObjects(workspacePath, mirrorPath))) {
       core.info(
         '[git-mirror] Workspace does not share the mirror object store, using local fetch instead of direct ref copy'
       )
@@ -1243,6 +1232,111 @@ export async function copyRefsFromMirror(
     )
     return false
   }
+}
+
+/**
+ * Whether the workspace's alternates file references this mirror's object
+ * directory, i.e. objects known to the mirror are readable from the
+ * workspace without being copied.
+ */
+export async function sharesMirrorObjects(
+  workspacePath: string,
+  mirrorPath: string
+): Promise<boolean> {
+  const alternatesPath = path.join(
+    workspacePath,
+    '.git',
+    'objects',
+    'info',
+    'alternates'
+  )
+  const expectedAlternate = `${mirrorPath}/objects`
+  try {
+    const alternates = await fs.promises.readFile(alternatesPath, 'utf8')
+    return alternates
+      .split('\n')
+      .some(line => line.trim() === expectedAlternate)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Mirror refs whose tips are worth offering as negotiation tips for a
+ * shallow fetch of `ref`: the mirror's copy of the same branch or tag, the
+ * pull request's base branch for refs/pull/*, and the mirror HEAD as the
+ * nearest commit for anything else (bare SHAs, new branches). Candidates
+ * are ordered by expected proximity to the wanted commit.
+ */
+export function shallowNegotiationTipRefs(
+  ref: string,
+  baseRef: string
+): string[] {
+  const upperRef = (ref || '').toUpperCase()
+  const candidates: string[] = []
+  if (ref && !upperRef.startsWith('REFS/')) {
+    candidates.push(`refs/heads/${ref}`, `refs/tags/${ref}`)
+  } else if (
+    upperRef.startsWith('REFS/HEADS/') ||
+    upperRef.startsWith('REFS/TAGS/')
+  ) {
+    candidates.push(ref)
+  } else if (upperRef.startsWith('REFS/PULL/') && baseRef) {
+    candidates.push(
+      baseRef.toUpperCase().startsWith('REFS/')
+        ? baseRef
+        : `refs/heads/${baseRef}`
+    )
+  }
+  candidates.push('HEAD')
+  return candidates
+}
+
+/**
+ * Resolve the negotiation tips for a shallow fetch of `ref` to commit ids
+ * present in the mirror (see shallowNegotiationTipRefs). Only tips that
+ * resolve are returned, deduplicated; an empty result means the fetch should
+ * negotiate without mirror knowledge.
+ *
+ * The tips are how the mirror pays off on the shallow path. Alternates make
+ * the mirror's objects readable from the workspace, but git also treats
+ * every alternate ref as a known-reachable tip: in a deepening fetch the
+ * post-fetch connectivity check then enumerates the entire mirror object
+ * graph (minutes of cold reads on a large mirror), and negotiation offers
+ * every mirror ref as a `have`. Disabling alternate ref discovery removes
+ * both, and these explicit tips restore the negotiation benefit - the
+ * server sends only the delta from the mirror's tip - bounded to a handful
+ * of commits. The tips never affect correctness: the shallow boundary, the
+ * fetched refs and the objects sent are decided by the server from the
+ * wants; a stale mirror only makes the pack larger.
+ */
+export async function resolveShallowNegotiationTips(
+  mirrorPath: string,
+  ref: string,
+  baseRef: string
+): Promise<string[]> {
+  const tips: string[] = []
+  for (const candidate of shallowNegotiationTipRefs(ref, baseRef)) {
+    const result = await exec.getExecOutput(
+      'git',
+      [
+        '-C',
+        mirrorPath,
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        `${candidate}^{commit}`
+      ],
+      {silent: true, ignoreReturnCode: true}
+    )
+    const sha = result.stdout.trim()
+    if (result.exitCode === 0 && /^[0-9a-f]{40,64}$/.test(sha)) {
+      if (!tips.includes(sha)) {
+        tips.push(sha)
+      }
+    }
+  }
+  return tips
 }
 
 /**

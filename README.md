@@ -48,6 +48,8 @@ When a mirror already exists, the action mounts its Sticky Disk and uses [Git's 
 
 The workspace then performs the normal upstream-compatible fetch. Objects already present in the mirror are reused locally, while objects that are newer than the mirror are fetched from GitHub. This means a stale mirror does not block checkout or prevent the requested commit from being fetched.
 
+For shallow checkouts (`fetch-depth` greater than 0), the fetch tells GitHub which commits the mirror already has for the requested branch or tag, so only the delta since the mirror was last refreshed is transferred. Git is also stopped from treating every mirror ref as a starting point for its post-fetch checks, which would otherwise cost time proportional to the whole mirror history rather than to the requested checkout.
+
 The mirror always contains full history, but the workspace still respects inputs such as `fetch-depth`, `fetch-tags`, sparse checkout, LFS, and submodules. For example, `fetch-depth: 1` still produces a shallow workspace checkout.
 
 ### 3. Post-job refresh

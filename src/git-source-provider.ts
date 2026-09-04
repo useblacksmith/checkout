@@ -11,6 +11,8 @@ import * as stateHelper from './state-helper'
 import * as urlHelper from './url-helper'
 import * as blacksmithCache from './blacksmith-cache'
 import {
+  FetchOptions,
+  MinimumGitAlternateRefsCommandVersion,
   MinimumGitSparseCheckoutVersion,
   IGitCommandManager
 } from './git-command-manager'
@@ -248,12 +250,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Fetch
     core.startGroup('Fetching the repository')
-    const fetchOptions: {
-      filter?: string
-      fetchDepth?: number
-      fetchTags?: boolean
-      showProgress?: boolean
-    } = {}
+    const fetchOptions: FetchOptions = {}
 
     if (settings.filter) {
       fetchOptions.filter = settings.filter
@@ -322,6 +319,33 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     } else {
       fetchOptions.fetchDepth = settings.fetchDepth
       fetchOptions.fetchTags = settings.fetchTags
+      // With the mirror attached as an alternate, git would treat every
+      // mirror ref as a known tip: the deepening fetch's connectivity check
+      // walks the whole mirror object graph and negotiation offers every
+      // mirror ref. Turn alternate ref discovery off and offer a few mirror
+      // tips explicitly instead, so the server still sends only the delta
+      // from the mirror (see resolveShallowNegotiationTips).
+      if (
+        cacheInfo &&
+        (await git.version()).checkMinimum(
+          MinimumGitAlternateRefsCommandVersion
+        ) &&
+        (await blacksmithCache.sharesMirrorObjects(
+          settings.repositoryPath,
+          cacheInfo.mirrorPath
+        ))
+      ) {
+        fetchOptions.ignoreAlternateRefs = true
+        fetchOptions.negotiationTips =
+          await blacksmithCache.resolveShallowNegotiationTips(
+            cacheInfo.mirrorPath,
+            settings.ref,
+            process.env['GITHUB_BASE_REF'] || ''
+          )
+        core.info(
+          `[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`
+        )
+      }
       const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
       await git.fetch(refSpec, fetchOptions)
     }

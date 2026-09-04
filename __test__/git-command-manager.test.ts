@@ -375,4 +375,46 @@ describe('Test fetchDepth and fetchTags options', () => {
       expect.any(Object)
     )
   })
+
+  it('should disable alternate ref discovery and pass negotiation tips for a shallow mirror fetch', async () => {
+    jest.spyOn(exec, 'exec').mockImplementation(mockExec)
+
+    const workingDirectory = 'test'
+    const lfs = false
+    const doSparseCheckout = false
+    git = await commandManager.createCommandManager(
+      workingDirectory,
+      lfs,
+      doSparseCheckout
+    )
+    const refSpec = ['refspec1']
+    const options = {
+      fetchDepth: 1,
+      fetchTags: false,
+      ignoreAlternateRefs: true,
+      negotiationTips: ['aaaa', 'bbbb']
+    }
+
+    await git.fetch(refSpec, options)
+
+    expect(mockExec).toHaveBeenCalledWith(
+      expect.any(String),
+      [
+        '-c',
+        'protocol.version=2',
+        '-c',
+        'core.alternateRefsCommand=true',
+        'fetch',
+        '--no-tags',
+        '--prune',
+        '--no-recurse-submodules',
+        '--negotiation-tip=aaaa',
+        '--negotiation-tip=bbbb',
+        '--depth=1',
+        'origin',
+        'refspec1'
+      ],
+      expect.any(Object)
+    )
+  })
 })
