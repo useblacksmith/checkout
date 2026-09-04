@@ -81,6 +81,10 @@ export interface CacheInfo {
   // performedHydration indicates that this job performed the initial git mirror clone.
   // Used to notify the backend on commit so it can mark hydration as complete.
   performedHydration: boolean
+  // commitEarlyDenyReason is non-empty when the host already knows this job's
+  // sticky disk commit will be denied (e.g. branch protection): the mirror can
+  // be used but changes to it are discarded at VM teardown.
+  commitEarlyDenyReason: string
 }
 
 /**
@@ -323,7 +327,8 @@ export async function setupCache(
         mirrorPath: '',
         hydrationInProgress: true,
         hydrationMessage,
-        performedHydration: false
+        performedHydration: false,
+        commitEarlyDenyReason: ''
       }
     }
     // Re-throw other errors
@@ -347,6 +352,15 @@ export async function setupCache(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
 
+  const commitEarlyDenyReason = response.commitEarlyDeny
+    ? response.commitEarlyDenyReason || 'denied by host policy'
+    : ''
+  if (commitEarlyDenyReason) {
+    core.notice(
+      `[git-mirror] Sticky disk changes will not be committed for this job (${commitEarlyDenyReason}). The git mirror cache is used as-is and any changes to it are discarded.`
+    )
+  }
+
   // Format if needed
   await waitForNonZeroDeviceSize(device, 10000)
   await maybeFormatDevice(device)
@@ -367,7 +381,8 @@ export async function setupCache(
     mountPoint,
     mirrorPath: getMirrorPath(owner, repo),
     hydrationInProgress: false,
-    performedHydration: false // Will be set by ensureMirror if we do initial clone
+    performedHydration: false, // Will be set by ensureMirror if we do initial clone
+    commitEarlyDenyReason
   }
 }
 
@@ -1811,7 +1826,13 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       vmHydratedGitMirror: vmHydratedGitMirror
     })
 
-    core.info('[git-mirror] Successfully committed sticky disk')
+    // The host applies the commit at VM teardown, after this step has ended;
+    // the RPC only records whether a commit was requested.
+    core.info(
+      shouldCommit
+        ? '[git-mirror] Sticky disk commit requested; applied at VM shutdown'
+        : '[git-mirror] Sticky disk released without commit'
+    )
   } catch (error) {
     core.warning(
       `[git-mirror] Failed to commit sticky disk: ${(error as any)?.message ?? error}`

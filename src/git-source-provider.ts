@@ -136,6 +136,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName)
           stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
           stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint)
+          stateHelper.setBlacksmithCacheCommitEarlyDenyReason(
+            cacheInfo.commitEarlyDenyReason
+          )
 
           const performedHydration = await blacksmithCache.ensureMirror(
             cacheInfo.mirrorPath,
