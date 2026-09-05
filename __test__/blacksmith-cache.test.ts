@@ -291,14 +291,78 @@ describe('blacksmith-cache tests', () => {
       expect(diff.negotiationTips).toEqual([shaA])
     })
 
-    it('falls back to the default branch tip when all changed refs are new', () => {
+    it('offers the default branch tip when all changed refs are new', () => {
       const lsRemote = `${shaA}\trefs/heads/main\n${shaC}\trefs/heads/feature\n`
       const local = `${shaA} refs/heads/main\n`
-      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local, {
+        defaultBranchRef: 'refs/heads/main'
+      })
       expect(diff.updatedRefSpecs).toEqual([
         '+refs/heads/feature:refs/heads/feature'
       ])
       expect(diff.negotiationTips).toEqual([shaA])
+    })
+
+    it('has no tips without hints when every changed ref is new', () => {
+      const lsRemote = `${shaA}\trefs/heads/main\n${shaC}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/main\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.negotiationTips).toEqual([])
+    })
+
+    it('offers the unchanged default branch tip before the old tip of a rewritten branch', () => {
+      const shaD = 'd'.repeat(40)
+      const lsRemote = `${shaA}\trefs/heads/trunk\n${shaD}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/trunk\n${shaB} refs/heads/feature\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local, {
+        defaultBranchRef: 'refs/heads/trunk'
+      })
+      expect(diff.updatedRefSpecs).toEqual([
+        '+refs/heads/feature:refs/heads/feature'
+      ])
+      expect(diff.negotiationTips).toEqual([shaA, shaB])
+    })
+
+    it('orders default branch, recent tips, then old tips, deduplicated and validated', () => {
+      const shaD = 'd'.repeat(40)
+      const shaE = 'e'.repeat(40)
+      const shaF = 'f'.repeat(40)
+      const lsRemote = `${shaA}\trefs/heads/develop\n${shaB}\trefs/heads/master\n${shaF}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/develop\n${shaB} refs/heads/master\n${shaC} refs/heads/feature\n${shaD} refs/heads/other\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local, {
+        defaultBranchRef: 'refs/heads/develop',
+        recentTips: [shaD, shaA, 'not-an-oid', shaE]
+      })
+      expect(diff.negotiationTips).toEqual([shaA, shaD, shaE, shaC])
+    })
+
+    it('ignores a default branch ref missing from the mirror', () => {
+      const lsRemote = `${shaB}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/feature\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local, {
+        defaultBranchRef: 'refs/heads/gone'
+      })
+      expect(diff.negotiationTips).toEqual([shaA])
+    })
+
+    it('keeps base tips when capping a very large batch of old tips', () => {
+      const changed: string[] = []
+      const localLines = [`${shaA} refs/heads/main`]
+      for (let i = 0; i < 1200; i++) {
+        const oldSha = i.toString(16).padStart(40, '0')
+        const newSha = i.toString(16).padStart(40, '1')
+        changed.push(`${newSha}\trefs/heads/b${i}`)
+        localLines.push(`${oldSha} refs/heads/b${i}`)
+      }
+      const lsRemote = `${shaA}\trefs/heads/main\n${changed.join('\n')}\n`
+      const diff = blacksmithCache.diffMirrorRefs(
+        lsRemote,
+        `${localLines.join('\n')}\n`,
+        {defaultBranchRef: 'refs/heads/main'}
+      )
+      expect(diff.updatedRefSpecs).toHaveLength(1200)
+      expect(diff.negotiationTips).toHaveLength(1000)
+      expect(diff.negotiationTips[0]).toBe(shaA)
     })
 
     it('detects refs deleted on the remote', () => {
