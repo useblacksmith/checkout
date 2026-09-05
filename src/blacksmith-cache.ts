@@ -567,8 +567,8 @@ interface RefDiff {
   // Commits passed as --negotiation-tip arguments so git only reports
   // commits reachable from these tips instead of walking every local ref
   // (mark_complete_local_refs is O(all refs) in cold-cache pack reads
-  // otherwise). Base tips (the mirror's default branch, main/master and the
-  // most recently committed branches) come first, then the old local tips
+  // otherwise). Base tips (the mirror's default branch and the most
+  // recently committed branches) come first, then the old local tips
   // of the refs being updated. The old tip alone is only a good common
   // ancestor for a fast-forward push; a rebased or brand-new branch shares
   // its history with the current base, not with its own previous tip, and
@@ -578,8 +578,8 @@ interface RefDiff {
 }
 
 interface NegotiationHints {
-  // Ref the mirror's HEAD points at (e.g. refs/heads/develop).
-  headRef?: string
+  // Default branch: the ref the mirror's HEAD points at, see mirrorHeadRef().
+  defaultBranchRef?: string
   // Tips of the most recently committed branches, see recentBranchTips().
   recentTips?: string[]
 }
@@ -644,16 +644,12 @@ export function diffMirrorRefs(
     }
   }
 
-  const baseTips: string[] = []
-  for (const ref of [hints.headRef, 'refs/heads/main', 'refs/heads/master']) {
-    const sha = ref ? localRefs.get(ref) : undefined
-    if (sha) {
-      baseTips.push(sha)
-    }
-  }
+  const defaultBranchTip = hints.defaultBranchRef
+    ? localRefs.get(hints.defaultBranchRef)
+    : undefined
   const negotiationTips = Array.from(
     new Set([
-      ...baseTips,
+      ...(defaultBranchTip ? [defaultBranchTip] : []),
       ...(hints.recentTips ?? []).filter(tip => OBJECT_ID_RE.test(tip)),
       ...oldTips
     ])
@@ -802,7 +798,11 @@ export async function recentBranchTips(
 }
 
 /**
- * Ref the mirror's HEAD symref points at, or undefined when detached/unset.
+ * Ref the mirror's HEAD symref points at - the upstream default branch as of
+ * `clone --mirror` - or undefined when detached/unset. Not refreshed from
+ * upstream on every sync: asking a remote for HEAD alone (`ls-remote origin
+ * HEAD`, `remote set-head -a`) sends no ref-prefix and pulls the complete
+ * advertisement, which the ls-remote-first sync exists to avoid.
  */
 export async function mirrorHeadRef(
   mirrorPath: string
@@ -899,12 +899,12 @@ export async function syncMirrorFromRemote(
       {silent: true}
     )
 
-    const [headRef, recentTips] = await Promise.all([
+    const [defaultBranchRef, recentTips] = await Promise.all([
       mirrorHeadRef(mirrorPath),
       recentBranchTips(mirrorPath)
     ])
     const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout, {
-      headRef,
+      defaultBranchRef,
       recentTips
     })
     core.info(

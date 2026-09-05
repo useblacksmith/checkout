@@ -557,15 +557,11 @@ function diffMirrorRefs(lsRemoteOutput, localRefsOutput, hints = {}) {
             }
         }
     }
-    const baseTips = [];
-    for (const ref of [hints.headRef, 'refs/heads/main', 'refs/heads/master']) {
-        const sha = ref ? localRefs.get(ref) : undefined;
-        if (sha) {
-            baseTips.push(sha);
-        }
-    }
+    const defaultBranchTip = hints.defaultBranchRef
+        ? localRefs.get(hints.defaultBranchRef)
+        : undefined;
     const negotiationTips = Array.from(new Set([
-        ...baseTips,
+        ...(defaultBranchTip ? [defaultBranchTip] : []),
         ...((_a = hints.recentTips) !== null && _a !== void 0 ? _a : []).filter(tip => OBJECT_ID_RE.test(tip)),
         ...oldTips
     ])).slice(0, MAX_NEGOTIATION_TIPS);
@@ -700,7 +696,11 @@ function recentBranchTips(mirrorPath_1) {
     });
 }
 /**
- * Ref the mirror's HEAD symref points at, or undefined when detached/unset.
+ * Ref the mirror's HEAD symref points at - the upstream default branch as of
+ * `clone --mirror` - or undefined when detached/unset. Not refreshed from
+ * upstream on every sync: asking a remote for HEAD alone (`ls-remote origin
+ * HEAD`, `remote set-head -a`) sends no ref-prefix and pulls the complete
+ * advertisement, which the ls-remote-first sync exists to avoid.
  */
 function mirrorHeadRef(mirrorPath) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -768,12 +768,12 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                 'refs/heads',
                 'refs/tags'
             ], { silent: true });
-            const [headRef, recentTips] = yield Promise.all([
+            const [defaultBranchRef, recentTips] = yield Promise.all([
                 mirrorHeadRef(mirrorPath),
                 recentBranchTips(mirrorPath)
             ]);
             const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout, {
-                headRef,
+                defaultBranchRef,
                 recentTips
             });
             core.info(`[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`);
