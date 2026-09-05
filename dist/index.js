@@ -51,6 +51,8 @@ exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.purgePullRefs = purgePullRefs;
 exports.parseMissingRemoteRefs = parseMissingRemoteRefs;
+exports.recentBranchTips = recentBranchTips;
+exports.mirrorHeadRef = mirrorHeadRef;
 exports.syncMirrorFromRemote = syncMirrorFromRemote;
 exports.mapMirrorRefToWorkspace = mapMirrorRefToWorkspace;
 exports.buildRefCopyInstructions = buildRefCopyInstructions;
@@ -98,6 +100,9 @@ const TIMEOUT_EXIT_CODE = 124;
 // Cap on --negotiation-tip arguments passed to the mirror sync fetch, to
 // bound the command line length when many refs changed at once.
 const MAX_NEGOTIATION_TIPS = 1000;
+// Number of most recently committed branch tips offered as negotiation tips
+// in addition to the changed refs' old tips.
+const RECENT_BRANCH_TIPS = 32;
 // Maximum number of times a mirror sync fetch is re-run after pruning refs
 // that were deleted on the remote between ls-remote and fetch.
 const MAX_VANISHED_REF_RETRIES = 5;
@@ -499,14 +504,16 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         return true; // Initial hydration performed
     });
 }
+const OBJECT_ID_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 /**
  * Compute the difference between the remote's advertised branch/tag tips
  * and the mirror's local refs.
  *
  * @param lsRemoteOutput - stdout of `git ls-remote --heads --tags origin`
  * @param localRefsOutput - stdout of `git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags`
+ * @param hints - extra commits to negotiate from, on top of the changed refs' old tips
  */
-function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
+function diffMirrorRefs(lsRemoteOutput, localRefsOutput, hints = {}) {
     var _a;
     const remoteRefs = new Map();
     for (const line of lsRemoteOutput.split('\n')) {
@@ -540,24 +547,24 @@ function diffMirrorRefs(lsRemoteOutput, localRefsOutput) {
         localRefs.set(refName, sha);
     }
     const updatedRefSpecs = [];
-    const negotiationTips = [];
+    const oldTips = [];
     for (const [refName, sha] of remoteRefs) {
         const localSha = localRefs.get(refName);
         if (localSha !== sha) {
             updatedRefSpecs.push(`+${refName}:${refName}`);
             if (localSha) {
-                negotiationTips.push(localSha);
+                oldTips.push(localSha);
             }
         }
     }
-    if (negotiationTips.length === 0) {
-        // Every changed ref is new locally; negotiate from the default branch
-        // tip so the server still learns about the bulk of shared history.
-        const fallback = (_a = localRefs.get('refs/heads/main')) !== null && _a !== void 0 ? _a : localRefs.get('refs/heads/master');
-        if (fallback) {
-            negotiationTips.push(fallback);
-        }
-    }
+    const defaultBranchTip = hints.defaultBranchRef
+        ? localRefs.get(hints.defaultBranchRef)
+        : undefined;
+    const negotiationTips = Array.from(new Set([
+        ...(defaultBranchTip ? [defaultBranchTip] : []),
+        ...((_a = hints.recentTips) !== null && _a !== void 0 ? _a : []).filter(tip => OBJECT_ID_RE.test(tip)),
+        ...oldTips
+    ])).slice(0, MAX_NEGOTIATION_TIPS);
     const deletedRefs = [];
     for (const refName of localRefs.keys()) {
         if (!remoteRefs.has(refName)) {
@@ -653,6 +660,61 @@ function parseMissingRemoteRefs(stderr) {
     }
     return refs;
 }
+/**
+ * Tips of the most recently committed branches in the mirror, newest first.
+ * Sorting by committer date parses every branch tip's commit, which is only
+ * cheap when a commit-graph serves the dates; without one this returns
+ * nothing rather than paying for scattered pack reads on a cold disk.
+ */
+function recentBranchTips(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, count = RECENT_BRANCH_TIPS) {
+        if (!hasCommitGraph(mirrorPath)) {
+            return [];
+        }
+        try {
+            const result = yield exec.getExecOutput('git', [
+                '-C',
+                mirrorPath,
+                'for-each-ref',
+                '--sort=-committerdate',
+                `--count=${count}`,
+                '--format=%(objectname)',
+                'refs/heads'
+            ], { silent: true, ignoreReturnCode: true });
+            if (result.exitCode !== 0) {
+                return [];
+            }
+            return result.stdout
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => OBJECT_ID_RE.test(line));
+        }
+        catch (error) {
+            core.debug(`[git-mirror] recent branch tips unavailable: ${error}`);
+            return [];
+        }
+    });
+}
+/**
+ * Ref the mirror's HEAD symref points at - the upstream default branch as of
+ * `clone --mirror` - or undefined when detached/unset. Not refreshed from
+ * upstream on every sync: asking a remote for HEAD alone (`ls-remote origin
+ * HEAD`, `remote set-head -a`) sends no ref-prefix and pulls the complete
+ * advertisement, which the ls-remote-first sync exists to avoid.
+ */
+function mirrorHeadRef(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('git', ['-C', mirrorPath, 'symbolic-ref', '-q', 'HEAD'], { silent: true, ignoreReturnCode: true });
+            const ref = result.stdout.trim();
+            return result.exitCode === 0 && ref.startsWith('refs/') ? ref : undefined;
+        }
+        catch (error) {
+            core.debug(`[git-mirror] HEAD ref unavailable: ${error}`);
+            return undefined;
+        }
+    });
+}
 function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false, timeoutSecs = REFRESH_TIMEOUT_SECS) {
         if (!fs.existsSync(mirrorPath)) {
@@ -706,7 +768,14 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                 'refs/heads',
                 'refs/tags'
             ], { silent: true });
-            const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout);
+            const [defaultBranchRef, recentTips] = yield Promise.all([
+                mirrorHeadRef(mirrorPath),
+                recentBranchTips(mirrorPath)
+            ]);
+            const diff = diffMirrorRefs(lsRemoteOutput, localRefsResult.stdout, {
+                defaultBranchRef,
+                recentTips
+            });
             core.info(`[git-mirror] ls-remote finished in ${Date.now() - lsRemoteStart}ms: ${diff.remoteRefCount} remote refs, ${diff.updatedRefSpecs.length} changed, ${diff.deletedRefs.length} deleted`);
             // Purge legacy refs/pull/* before fetching so the fetch's local ref
             // walk no longer covers them. A purge is a real mirror change that
@@ -756,14 +825,12 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         'fetch',
                         '--no-tags',
                         '--stdin',
-                        // Restrict negotiation to the changed refs' old tips. Without
-                        // this, git's mark_complete_local_refs walks every local ref and
-                        // parses each tip commit out of the pack - tens of seconds of
-                        // random reads on a large mirror when the sticky disk's pages are
-                        // cold.
-                        ...diff.negotiationTips
-                            .slice(0, MAX_NEGOTIATION_TIPS)
-                            .map(tip => `--negotiation-tip=${tip}`),
+                        // Restrict negotiation to the base tips and the changed refs' old
+                        // tips (see RefDiff.negotiationTips). Without this, git's
+                        // mark_complete_local_refs walks every local ref and parses each
+                        // tip commit out of the pack - tens of seconds of random reads on
+                        // a large mirror when the sticky disk's pages are cold.
+                        ...diff.negotiationTips.map(tip => `--negotiation-tip=${tip}`),
                         'origin'
                     ];
                     if (verbose) {
