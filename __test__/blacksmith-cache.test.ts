@@ -301,6 +301,49 @@ describe('blacksmith-cache tests', () => {
       expect(diff.negotiationTips).toEqual([shaA])
     })
 
+    it('offers the unchanged main tip before the old tip of a rewritten branch', () => {
+      const shaD = 'd'.repeat(40)
+      const lsRemote = `${shaA}\trefs/heads/main\n${shaD}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/main\n${shaB} refs/heads/feature\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local)
+      expect(diff.updatedRefSpecs).toEqual([
+        '+refs/heads/feature:refs/heads/feature'
+      ])
+      expect(diff.negotiationTips).toEqual([shaA, shaB])
+    })
+
+    it('offers HEAD, main/master and recent tips ahead of old tips, deduplicated', () => {
+      const shaD = 'd'.repeat(40)
+      const shaE = 'e'.repeat(40)
+      const shaF = 'f'.repeat(40)
+      const lsRemote = `${shaA}\trefs/heads/develop\n${shaB}\trefs/heads/master\n${shaF}\trefs/heads/feature\n`
+      const local = `${shaA} refs/heads/develop\n${shaB} refs/heads/master\n${shaC} refs/heads/feature\n${shaD} refs/heads/other\n`
+      const diff = blacksmithCache.diffMirrorRefs(lsRemote, local, {
+        headRef: 'refs/heads/develop',
+        recentTips: [shaD, shaA, 'not-an-oid', shaE]
+      })
+      expect(diff.negotiationTips).toEqual([shaA, shaB, shaD, shaE, shaC])
+    })
+
+    it('keeps base tips when capping a very large batch of old tips', () => {
+      const changed: string[] = []
+      const localLines = [`${shaA} refs/heads/main`]
+      for (let i = 0; i < 1200; i++) {
+        const oldSha = i.toString(16).padStart(40, '0')
+        const newSha = i.toString(16).padStart(40, '1')
+        changed.push(`${newSha}\trefs/heads/b${i}`)
+        localLines.push(`${oldSha} refs/heads/b${i}`)
+      }
+      const lsRemote = `${shaA}\trefs/heads/main\n${changed.join('\n')}\n`
+      const diff = blacksmithCache.diffMirrorRefs(
+        lsRemote,
+        `${localLines.join('\n')}\n`
+      )
+      expect(diff.updatedRefSpecs).toHaveLength(1200)
+      expect(diff.negotiationTips).toHaveLength(1000)
+      expect(diff.negotiationTips[0]).toBe(shaA)
+    })
+
     it('detects refs deleted on the remote', () => {
       const lsRemote = `${shaA}\trefs/heads/main\n`
       const local = `${shaA} refs/heads/main\n${shaB} refs/heads/gone\n`
