@@ -122,6 +122,14 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
+      # Verified before the next step mounts its own copy of the sticky disk
+      # over the same path: objects that only the current mount's sync added
+      # are not visible through a later mount.
+      - name: Verify filtered deep checkout is a full clone backed by the mirror
+        run: |
+          __test__/verify-mirror-no-filter.sh filter-checkout
+          test -f filter-checkout/action.yml
+
       - name: Test sparse checkout (mirror provides the objects)
         uses: ./
         with:
@@ -130,40 +138,11 @@ jobs:
             __test__
             .github
 
-      - name: Verify filtered checkouts are full clones backed by the mirror
+      - name: Verify sparse checkout is a full clone backed by the mirror
         run: |
-          set -euo pipefail
-          for ws in filter-checkout sparse-checkout; do
-            cd "$ws"
-
-            # No partial-clone state: no promisor packs, no promisor remote
-            if ls .git/objects/pack/*.promisor >/dev/null 2>&1; then
-              echo "$ws: unexpected promisor pack"
-              exit 1
-            fi
-            if git config --local --get remote.origin.promisor >/dev/null \
-               || git config --local --get remote.origin.partialclonefilter >/dev/null; then
-              echo "$ws: unexpected partial clone configuration"
-              exit 1
-            fi
-
-            # Only the objects the mirror lacked may live in the workspace
-            in_pack=$(git count-objects -v | awk '/^in-pack:/ {print $2}')
-            loose=$(git count-objects -v | awk '/^count:/ {print $2}')
-            echo "$ws: $in_pack packed + $loose loose local objects"
-            if [ "$((in_pack + loose))" -gt 1000 ]; then
-              echo "$ws: mirror history was copied into the workspace"
-              exit 1
-            fi
-
-            git fsck --connectivity-only --no-dangling
-            cd ..
-          done
-
-          test -f filter-checkout/action.yml
+          __test__/verify-mirror-no-filter.sh sparse-checkout
           test -f sparse-checkout/.github/workflows/test-blacksmith.yml
           if [ -f sparse-checkout/action.yml ]; then
             echo "sparse-checkout: cone pattern was not applied"
             exit 1
           fi
-          echo "Filtered checkouts verified"
