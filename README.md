@@ -52,6 +52,8 @@ For shallow checkouts (`fetch-depth` greater than 0), the fetch tells GitHub whi
 
 The mirror always contains full history, but the workspace still respects inputs such as `fetch-depth`, `fetch-tags`, sparse checkout, LFS, and submodules. For example, `fetch-depth: 1` still produces a shallow workspace checkout.
 
+The one input that is not passed through is `filter` (and the `blob:none` filter that sparse checkout implies). Every object a filter would omit is already available through the mirror, so the workspace is fetched without a filter and is a regular, not partial, clone. Honouring the filter would make the fetch far slower, not faster: on Git 2.48 and later, indexing a filtered pack repacks every mirror object reachable from the fetched commits into the workspace. When the action falls back to a standard checkout, `filter` behaves as in `actions/checkout`.
+
 ### 3. Post-job refresh
 
 The action refreshes an existing mirror with `git fetch --prune` during post-job cleanup, outside the critical checkout path. This prepares the mirror for subsequent workflow runs without delaying the checkout step itself.

@@ -61,6 +61,8 @@ inputs:
     description: >
       Partially clone against a given filter.
       Overrides sparse-checkout if set.
+      Ignored when the workspace shares a Blacksmith git mirror, which already
+      holds every object the filter would omit.
     default: null
   sparse-checkout:
     description: >
