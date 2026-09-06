@@ -142,7 +142,7 @@ jobs:
         run: |
           __test__/verify-mirror-no-filter.sh sparse-checkout
           test -f sparse-checkout/.github/workflows/test-blacksmith.yml
-          if [ -f sparse-checkout/action.yml ]; then
+          if [ -d sparse-checkout/src ]; then
             echo "sparse-checkout: cone pattern was not applied"
             exit 1
           fi
