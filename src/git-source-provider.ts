@@ -252,10 +252,28 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     core.startGroup('Fetching the repository')
     const fetchOptions: FetchOptions = {}
 
-    if (settings.filter) {
-      fetchOptions.filter = settings.filter
-    } else if (settings.sparseCheckout) {
-      fetchOptions.filter = 'blob:none'
+    const sharesMirrorObjects =
+      !!cacheInfo &&
+      (await blacksmithCache.sharesMirrorObjects(
+        settings.repositoryPath,
+        cacheInfo.mirrorPath
+      ))
+
+    const filter = settings.filter
+      ? settings.filter
+      : settings.sparseCheckout
+        ? 'blob:none'
+        : undefined
+    if (filter && sharesMirrorObjects) {
+      // The mirror alternate already holds every object the filter would omit,
+      // and a filtered fetch makes the workspace a partial clone whose
+      // index-pack (git >= 2.48) repacks all mirror objects reachable from the
+      // fetched commits into a local promisor pack.
+      core.info(
+        `[git-mirror] Fetching without --filter=${filter}: the mirror already provides every object`
+      )
+    } else if (filter) {
+      fetchOptions.filter = filter
     }
 
     if (settings.fetchDepth <= 0) {
@@ -327,13 +345,10 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       // from the mirror (see resolveShallowNegotiationTips).
       if (
         cacheInfo &&
+        sharesMirrorObjects &&
         (await git.version()).checkMinimum(
           MinimumGitAlternateRefsCommandVersion
-        ) &&
-        (await blacksmithCache.sharesMirrorObjects(
-          settings.repositoryPath,
-          cacheInfo.mirrorPath
-        ))
+        )
       ) {
         fetchOptions.ignoreAlternateRefs = true
         fetchOptions.negotiationTips =

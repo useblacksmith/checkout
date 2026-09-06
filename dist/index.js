@@ -3304,11 +3304,22 @@ function getSource(settings) {
             // Fetch
             core.startGroup('Fetching the repository');
             const fetchOptions = {};
-            if (settings.filter) {
-                fetchOptions.filter = settings.filter;
+            const sharesMirrorObjects = !!cacheInfo &&
+                (yield blacksmithCache.sharesMirrorObjects(settings.repositoryPath, cacheInfo.mirrorPath));
+            const filter = settings.filter
+                ? settings.filter
+                : settings.sparseCheckout
+                    ? 'blob:none'
+                    : undefined;
+            if (filter && sharesMirrorObjects) {
+                // The mirror alternate already holds every object the filter would omit,
+                // and a filtered fetch makes the workspace a partial clone whose
+                // index-pack (git >= 2.48) repacks all mirror objects reachable from the
+                // fetched commits into a local promisor pack.
+                core.info(`[git-mirror] Fetching without --filter=${filter}: the mirror already provides every object`);
             }
-            else if (settings.sparseCheckout) {
-                fetchOptions.filter = 'blob:none';
+            else if (filter) {
+                fetchOptions.filter = filter;
             }
             if (settings.fetchDepth <= 0) {
                 // When the Blacksmith mirror is available and synced with the remote,
@@ -3367,8 +3378,8 @@ function getSource(settings) {
                 // tips explicitly instead, so the server still sends only the delta
                 // from the mirror (see resolveShallowNegotiationTips).
                 if (cacheInfo &&
-                    (yield git.version()).checkMinimum(git_command_manager_1.MinimumGitAlternateRefsCommandVersion) &&
-                    (yield blacksmithCache.sharesMirrorObjects(settings.repositoryPath, cacheInfo.mirrorPath))) {
+                    sharesMirrorObjects &&
+                    (yield git.version()).checkMinimum(git_command_manager_1.MinimumGitAlternateRefsCommandVersion)) {
                     fetchOptions.ignoreAlternateRefs = true;
                     fetchOptions.negotiationTips =
                         yield blacksmithCache.resolveShallowNegotiationTips(cacheInfo.mirrorPath, settings.ref, process.env['GITHUB_BASE_REF'] || '');
