@@ -402,6 +402,35 @@ function getAuthConfigArgs(
 }
 
 /**
+ * Jobs sharing a mirror do not all run as the same user: a VM job runs git
+ * as the runner user, a job container typically as root. Git refuses a
+ * repository owned by someone else ("dubious ownership"), and the runner
+ * user cannot write into a root-owned one, so a mirror hydrated by the
+ * other kind of job is taken over before it is read or synced.
+ */
+async function adoptMirrorOwnership(mirrorPath: string): Promise<void> {
+  const uid = process.getuid?.()
+  const gid = process.getgid?.()
+  if (uid === undefined || gid === undefined) {
+    return
+  }
+  const owner = (await fs.promises.stat(mirrorPath)).uid
+  if (owner === uid) {
+    return
+  }
+  const start = Date.now()
+  await exec.exec('sudo', [
+    'chown',
+    '-R',
+    `${uid}:${gid}`,
+    path.dirname(mirrorPath)
+  ])
+  core.info(
+    `[git-mirror] Took over mirror owned by uid ${owner} in ${Date.now() - start}ms`
+  )
+}
+
+/**
  * Build git environment with optional verbose flags
  */
 function buildGitEnv(
@@ -496,6 +525,7 @@ export async function ensureMirror(
     // Mirror exists - the caller synchronizes it with the remote via
     // syncMirrorFromRemote() before populating the workspace from it
     core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`)
+    await adoptMirrorOwnership(mirrorPath)
     return false // Not initial hydration
   }
 
@@ -1214,11 +1244,17 @@ export function buildPackedRefsContent(mirrorRefs: string): string {
  * checkout in a reused workspace, so scripts never read fetch output that
  * predates this ref state.
  *
+ * `env` is the checkout's git environment (see
+ * IGitCommandManager.getEnvironment); the workspace directory may be owned
+ * by another user than the one running git (job containers), and only its
+ * temporary global config marks the workspace as a safe.directory.
+ *
  * @returns true on success, false if the caller should fall back
  */
 export async function copyRefsFromMirror(
   workspacePath: string,
-  mirrorPath: string
+  mirrorPath: string,
+  env?: {[key: string]: string}
 ): Promise<boolean> {
   try {
     const start = Date.now()
@@ -1245,7 +1281,7 @@ export async function copyRefsFromMirror(
     const refStorage = await exec.getExecOutput(
       'git',
       ['-C', workspacePath, 'config', '--get', 'extensions.refstorage'],
-      {silent: true, ignoreReturnCode: true}
+      {silent: true, ignoreReturnCode: true, env}
     )
     const refBackend = refStorage.stdout.trim()
     if (refBackend !== '' && refBackend !== 'files') {
@@ -1277,7 +1313,7 @@ export async function copyRefsFromMirror(
         'refs/remotes/origin',
         'refs/tags'
       ],
-      {silent: true}
+      {silent: true, env}
     )
 
     const packedRefsPath = path.join(gitDir, 'packed-refs')
@@ -1306,10 +1342,12 @@ export async function copyRefsFromMirror(
     if (instructions.length > 0) {
       await exec.exec('git', ['-C', workspacePath, 'update-ref', '--stdin'], {
         silent: true,
-        input: Buffer.from(`${instructions.join('\n')}\n`)
+        input: Buffer.from(`${instructions.join('\n')}\n`),
+        env
       })
       await exec.exec('git', ['-C', workspacePath, 'pack-refs', '--all'], {
-        silent: true
+        silent: true,
+        env
       })
     }
     core.info(
@@ -1462,26 +1500,31 @@ async function removeStaleFetchHead(gitDir: string): Promise<void> {
  */
 export async function fetchRefsFromMirror(
   workspacePath: string,
-  mirrorPath: string
+  mirrorPath: string,
+  env?: {[key: string]: string}
 ): Promise<boolean> {
   core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`)
-  if (await copyRefsFromMirror(workspacePath, mirrorPath)) {
+  if (await copyRefsFromMirror(workspacePath, mirrorPath, env)) {
     return true
   }
   try {
-    await exec.exec('git', [
-      '-C',
-      workspacePath,
-      '-c',
-      'gc.auto=0',
-      'fetch',
-      '--prune',
-      '--no-tags',
-      '--no-recurse-submodules',
-      mirrorPath,
-      '+refs/heads/*:refs/remotes/origin/*',
-      '+refs/tags/*:refs/tags/*'
-    ])
+    await exec.exec(
+      'git',
+      [
+        '-C',
+        workspacePath,
+        '-c',
+        'gc.auto=0',
+        'fetch',
+        '--prune',
+        '--no-tags',
+        '--no-recurse-submodules',
+        mirrorPath,
+        '+refs/heads/*:refs/remotes/origin/*',
+        '+refs/tags/*:refs/tags/*'
+      ],
+      {env}
+    )
     return true
   } catch (error) {
     core.warning(
@@ -1512,11 +1555,14 @@ export async function writeAlternates(
  * Dissociate the repository from the mirror by copying all objects locally
  * This is needed for Docker-based actions that may not have access to the mirror mount
  */
-export async function dissociate(workspacePath: string): Promise<void> {
+export async function dissociate(
+  workspacePath: string,
+  env?: {[key: string]: string}
+): Promise<void> {
   core.info('Dissociating repository from mirror')
 
   // Copy all objects from alternates into local repo
-  await exec.exec('git', ['-C', workspacePath, 'repack', '-a', '-d'])
+  await exec.exec('git', ['-C', workspacePath, 'repack', '-a', '-d'], {env})
 
   // Remove alternates file
   const alternatesFile = path.join(

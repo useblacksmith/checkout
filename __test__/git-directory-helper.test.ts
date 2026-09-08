@@ -471,6 +471,7 @@ async function setup(testName: string): Promise<void> {
     configExists: jest.fn(),
     fetch: jest.fn(),
     getDefaultBranch: jest.fn(),
+    getEnvironment: jest.fn(() => ({})),
     getSubmoduleConfigPaths: jest.fn(async () => []),
     getWorkingDirectory: jest.fn(() => repositoryPath),
     init: jest.fn(),
