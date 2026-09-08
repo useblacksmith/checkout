@@ -1,8 +1,8 @@
 ---
 name: "@buf/blacksmith_vm-agent.connectrpc_es"
-version: 1.6.1-20260115212136-f78b3d5805ba.2
+version: 1.6.1-20260908145150-8ba6e8a5a8a5.2
 type: npm
-summary: This package contains generated code for the protobuf module buf.build/blacksmith/vm-agent:f78b3d5805ba4ceebc39dfa2fdb3ed1e
+summary: This package contains generated code for the protobuf module buf.build/blacksmith/vm-agent:8ba6e8a5a8a5415085a5b6a657dc9892
   when generated with the plugin buf.build/connectrpc/es:v1.6.1 revision:2
 homepage:
 license: apache-2.0
