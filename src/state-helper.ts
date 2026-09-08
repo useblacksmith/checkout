@@ -64,6 +64,14 @@ export const BlacksmithCachePerformedHydration =
   core.getState('blacksmithCachePerformedHydration') === 'true'
 
 /**
+ * Whether the agent reported at expose time that this job's sticky disk
+ * commit will be denied (e.g. sticky disk branch protection). The POST
+ * action then releases the disk without maintenance or a commit request.
+ */
+export const BlacksmithCacheCommitDenied =
+  core.getState('blacksmithCacheCommitDenied') === 'true'
+
+/**
  * Whether the main step's mirror sync changed the mirror. Used by the POST
  * action to decide whether the sticky disk needs to be committed.
  */
@@ -170,6 +178,13 @@ export function setBlacksmithCachePerformedHydration(performed: boolean) {
     'blacksmithCachePerformedHydration',
     performed ? 'true' : 'false'
   )
+}
+
+/**
+ * Save whether the agent reported that this job's sticky disk commit will be denied.
+ */
+export function setBlacksmithCacheCommitDenied(denied: boolean) {
+  core.saveState('blacksmithCacheCommitDenied', denied ? 'true' : 'false')
 }
 
 /**

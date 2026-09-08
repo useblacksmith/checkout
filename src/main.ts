@@ -46,6 +46,7 @@ async function cleanup(): Promise<void> {
   const mountPoint = stateHelper.BlacksmithCacheMountPoint
   const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
   const performedHydration = stateHelper.BlacksmithCachePerformedHydration
+  const commitDenied = stateHelper.BlacksmithCacheCommitDenied
   let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged
   let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed
   let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut
@@ -89,7 +90,11 @@ async function cleanup(): Promise<void> {
       let shouldCommit = true
       let skipReason = ''
 
-      if (failureCheck.error) {
+      if (commitDenied) {
+        shouldCommit = false
+        skipReason =
+          'The agent reported at setup that this job may not commit the sticky disk'
+      } else if (failureCheck.error) {
         // If we can't determine failure status, skip commit to be safe
         shouldCommit = false
         skipReason = `Unable to check for step failures: ${failureCheck.error}`
@@ -135,7 +140,7 @@ async function cleanup(): Promise<void> {
         stickyDiskKey,
         repoName: repoName || undefined,
         mountPoint: mountPoint || undefined,
-        mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
+        mirrorPath: shouldCommit ? mirrorPath || undefined : undefined,
         shouldCommit,
         vmHydratedGitMirror,
         mirrorSyncFailed,

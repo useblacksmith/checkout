@@ -138,48 +138,58 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
           stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName)
           stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath)
           stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint)
+          stateHelper.setBlacksmithCacheCommitDenied(cacheInfo.commitDenied)
 
-          const performedHydration = await blacksmithCache.ensureMirror(
-            cacheInfo.mirrorPath,
-            repositoryUrl,
-            settings.authToken,
-            settings.verbose
-          )
-          stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
-
-          if (performedHydration) {
-            // A freshly-cloned mirror is exactly the remote's current state
-            mirrorFresh = true
-            stateHelper.setBlacksmithCacheMirrorChanged(true)
-          } else if (settings.fetchDepth <= 0) {
-            // Bring the mirror's branch/tag refs up to date with the remote
-            // (ls-remote diff + targeted fetch of only the changed refs), so
-            // the workspace can be populated from the mirror with the same
-            // freshness as a direct network fetch.
-            const syncResult = await blacksmithCache.syncMirrorFromRemote(
+          if (blacksmithCache.shouldSkipHydration(cacheInfo)) {
+            core.warning(
+              '[git-mirror] Mirror is not hydrated yet and this job cannot commit the sticky disk; skipping hydration and cloning directly from GitHub. The mirror will be hydrated by a job that is allowed to commit.'
+            )
+            cacheInfo = null
+            core.endGroup()
+          } else {
+            const performedHydration = await blacksmithCache.ensureMirror(
               cacheInfo.mirrorPath,
               repositoryUrl,
               settings.authToken,
               settings.verbose
             )
-            mirrorFresh = syncResult.success
-            stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed)
-            stateHelper.setBlacksmithCacheMirrorSyncFailed(
-              !syncResult.success && !syncResult.timedOut
-            )
-            stateHelper.setBlacksmithCacheMirrorSyncTimedOut(
-              syncResult.timedOut
-            )
-          } else {
-            // Shallow checkouts never populate the workspace from mirror
-            // refs, so the checkout step doesn't need a fresh mirror. Defer
-            // the mirror sync to the post step to keep the checkout step
-            // fast.
-            stateHelper.setBlacksmithCacheMirrorSyncDeferred(true)
-            stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
-            stateHelper.setBlacksmithCacheVerbose(settings.verbose)
+            stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
+
+            if (performedHydration) {
+              // A freshly-cloned mirror is exactly the remote's current state
+              mirrorFresh = true
+              stateHelper.setBlacksmithCacheMirrorChanged(true)
+            } else if (settings.fetchDepth <= 0) {
+              // Bring the mirror's branch/tag refs up to date with the remote
+              // (ls-remote diff + targeted fetch of only the changed refs), so
+              // the workspace can be populated from the mirror with the same
+              // freshness as a direct network fetch.
+              const syncResult = await blacksmithCache.syncMirrorFromRemote(
+                cacheInfo.mirrorPath,
+                repositoryUrl,
+                settings.authToken,
+                settings.verbose
+              )
+              mirrorFresh = syncResult.success
+              stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed)
+              stateHelper.setBlacksmithCacheMirrorSyncFailed(
+                !syncResult.success && !syncResult.timedOut
+              )
+              stateHelper.setBlacksmithCacheMirrorSyncTimedOut(
+                syncResult.timedOut
+              )
+            } else if (!cacheInfo.commitDenied) {
+              // Shallow checkouts never populate the workspace from mirror
+              // refs, so the checkout step doesn't need a fresh mirror. Defer
+              // the mirror sync to the post step to keep the checkout step
+              // fast. A sync whose result cannot be committed is not worth
+              // running at all.
+              stateHelper.setBlacksmithCacheMirrorSyncDeferred(true)
+              stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl)
+              stateHelper.setBlacksmithCacheVerbose(settings.verbose)
+            }
+            core.endGroup()
           }
-          core.endGroup()
         }
       } catch (error) {
         core.endGroup()

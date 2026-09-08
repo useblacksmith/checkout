@@ -47,6 +47,8 @@ exports.isAllowedInsideContainer = isAllowedInsideContainer;
 exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
 exports.setupCache = setupCache;
+exports.mirrorExists = mirrorExists;
+exports.shouldSkipHydration = shouldSkipHydration;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.purgePullRefs = purgePullRefs;
@@ -73,7 +75,7 @@ const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
 const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
-const stickydisk_connect_1 = __nccwpck_require__(2880);
+const stickydisk_connect_1 = __nccwpck_require__(783);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const container_detector_1 = __nccwpck_require__(6424);
 // Without a deadline, a black-holed dial stalls the checkout until the OS
@@ -314,7 +316,8 @@ function setupCache(owner, repo) {
                     mirrorPath: '',
                     hydrationInProgress: true,
                     hydrationMessage,
-                    performedHydration: false
+                    performedHydration: false,
+                    commitDenied: false
                 };
             }
             // Re-throw other errors
@@ -332,6 +335,11 @@ function setupCache(owner, repo) {
             throw new Error('No exposeId found in sticky disk response');
         }
         core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
+        const commitDenied = response.commitEarlyDeny === true;
+        const commitDeniedReason = response.commitEarlyDenyReason || undefined;
+        if (commitDenied) {
+            core.info(`[git-mirror] Changes to the sticky disk will not be committed for this job: ${commitDeniedReason !== null && commitDeniedReason !== void 0 ? commitDeniedReason : 'commit denied by the agent'}`);
+        }
         // Format if needed
         yield waitForNonZeroDeviceSize(device, 10000);
         yield maybeFormatDevice(device);
@@ -350,7 +358,9 @@ function setupCache(owner, repo) {
             mountPoint,
             mirrorPath: getMirrorPath(owner, repo),
             hydrationInProgress: false,
-            performedHydration: false // Will be set by ensureMirror if we do initial clone
+            performedHydration: false, // Will be set by ensureMirror if we do initial clone
+            commitDenied,
+            commitDeniedReason
         };
     });
 }
@@ -434,6 +444,18 @@ function summarizeTrace2Perf(trace2PerfPath, title) {
         fs.rmSync(trace2PerfPath, { force: true });
     }
 }
+function mirrorExists(mirrorPath) {
+    return fs.existsSync(mirrorPath);
+}
+/**
+ * An initial clone by a job whose sticky disk commit is already known to be
+ * denied is discarded at teardown, and the next job would redo it. Such a
+ * job leaves hydration to one that is allowed to commit and clones directly
+ * from the remote instead; an already hydrated mirror is still used.
+ */
+function shouldSkipHydration(cacheInfo) {
+    return cacheInfo.commitDenied && !mirrorExists(cacheInfo.mirrorPath);
+}
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
  * If the mirror already exists, it is left as-is; the caller brings it up to
@@ -452,7 +474,7 @@ function summarizeTrace2Perf(trace2PerfPath, title) {
 function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
         var _a, _b, _c, _d;
-        if (fs.existsSync(mirrorPath)) {
+        if (mirrorExists(mirrorPath)) {
             // Mirror exists - the caller synchronizes it with the remote via
             // syncMirrorFromRemote() before populating the workspace from it
             core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`);
@@ -1630,7 +1652,9 @@ function cleanup(options) {
                 stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
                 vmHydratedGitMirror: vmHydratedGitMirror
             });
-            core.info('[git-mirror] Successfully committed sticky disk');
+            core.info(shouldCommit
+                ? '[git-mirror] Requested sticky disk commit'
+                : '[git-mirror] Released sticky disk without commit');
         }
         catch (error) {
             core.warning(`[git-mirror] Failed to commit sticky disk: ${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
@@ -3223,34 +3247,43 @@ function getSource(settings) {
                         stateHelper.setBlacksmithCacheRepoName(cacheInfo.repoName);
                         stateHelper.setBlacksmithCacheMirrorPath(cacheInfo.mirrorPath);
                         stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint);
-                        const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
-                        stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
-                        if (performedHydration) {
-                            // A freshly-cloned mirror is exactly the remote's current state
-                            mirrorFresh = true;
-                            stateHelper.setBlacksmithCacheMirrorChanged(true);
-                        }
-                        else if (settings.fetchDepth <= 0) {
-                            // Bring the mirror's branch/tag refs up to date with the remote
-                            // (ls-remote diff + targeted fetch of only the changed refs), so
-                            // the workspace can be populated from the mirror with the same
-                            // freshness as a direct network fetch.
-                            const syncResult = yield blacksmithCache.syncMirrorFromRemote(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
-                            mirrorFresh = syncResult.success;
-                            stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed);
-                            stateHelper.setBlacksmithCacheMirrorSyncFailed(!syncResult.success && !syncResult.timedOut);
-                            stateHelper.setBlacksmithCacheMirrorSyncTimedOut(syncResult.timedOut);
+                        stateHelper.setBlacksmithCacheCommitDenied(cacheInfo.commitDenied);
+                        if (blacksmithCache.shouldSkipHydration(cacheInfo)) {
+                            core.warning('[git-mirror] Mirror is not hydrated yet and this job cannot commit the sticky disk; skipping hydration and cloning directly from GitHub. The mirror will be hydrated by a job that is allowed to commit.');
+                            cacheInfo = null;
+                            core.endGroup();
                         }
                         else {
-                            // Shallow checkouts never populate the workspace from mirror
-                            // refs, so the checkout step doesn't need a fresh mirror. Defer
-                            // the mirror sync to the post step to keep the checkout step
-                            // fast.
-                            stateHelper.setBlacksmithCacheMirrorSyncDeferred(true);
-                            stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
-                            stateHelper.setBlacksmithCacheVerbose(settings.verbose);
+                            const performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            stateHelper.setBlacksmithCachePerformedHydration(performedHydration);
+                            if (performedHydration) {
+                                // A freshly-cloned mirror is exactly the remote's current state
+                                mirrorFresh = true;
+                                stateHelper.setBlacksmithCacheMirrorChanged(true);
+                            }
+                            else if (settings.fetchDepth <= 0) {
+                                // Bring the mirror's branch/tag refs up to date with the remote
+                                // (ls-remote diff + targeted fetch of only the changed refs), so
+                                // the workspace can be populated from the mirror with the same
+                                // freshness as a direct network fetch.
+                                const syncResult = yield blacksmithCache.syncMirrorFromRemote(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                                mirrorFresh = syncResult.success;
+                                stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed);
+                                stateHelper.setBlacksmithCacheMirrorSyncFailed(!syncResult.success && !syncResult.timedOut);
+                                stateHelper.setBlacksmithCacheMirrorSyncTimedOut(syncResult.timedOut);
+                            }
+                            else if (!cacheInfo.commitDenied) {
+                                // Shallow checkouts never populate the workspace from mirror
+                                // refs, so the checkout step doesn't need a fresh mirror. Defer
+                                // the mirror sync to the post step to keep the checkout step
+                                // fast. A sync whose result cannot be committed is not worth
+                                // running at all.
+                                stateHelper.setBlacksmithCacheMirrorSyncDeferred(true);
+                                stateHelper.setBlacksmithCacheRepoUrl(repositoryUrl);
+                                stateHelper.setBlacksmithCacheVerbose(settings.verbose);
+                            }
+                            core.endGroup();
                         }
-                        core.endGroup();
                     }
                 }
                 catch (error) {
@@ -4120,6 +4153,7 @@ function cleanup() {
         const mountPoint = stateHelper.BlacksmithCacheMountPoint;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
         const performedHydration = stateHelper.BlacksmithCachePerformedHydration;
+        const commitDenied = stateHelper.BlacksmithCacheCommitDenied;
         let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged;
         let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed;
         let mirrorSyncTimedOut = stateHelper.BlacksmithCacheMirrorSyncTimedOut;
@@ -4151,7 +4185,12 @@ function cleanup() {
                 const failureCheck = yield (0, step_checker_1.checkPreviousStepFailures)();
                 let shouldCommit = true;
                 let skipReason = '';
-                if (failureCheck.error) {
+                if (commitDenied) {
+                    shouldCommit = false;
+                    skipReason =
+                        'The agent reported at setup that this job may not commit the sticky disk';
+                }
+                else if (failureCheck.error) {
                     // If we can't determine failure status, skip commit to be safe
                     shouldCommit = false;
                     skipReason = `Unable to check for step failures: ${failureCheck.error}`;
@@ -4189,7 +4228,7 @@ function cleanup() {
                     stickyDiskKey,
                     repoName: repoName || undefined,
                     mountPoint: mountPoint || undefined,
-                    mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
+                    mirrorPath: shouldCommit ? mirrorPath || undefined : undefined,
                     shouldCommit,
                     vmHydratedGitMirror,
                     mirrorSyncFailed,
@@ -4646,7 +4685,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCacheCommitDenied = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -4657,6 +4696,7 @@ exports.setBlacksmithCacheMountPoint = setBlacksmithCacheMountPoint;
 exports.setBlacksmithCacheRepoName = setBlacksmithCacheRepoName;
 exports.setBlacksmithCacheStickyDiskKey = setBlacksmithCacheStickyDiskKey;
 exports.setBlacksmithCachePerformedHydration = setBlacksmithCachePerformedHydration;
+exports.setBlacksmithCacheCommitDenied = setBlacksmithCacheCommitDenied;
 exports.setBlacksmithCacheMirrorChanged = setBlacksmithCacheMirrorChanged;
 exports.setBlacksmithCacheMirrorSyncFailed = setBlacksmithCacheMirrorSyncFailed;
 exports.setBlacksmithCacheMirrorSyncTimedOut = setBlacksmithCacheMirrorSyncTimedOut;
@@ -4709,6 +4749,12 @@ exports.BlacksmithCacheStickyDiskKey = core.getState('blacksmithCacheStickyDiskK
  * Used to notify the backend on commit so it can mark hydration as complete.
  */
 exports.BlacksmithCachePerformedHydration = core.getState('blacksmithCachePerformedHydration') === 'true';
+/**
+ * Whether the agent reported at expose time that this job's sticky disk
+ * commit will be denied (e.g. sticky disk branch protection). The POST
+ * action then releases the disk without maintenance or a commit request.
+ */
+exports.BlacksmithCacheCommitDenied = core.getState('blacksmithCacheCommitDenied') === 'true';
 /**
  * Whether the main step's mirror sync changed the mirror. Used by the POST
  * action to decide whether the sticky disk needs to be committed.
@@ -4793,6 +4839,12 @@ function setBlacksmithCacheStickyDiskKey(stickyDiskKey) {
  */
 function setBlacksmithCachePerformedHydration(performed) {
     core.saveState('blacksmithCachePerformedHydration', performed ? 'true' : 'false');
+}
+/**
+ * Save whether the agent reported that this job's sticky disk commit will be denied.
+ */
+function setBlacksmithCacheCommitDenied(denied) {
+    core.saveState('blacksmithCacheCommitDenied', denied ? 'true' : 'false');
 }
 /**
  * Save whether the main step's mirror sync changed the mirror.
@@ -61341,7 +61393,7 @@ module.exports = parseParams
 
 /***/ }),
 
-/***/ 2880:
+/***/ 783:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 "use strict";
@@ -65072,7 +65124,7 @@ const proto3 = makeProtoRuntime("proto3", (fields) => {
     }
 });
 
-;// CONCATENATED MODULE: ./node_modules/@buf/blacksmith_vm-agent.connectrpc_es/node_modules/@buf/blacksmith_vm-agent.bufbuild_es/stickydisk/v1/stickydisk_pb.js
+;// CONCATENATED MODULE: ./node_modules/@buf/blacksmith_vm-agent.bufbuild_es/stickydisk/v1/stickydisk_pb.js
 // @generated by protoc-gen-es v1.10.0
 // @generated from file stickydisk/v1/stickydisk.proto (package stickydisk.v1, syntax proto3)
 /* eslint-disable */
@@ -65081,14 +65133,88 @@ const proto3 = makeProtoRuntime("proto3", (fields) => {
 
 
 /**
- * @generated from enum stickydisk.v1.Architecture
+ * CommitIntent is a client's mount-time declaration of when it intends to
+ * commit the disk. Unrecognized values are treated as UNSPECIFIED.
+ *
+ * @generated from enum stickydisk.v1.CommitIntent
  */
-const Architecture = /*@__PURE__*/ proto3.makeEnum(
-  "stickydisk.v1.Architecture",
+const CommitIntent = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.CommitIntent",
   [
-    {no: 0, name: "ARCHITECTURE_UNSPECIFIED", localName: "UNSPECIFIED"},
-    {no: 1, name: "ARCHITECTURE_AMD64", localName: "AMD64"},
-    {no: 2, name: "ARCHITECTURE_ARM64", localName: "ARM64"},
+    {no: 0, name: "COMMIT_INTENT_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "COMMIT_INTENT_ALWAYS", localName: "ALWAYS"},
+    {no: 2, name: "COMMIT_INTENT_NEVER", localName: "NEVER"},
+    {no: 3, name: "COMMIT_INTENT_IF_MISSING", localName: "IF_MISSING"},
+    {no: 4, name: "COMMIT_INTENT_ON_CHANGE", localName: "ON_CHANGE"},
+  ],
+);
+
+/**
+ * @generated from enum stickydisk.v1.BuilderMode
+ */
+const BuilderMode = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.BuilderMode",
+  [
+    {no: 0, name: "BUILDER_MODE_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "BUILDER_MODE_BLACKSMITH_REMOTE", localName: "BLACKSMITH_REMOTE"},
+    {no: 2, name: "BUILDER_MODE_LOCAL_FALLBACK", localName: "LOCAL_FALLBACK"},
+    {no: 3, name: "BUILDER_MODE_EXISTING", localName: "EXISTING"},
+  ],
+);
+
+/**
+ * @generated from enum stickydisk.v1.BuilderFallbackReason
+ */
+const BuilderFallbackReason = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.BuilderFallbackReason",
+  [
+    {no: 0, name: "BUILDER_FALLBACK_REASON_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "BUILDER_FALLBACK_REASON_STICKYDISK_SETUP_FAILED", localName: "STICKYDISK_SETUP_FAILED"},
+    {no: 2, name: "BUILDER_FALLBACK_REASON_BUILDKITD_FAILED", localName: "BUILDKITD_FAILED"},
+    {no: 3, name: "BUILDER_FALLBACK_REASON_EXISTING_BUILDER", localName: "EXISTING_BUILDER"},
+  ],
+);
+
+/**
+ * @generated from enum stickydisk.v1.CommitDecision
+ */
+const CommitDecision = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.CommitDecision",
+  [
+    {no: 0, name: "COMMIT_DECISION_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "COMMIT_DECISION_REQUESTED", localName: "REQUESTED"},
+    {no: 2, name: "COMMIT_DECISION_SKIPPED", localName: "SKIPPED"},
+  ],
+);
+
+/**
+ * @generated from enum stickydisk.v1.CommitSkipReason
+ */
+const CommitSkipReason = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.CommitSkipReason",
+  [
+    {no: 0, name: "COMMIT_SKIP_REASON_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "COMMIT_SKIP_REASON_STEP_FAILURES", localName: "STEP_FAILURES"},
+    {no: 2, name: "COMMIT_SKIP_REASON_INTEGRITY", localName: "INTEGRITY"},
+    {no: 3, name: "COMMIT_SKIP_REASON_SIGKILL", localName: "SIGKILL"},
+    {no: 4, name: "COMMIT_SKIP_REASON_CLEANUP_ERROR", localName: "CLEANUP_ERROR"},
+    {no: 5, name: "COMMIT_SKIP_REASON_AMBIGUOUS", localName: "AMBIGUOUS"},
+    {no: 6, name: "COMMIT_SKIP_REASON_NO_EXPOSE", localName: "NO_EXPOSE"},
+    {no: 7, name: "COMMIT_SKIP_REASON_SERVER_DECLINED", localName: "SERVER_DECLINED"},
+    {no: 8, name: "COMMIT_SKIP_REASON_HOOK_SKIPPED", localName: "HOOK_SKIPPED"},
+  ],
+);
+
+/**
+ * @generated from enum stickydisk.v1.IntegrityOutcome
+ */
+const IntegrityOutcome = /*@__PURE__*/ proto3.makeEnum(
+  "stickydisk.v1.IntegrityOutcome",
+  [
+    {no: 0, name: "INTEGRITY_OUTCOME_UNSPECIFIED", localName: "UNSPECIFIED"},
+    {no: 1, name: "INTEGRITY_OUTCOME_PASSED", localName: "PASSED"},
+    {no: 2, name: "INTEGRITY_OUTCOME_FAILED", localName: "FAILED"},
+    {no: 3, name: "INTEGRITY_OUTCOME_SKIPPED", localName: "SKIPPED"},
   ],
 );
 
@@ -65105,6 +65231,7 @@ const GetStickyDiskRequest = /*@__PURE__*/ proto3.makeMessageType(
     { no: 5, name: "sticky_disk_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "repo_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "sticky_disk_token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "commit_intent", kind: "enum", T: proto3.getEnumType(CommitIntent) },
   ],
 );
 
@@ -65118,6 +65245,23 @@ const GetStickyDiskResponse = /*@__PURE__*/ proto3.makeMessageType(
     { no: 2, name: "disk_identifier", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "parent_snapshot_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "clone_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "buildkitd_config", kind: "message", T: BuildkitdConfig },
+    { no: 6, name: "commit_early_deny", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "commit_early_deny_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ],
+);
+
+/**
+ * BuildkitdConfig carries the backend's buildkitd policy for a docker build
+ * cache disk. The agent forwards it verbatim from the backend; it does not
+ * interpret or validate it.
+ *
+ * @generated from message stickydisk.v1.BuildkitdConfig
+ */
+const BuildkitdConfig = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.BuildkitdConfig",
+  () => [
+    { no: 1, name: "gc_keep_duration_hours", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ],
 );
 
@@ -65213,24 +65357,94 @@ const UpResponse = /*@__PURE__*/ proto3.makeMessageType(
 );
 
 /**
- * @generated from message stickydisk.v1.QueueDockerJobRequest
+ * @generated from message stickydisk.v1.ReportDockerBuildRequest
  */
-const QueueDockerJobRequest = /*@__PURE__*/ proto3.makeMessageType(
-  "stickydisk.v1.QueueDockerJobRequest",
+const ReportDockerBuildRequest = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.ReportDockerBuildRequest",
   () => [
-    { no: 1, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "tailscale_hostname", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "vm_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "arch", kind: "enum", T: proto3.getEnumType(Architecture) },
+    { no: 1, name: "vm_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expose_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "builds", kind: "message", T: DockerBuildRecord, repeated: true },
+    { no: 4, name: "runner_step_timeline", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 5, name: "lifecycle", kind: "message", T: DockerJobLifecycle },
+    { no: 6, name: "git_sha", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "git_branch", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ],
 );
 
 /**
- * @generated from message stickydisk.v1.QueueDockerJobResponse
+ * @generated from message stickydisk.v1.DockerBuildRecord
  */
-const QueueDockerJobResponse = /*@__PURE__*/ proto3.makeMessageType(
-  "stickydisk.v1.QueueDockerJobResponse",
-  [],
+const DockerBuildRecord = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.DockerBuildRecord",
+  () => [
+    { no: 1, name: "history_record", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 2, name: "trace", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 3, name: "incomplete", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ],
+);
+
+/**
+ * @generated from message stickydisk.v1.CacheMountUsage
+ */
+const CacheMountUsage = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.CacheMountUsage",
+  () => [
+    { no: 1, name: "mount_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "records", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ],
+);
+
+/**
+ * DockerJobLifecycle is the per-job builder lifecycle summary: the guest-side
+ * decisions and states lower layers cannot see (builder mode, commit
+ * decision, integrity outcome, cache store sizes, disk pressure).
+ *
+ * @generated from message stickydisk.v1.DockerJobLifecycle
+ */
+const DockerJobLifecycle = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.DockerJobLifecycle",
+  () => [
+    { no: 1, name: "builder_mode", kind: "enum", T: proto3.getEnumType(BuilderMode) },
+    { no: 2, name: "fallback_reason", kind: "enum", T: proto3.getEnumType(BuilderFallbackReason) },
+    { no: 3, name: "commit_decision", kind: "enum", T: proto3.getEnumType(CommitDecision) },
+    { no: 4, name: "commit_skip_reason", kind: "enum", T: proto3.getEnumType(CommitSkipReason) },
+    { no: 5, name: "integrity_outcome", kind: "enum", T: proto3.getEnumType(IntegrityOutcome) },
+    { no: 6, name: "integrity_duration_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "du_total_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "du_cache_mount_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "du_layers_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 10, name: "du_source_local_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 11, name: "cache_mounts", kind: "message", T: CacheMountUsage, repeated: true },
+    { no: 12, name: "fs_used_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 13, name: "fs_size_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 14, name: "prune_triggered", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 15, name: "prune_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 16, name: "hotload_duration_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 17, name: "buildkitd_ready_duration_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 18, name: "buildkitd_shutdown_duration_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 19, name: "buildkitd_sigkill_used", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 20, name: "history_export_timed_out", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 21, name: "history_prune_failed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 22, name: "timeline_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 23, name: "timeline_truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 24, name: "history_export_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 25, name: "traces_dropped_oversize", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 26, name: "traces_dropped_payload_cap", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 27, name: "records_dropped_payload_cap", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+  ],
+);
+
+/**
+ * @generated from message stickydisk.v1.ReportDockerBuildResponse
+ */
+const ReportDockerBuildResponse = /*@__PURE__*/ proto3.makeMessageType(
+  "stickydisk.v1.ReportDockerBuildResponse",
+  () => [
+    { no: 1, name: "docker_build_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ],
 );
 
 
@@ -65338,12 +65552,20 @@ const StickyDiskService = {
       kind: MethodKind.Unary,
     },
     /**
-     * @generated from rpc stickydisk.v1.StickyDiskService.QueueDockerJob
+     * ReportDockerBuild is the structured docker-build teardown report from
+     * setup-docker-builder: raw BuildKit history bytes per build, the raw
+     * runner step timeline, and the job's builder/commit lifecycle facts.
+     * The guest ships only build facts plus the expose_id it got from
+     * GetStickyDisk; all identity (sticky disk key, entity, clone lineage,
+     * installation, region, host, GitHub run/job IDs) is stamped host-side.
+     * The host issues one docker_build_id per shipped build in the response.
+     *
+     * @generated from rpc stickydisk.v1.StickyDiskService.ReportDockerBuild
      */
-    queueDockerJob: {
-      name: "QueueDockerJob",
-      I: QueueDockerJobRequest,
-      O: QueueDockerJobResponse,
+    reportDockerBuild: {
+      name: "ReportDockerBuild",
+      I: ReportDockerBuildRequest,
+      O: ReportDockerBuildResponse,
       kind: MethodKind.Unary,
     },
   }

@@ -84,6 +84,12 @@ export interface CacheInfo {
   // performedHydration indicates that this job performed the initial git mirror clone.
   // Used to notify the backend on commit so it can mark hydration as complete.
   performedHydration: boolean
+  // commitDenied indicates the agent already knows this job's changes to the
+  // sticky disk will be discarded at teardown (e.g. sticky disk branch
+  // protection for a pull_request job). The mirror can still be read, but
+  // work done only to persist it (hydration, deferred sync, GC) is wasted.
+  commitDenied: boolean
+  commitDeniedReason?: string
 }
 
 /**
@@ -326,7 +332,8 @@ export async function setupCache(
         mirrorPath: '',
         hydrationInProgress: true,
         hydrationMessage,
-        performedHydration: false
+        performedHydration: false,
+        commitDenied: false
       }
     }
     // Re-throw other errors
@@ -350,6 +357,14 @@ export async function setupCache(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
 
+  const commitDenied = response.commitEarlyDeny === true
+  const commitDeniedReason = response.commitEarlyDenyReason || undefined
+  if (commitDenied) {
+    core.info(
+      `[git-mirror] Changes to the sticky disk will not be committed for this job: ${commitDeniedReason ?? 'commit denied by the agent'}`
+    )
+  }
+
   // Format if needed
   await waitForNonZeroDeviceSize(device, 10000)
   await maybeFormatDevice(device)
@@ -370,7 +385,9 @@ export async function setupCache(
     mountPoint,
     mirrorPath: getMirrorPath(owner, repo),
     hydrationInProgress: false,
-    performedHydration: false // Will be set by ensureMirror if we do initial clone
+    performedHydration: false, // Will be set by ensureMirror if we do initial clone
+    commitDenied,
+    commitDeniedReason
   }
 }
 
@@ -471,6 +488,20 @@ function summarizeTrace2Perf(trace2PerfPath: string, title: string): void {
   }
 }
 
+export function mirrorExists(mirrorPath: string): boolean {
+  return fs.existsSync(mirrorPath)
+}
+
+/**
+ * An initial clone by a job whose sticky disk commit is already known to be
+ * denied is discarded at teardown, and the next job would redo it. Such a
+ * job leaves hydration to one that is allowed to commit and clones directly
+ * from the remote instead; an already hydrated mirror is still used.
+ */
+export function shouldSkipHydration(cacheInfo: CacheInfo): boolean {
+  return cacheInfo.commitDenied && !mirrorExists(cacheInfo.mirrorPath)
+}
+
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
  * If the mirror already exists, it is left as-is; the caller brings it up to
@@ -492,7 +523,7 @@ export async function ensureMirror(
   authToken: string,
   verbose: boolean = false
 ): Promise<boolean> {
-  if (fs.existsSync(mirrorPath)) {
+  if (mirrorExists(mirrorPath)) {
     // Mirror exists - the caller synchronizes it with the remote via
     // syncMirrorFromRemote() before populating the workspace from it
     core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`)
@@ -1996,7 +2027,11 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       vmHydratedGitMirror: vmHydratedGitMirror
     })
 
-    core.info('[git-mirror] Successfully committed sticky disk')
+    core.info(
+      shouldCommit
+        ? '[git-mirror] Requested sticky disk commit'
+        : '[git-mirror] Released sticky disk without commit'
+    )
   } catch (error) {
     core.warning(
       `[git-mirror] Failed to commit sticky disk: ${(error as any)?.message ?? error}`
