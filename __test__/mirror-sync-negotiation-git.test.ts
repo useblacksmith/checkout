@@ -164,17 +164,20 @@ describe('mirror sync negotiation with real git', () => {
     process.env['GIT_TRACE_PACKET'] = packetTrace
     const before = objectCount(mirrorPath)
 
+    let changedCallbacks = 0
     const result = await blacksmithCache.syncMirrorFromRemote(
       mirrorPath,
       'https://example.invalid/owner/repo',
       'token',
       false,
-      60
+      60,
+      () => changedCallbacks++
     )
 
     expect(result.success).toBe(true)
     expect(result.timedOut).toBe(false)
     expect(result.changed).toBe(true)
+    expect(changedCallbacks).toBe(1)
     expect(git(mirrorPath, 'rev-parse', 'refs/heads/feature')).toBe(
       newFeatureTip
     )
