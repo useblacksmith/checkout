@@ -1040,6 +1040,7 @@ async function setup(testName: string): Promise<void> {
     env: {},
     fetch: jest.fn(),
     getDefaultBranch: jest.fn(),
+    getEnvironment: jest.fn(() => ({...git.env})),
     getSubmoduleConfigPaths: jest.fn(async () => []),
     getWorkingDirectory: jest.fn(() => workspace),
     init: jest.fn(),

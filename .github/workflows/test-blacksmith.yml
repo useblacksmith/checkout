@@ -114,3 +114,99 @@ jobs:
 
           git fsck --no-dangling
           echo "Reused deep checkout verified"
+
+  # The shape that bit real container jobs: a privileged job container with the
+  # runner's devices passed through, checking out as root into a directory
+  # owned by the runner user (the workspace is bind-mounted from the host),
+  # then dissociating from the mirror. Without the checkout's git environment
+  # the dissociate repack fails with "dubious ownership". The target is a
+  # subdirectory given the workspace's owner rather than the workspace root,
+  # so the checkout does not wipe the action code out from under the job.
+  #
+  # The mirror on the sticky disk was committed by VM jobs, so it arrives owned
+  # by the runner user and the root checkout has to take it over. (Every
+  # checkout step mounts its own copy of the last commit, so ownership cannot be
+  # flipped between two steps of one job; the takeover is only observable
+  # across jobs, and in the VM direction only after a container job committed.)
+  test-git-mirror-container:
+    runs-on: blacksmith
+    container:
+      image: ubuntu:24.04
+      options: --privileged -v /dev:/dev
+    steps:
+      - name: Install git, sudo and the sticky disk tooling
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bash git sudo util-linux e2fsprogs mount ca-certificates
+
+      - name: Checkout action repo
+        uses: actions/checkout@v4
+        with:
+          path: action
+
+      - name: Create a checkout directory owned by the runner user
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" = 0
+          mkdir host-owned && chown --reference=. host-owned
+          test "$(stat -c %u host-owned)" != 0
+          echo "workspace owned by uid $(stat -c %u .), git runs as uid $(id -u)"
+
+      - name: Test checkout with git mirror inside the container (dissociate)
+        uses: ./action
+        with:
+          path: host-owned
+          allow-inside-container: true
+          dissociate: true
+
+      - name: Verify the mirror was mounted and the workspace dissociated
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" = 0
+          mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
+          if ! mountpoint -q "$(dirname "$(dirname "$mirror")")"; then
+            echo "Sticky disk is not mounted inside the container; the mirror path was not exercised"
+            exit 1
+          fi
+          test -d "$mirror"
+          if [ "$(stat -c %u "$mirror")" != 0 ]; then
+            echo "mirror still owned by uid $(stat -c %u "$mirror"); the root checkout did not take it over"
+            exit 1
+          fi
+          cd host-owned
+          if [ -e .git/objects/info/alternates ]; then
+            echo "alternates file survived dissociate"
+            exit 1
+          fi
+          git config --global --add safe.directory "$PWD"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fsck --no-dangling
+          echo "Container checkout with dissociate verified"
+
+  # The other direction: a VM job finding the mirror as a root container job
+  # left it. Real once a container job on a trusted trigger (push to main) has
+  # committed a root-owned mirror; the action logs the owner it took over from.
+  test-git-mirror-after-container:
+    runs-on: blacksmith
+    needs: test-git-mirror-container
+    steps:
+      - name: Checkout action repo
+        uses: actions/checkout@v4
+
+      - name: Test checkout against the mirror a container job left behind
+        uses: ./
+        with:
+          path: after-container
+
+      - name: Verify the mirror is owned by the runner user and was used
+        run: |
+          set -euo pipefail
+          mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
+          test -d "$mirror"
+          test "$(stat -c %u "$mirror")" = "$(id -u)"
+          grep -qF "$mirror/objects" after-container/.git/objects/info/alternates
+          git -C after-container fsck --no-dangling
+          echo "Checkout after a container job verified (mirror owned by uid $(id -u))"

@@ -50,6 +50,12 @@ export interface IGitCommandManager {
   configExists(configKey: string, globalConfig?: boolean): Promise<boolean>
   fetch(refSpec: string[], options: FetchOptions): Promise<void>
   getDefaultBranch(repositoryUrl: string): Promise<string>
+  /**
+   * Environment for git commands run outside this manager against the
+   * workspace, so they see the same HOME (temporary global config with
+   * safe.directory, auth) as the manager's own commands.
+   */
+  getEnvironment(): {[key: string]: string}
   getSubmoduleConfigPaths(recursive: boolean): Promise<string[]>
   getWorkingDirectory(): string
   init(): Promise<void>
@@ -365,6 +371,19 @@ class GitCommandManager {
     throw new Error('Unexpected output when retrieving default branch')
   }
 
+  getEnvironment(): {[key: string]: string} {
+    const env: {[key: string]: string} = {}
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) {
+        env[key] = value
+      }
+    }
+    for (const key of Object.keys(this.gitEnv)) {
+      env[key] = this.gitEnv[key]
+    }
+    return env
+  }
+
   async getSubmoduleConfigPaths(recursive: boolean): Promise<string[]> {
     // Get submodule config file paths.
     // Use `--show-origin` to get the config file path for each submodule.
@@ -639,13 +658,7 @@ class GitCommandManager {
 
     const result = new GitOutput()
 
-    const env = {}
-    for (const key of Object.keys(process.env)) {
-      env[key] = process.env[key]
-    }
-    for (const key of Object.keys(this.gitEnv)) {
-      env[key] = this.gitEnv[key]
-    }
+    const env = this.getEnvironment()
 
     const defaultListener = {
       stdout: (data: Buffer) => {

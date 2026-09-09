@@ -278,7 +278,8 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       ) {
         fetchedFromMirror = await blacksmithCache.fetchRefsFromMirror(
           settings.repositoryPath,
-          cacheInfo.mirrorPath
+          cacheInfo.mirrorPath,
+          git.getEnvironment()
         )
       }
 
@@ -399,7 +400,10 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // This copies all objects from alternates into the local repo so it's independent
     if (settings.dissociate && cacheInfo) {
       core.startGroup('Dissociating from Blacksmith mirror')
-      await blacksmithCache.dissociate(settings.repositoryPath)
+      await blacksmithCache.dissociate(
+        settings.repositoryPath,
+        git.getEnvironment()
+      )
       core.endGroup()
     }
 

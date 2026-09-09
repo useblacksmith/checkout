@@ -382,6 +382,35 @@ function getAuthConfigArgs(repoUrl, authToken) {
     };
 }
 /**
+ * Jobs sharing a mirror do not all run as the same user: a VM job runs git
+ * as the runner user, a job container typically as root. Git refuses a
+ * repository owned by someone else ("dubious ownership"), and the runner
+ * user cannot write into a root-owned one, so a mirror hydrated by the
+ * other kind of job is taken over before it is read or synced.
+ */
+function adoptMirrorOwnership(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b;
+        const uid = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process);
+        const gid = (_b = process.getgid) === null || _b === void 0 ? void 0 : _b.call(process);
+        if (uid === undefined || gid === undefined) {
+            return;
+        }
+        const owner = (yield fs.promises.stat(mirrorPath)).uid;
+        if (owner === uid) {
+            return;
+        }
+        const start = Date.now();
+        yield exec.exec('sudo', [
+            'chown',
+            '-R',
+            `${uid}:${gid}`,
+            path.dirname(mirrorPath)
+        ]);
+        core.info(`[git-mirror] Took over mirror owned by uid ${owner} in ${Date.now() - start}ms`);
+    });
+}
+/**
  * Build git environment with optional verbose flags
  */
 function buildGitEnv(verbose, trace2PerfPath) {
@@ -464,6 +493,7 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
             // Mirror exists - the caller synchronizes it with the remote via
             // syncMirrorFromRemote() before populating the workspace from it
             core.info(`[git-mirror] Found existing mirror at ${mirrorPath}`);
+            yield adoptMirrorOwnership(mirrorPath);
             return false; // Not initial hydration
         }
         // First time - create a bare mirror clone (initial hydration)
@@ -1044,9 +1074,14 @@ function buildPackedRefsContent(mirrorRefs) {
  * checkout in a reused workspace, so scripts never read fetch output that
  * predates this ref state.
  *
+ * `env` is the checkout's git environment (see
+ * IGitCommandManager.getEnvironment); the workspace directory may be owned
+ * by another user than the one running git (job containers), and only its
+ * temporary global config marks the workspace as a safe.directory.
+ *
  * @returns true on success, false if the caller should fall back
  */
-function copyRefsFromMirror(workspacePath, mirrorPath) {
+function copyRefsFromMirror(workspacePath, mirrorPath, env) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
             const start = Date.now();
@@ -1063,7 +1098,7 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
             // default loose format the way this path assumes. A reftable
             // repository ignores a packed-refs file entirely, so writing one would
             // silently produce a repo with no refs.
-            const refStorage = yield exec.getExecOutput('git', ['-C', workspacePath, 'config', '--get', 'extensions.refstorage'], { silent: true, ignoreReturnCode: true });
+            const refStorage = yield exec.getExecOutput('git', ['-C', workspacePath, 'config', '--get', 'extensions.refstorage'], { silent: true, ignoreReturnCode: true, env });
             const refBackend = refStorage.stdout.trim();
             if (refBackend !== '' && refBackend !== 'files') {
                 core.info(`[git-mirror] Workspace uses ref backend '${refBackend}', using local fetch instead of direct ref copy`);
@@ -1084,7 +1119,7 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
                 '--format=%(objectname) %(refname) %(symref)',
                 'refs/remotes/origin',
                 'refs/tags'
-            ], { silent: true });
+            ], { silent: true, env });
             const packedRefsPath = path.join(gitDir, 'packed-refs');
             const freshWorkspace = workspaceRefs.stdout.trim() === '' && !fs.existsSync(packedRefsPath);
             if (freshWorkspace) {
@@ -1103,10 +1138,12 @@ function copyRefsFromMirror(workspacePath, mirrorPath) {
             if (instructions.length > 0) {
                 yield exec.exec('git', ['-C', workspacePath, 'update-ref', '--stdin'], {
                     silent: true,
-                    input: Buffer.from(`${instructions.join('\n')}\n`)
+                    input: Buffer.from(`${instructions.join('\n')}\n`),
+                    env
                 });
                 yield exec.exec('git', ['-C', workspacePath, 'pack-refs', '--all'], {
-                    silent: true
+                    silent: true,
+                    env
                 });
             }
             core.info(`[git-mirror] Reconciled ${instructions.length} refs from mirror in ${Date.now() - start}ms`);
@@ -1236,10 +1273,10 @@ function removeStaleFetchHead(gitDir) {
  * @returns true on success, false if the local fetch failed and the caller
  * should fall back to a network fetch
  */
-function fetchRefsFromMirror(workspacePath, mirrorPath) {
+function fetchRefsFromMirror(workspacePath, mirrorPath, env) {
     return __awaiter(this, void 0, void 0, function* () {
         core.info(`[git-mirror] Fetching refs locally from mirror at ${mirrorPath}`);
-        if (yield copyRefsFromMirror(workspacePath, mirrorPath)) {
+        if (yield copyRefsFromMirror(workspacePath, mirrorPath, env)) {
             return true;
         }
         try {
@@ -1255,7 +1292,7 @@ function fetchRefsFromMirror(workspacePath, mirrorPath) {
                 mirrorPath,
                 '+refs/heads/*:refs/remotes/origin/*',
                 '+refs/tags/*:refs/tags/*'
-            ]);
+            ], { env });
             return true;
         }
         catch (error) {
@@ -1282,11 +1319,11 @@ function writeAlternates(workspacePath, mirrorPath) {
  * Dissociate the repository from the mirror by copying all objects locally
  * This is needed for Docker-based actions that may not have access to the mirror mount
  */
-function dissociate(workspacePath) {
+function dissociate(workspacePath, env) {
     return __awaiter(this, void 0, void 0, function* () {
         core.info('Dissociating repository from mirror');
         // Copy all objects from alternates into local repo
-        yield exec.exec('git', ['-C', workspacePath, 'repack', '-a', '-d']);
+        yield exec.exec('git', ['-C', workspacePath, 'repack', '-a', '-d'], { env });
         // Remove alternates file
         const alternatesFile = path.join(workspacePath, '.git', 'objects', 'info', 'alternates');
         try {
@@ -2616,6 +2653,18 @@ class GitCommandManager {
             throw new Error('Unexpected output when retrieving default branch');
         });
     }
+    getEnvironment() {
+        const env = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (value !== undefined) {
+                env[key] = value;
+            }
+        }
+        for (const key of Object.keys(this.gitEnv)) {
+            env[key] = this.gitEnv[key];
+        }
+        return env;
+    }
     getSubmoduleConfigPaths(recursive) {
         return __awaiter(this, void 0, void 0, function* () {
             // Get submodule config file paths.
@@ -2851,13 +2900,7 @@ class GitCommandManager {
         return __awaiter(this, arguments, void 0, function* (args, allowAllExitCodes = false, silent = false, customListeners = {}) {
             fshelper.directoryExistsSync(this.workingDirectory, true);
             const result = new GitOutput();
-            const env = {};
-            for (const key of Object.keys(process.env)) {
-                env[key] = process.env[key];
-            }
-            for (const key of Object.keys(this.gitEnv)) {
-                env[key] = this.gitEnv[key];
-            }
+            const env = this.getEnvironment();
             const defaultListener = {
                 stdout: (data) => {
                     stdout.push(data.toString());
@@ -3334,7 +3377,7 @@ function getSource(settings) {
                     mirrorFresh &&
                     !fetchOptions.filter &&
                     !fsHelper.fileExistsSync(path.join(settings.repositoryPath, '.git', 'shallow'))) {
-                    fetchedFromMirror = yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath);
+                    fetchedFromMirror = yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath, git.getEnvironment());
                 }
                 if (fetchedFromMirror) {
                     // The mirror copy only materializes branches and tags. Any other ref
@@ -3430,7 +3473,7 @@ function getSource(settings) {
             // This copies all objects from alternates into the local repo so it's independent
             if (settings.dissociate && cacheInfo) {
                 core.startGroup('Dissociating from Blacksmith mirror');
-                yield blacksmithCache.dissociate(settings.repositoryPath);
+                yield blacksmithCache.dissociate(settings.repositoryPath, git.getEnvironment());
                 core.endGroup();
             }
             // Submodules
