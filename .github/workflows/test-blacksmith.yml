@@ -156,7 +156,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git sudo util-linux e2fsprogs mount ca-certificates
+            bash git sudo util-linux e2fsprogs mount ca-certificates
 
       - name: Checkout action repo
         uses: actions/checkout@v4
@@ -170,6 +170,7 @@ jobs:
           dissociate: true
 
       - name: Verify the mirror was mounted and the workspace dissociated
+        shell: bash
         run: |
           set -euo pipefail
           test "$(id -u)" = 0
