@@ -8,6 +8,7 @@ import {createGrpcTransport} from '@connectrpc/connect-node'
 import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
 import * as retryHelper from './retry-helper'
 import {isRunningInContainer} from './container-detector'
+import {packNamesOrNull, packSizeBytesOrNull} from './mirror-telemetry'
 
 // Without a deadline, a black-holed dial stalls the checkout until the OS
 // gives up on the TCP handshake.
@@ -51,6 +52,13 @@ export interface OperationResult {
   success: boolean
   timedOut: boolean
   error?: string
+  // The operation did no work (no mirror to refresh, or `gc --auto` found
+  // nothing to collect); no telemetry row applies.
+  skipped?: boolean
+  // Structured-telemetry detail (best-effort; 0 when measurement failed).
+  durationMs?: number
+  bytes?: number
+  mirrorSizeBytes?: number
 }
 
 /**
@@ -262,6 +270,11 @@ async function maybeFormatDevice(device: string): Promise<void> {
   core.debug(`Successfully formatted ${device} with ext4`)
 }
 
+/** Sticky disk key of a repository's git mirror; one mirror per repository. */
+export function stickyDiskKeyFor(owner: string, repo: string): string {
+  return `${owner}-${repo}`
+}
+
 /**
  * Request a sticky disk from the VM agent, format if needed, and mount it.
  * Returns CacheInfo with hydrationInProgress=true if another job is hydrating,
@@ -272,7 +285,7 @@ export async function setupCache(
   repo: string
 ): Promise<CacheInfo> {
   const client = createBlacksmithClient()
-  const stickyDiskKey = `${owner}-${repo}`
+  const stickyDiskKey = stickyDiskKeyFor(owner, repo)
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), AGENT_RPC_TIMEOUT_MS)
@@ -871,18 +884,30 @@ export async function syncMirrorFromRemote(
   repoUrl: string,
   authToken: string,
   verbose: boolean = false,
-  timeoutSecs: number = REFRESH_TIMEOUT_SECS
+  timeoutSecs: number = REFRESH_TIMEOUT_SECS,
+  // Invoked as soon as the mirror has changed, before the post-sync size
+  // walk, so callers can persist "mirror changed" state ahead of any
+  // measurement cost that a job cancel could interrupt.
+  onMirrorChanged?: () => void
 ): Promise<MirrorSyncResult> {
   if (!fs.existsSync(mirrorPath)) {
     core.debug(
       `[git-mirror] Mirror does not exist at ${mirrorPath}, skipping sync`
     )
-    return {success: true, timedOut: false, changed: false}
+    return {success: true, timedOut: false, changed: false, skipped: true}
   }
 
   core.info(
     `[git-mirror] Syncing mirror at ${mirrorPath} with remote (budget: ${timeoutSecs}s)`
   )
+
+  // Pack size delta across the sync approximates the bytes landed — the
+  // steady-state freshness cost between commits. Fetches under
+  // fetch.unpackLimit land as loose objects and read as 0 here; that is
+  // the price of never walking loose objects on the sticky disk. Measured
+  // before the deadline is set so it never eats into the sync budget.
+  const sizeBefore = await packSizeBytesOrNull(mirrorPath)
+  const syncStart = Date.now()
 
   // One deadline bounds the whole sync: ls-remote and every fetch
   // invocation (including vanished-ref reruns) draw from the same budget,
@@ -963,7 +988,17 @@ export async function syncMirrorFromRemote(
 
     if (diff.updatedRefSpecs.length === 0 && diff.deletedRefs.length === 0) {
       core.info('[git-mirror] Mirror is already up to date with the remote')
-      return {success: true, timedOut: false, changed: purgedRefs > 0}
+      if (purgedRefs > 0) {
+        onMirrorChanged?.()
+      }
+      return {
+        success: true,
+        timedOut: false,
+        changed: purgedRefs > 0,
+        durationMs: Date.now() - syncStart,
+        bytes: 0,
+        mirrorSizeBytes: sizeBefore ?? 0
+      }
     }
 
     // Refs deleted on the remote between ls-remote and the fetch make git
@@ -1108,7 +1143,23 @@ export async function syncMirrorFromRemote(
     }
 
     core.info('[git-mirror] Mirror sync complete')
-    return {success: true, timedOut: false, changed: true}
+    // Duration is the sync alone; the size read below is measurement cost.
+    const durationMs = Date.now() - syncStart
+    onMirrorChanged?.()
+    const sizeAfter = await packSizeBytesOrNull(mirrorPath)
+    return {
+      success: true,
+      timedOut: false,
+      changed: true,
+      durationMs,
+      // Only report a delta when both reads succeeded — a failed read is 0
+      // and would report the whole mirror as fetched.
+      bytes:
+        sizeBefore !== null && sizeAfter !== null
+          ? Math.max(0, sizeAfter - sizeBefore)
+          : 0,
+      mirrorSizeBytes: sizeAfter ?? 0
+    }
   } catch (error) {
     const msg = (error as Error).message || String(error)
     const timedOut = msg.includes('timed out')
@@ -1117,7 +1168,15 @@ export async function syncMirrorFromRemote(
     } else {
       core.warning(`[git-mirror] Mirror sync failed: ${msg}`)
     }
-    return {success: false, timedOut, error: msg, changed: false}
+    return {
+      success: false,
+      timedOut,
+      error: msg,
+      changed: false,
+      durationMs: Date.now() - syncStart,
+      bytes: 0,
+      mirrorSizeBytes: sizeBefore ?? 0
+    }
   }
 }
 
@@ -1659,10 +1718,16 @@ export function hasCommitGraph(mirrorPath: string): boolean {
   )
 }
 
+function samePackNames(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((name, i) => name === b[i])
+}
+
 /**
  * Run lightweight garbage collection on the mirror.
  * Uses --auto to only run GC when git determines it's needed (based on loose object count).
  * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
+ * A no-op `gc --auto` is reported as skipped so only real collections
+ * produce a maintenance row.
  */
 async function runMirrorGC(
   mirrorPath: string,
@@ -1672,6 +1737,11 @@ async function runMirrorGC(
     `[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`
   )
 
+  // Pack size delta across gc approximates the bytes reclaimed by pack
+  // consolidation; loose objects are never walked on the sticky disk.
+  const sizeBefore = await packSizeBytesOrNull(mirrorPath)
+  const packsBefore = await packNamesOrNull(mirrorPath)
+  const gcStart = Date.now()
   try {
     // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
     // This is much faster than a full gc when not needed
@@ -1698,7 +1768,10 @@ async function runMirrorGC(
       return {
         success: false,
         timedOut: true,
-        error: `git gc timed out after ${timeoutSecs}s`
+        error: `git gc timed out after ${timeoutSecs}s`,
+        durationMs: Date.now() - gcStart,
+        bytes: 0,
+        mirrorSizeBytes: sizeBefore ?? 0
       }
     }
     if (result.exitCode !== 0) {
@@ -1706,15 +1779,55 @@ async function runMirrorGC(
       return {
         success: false,
         timedOut: false,
-        error: `git gc failed with exit code ${result.exitCode}`
+        error: `git gc failed with exit code ${result.exitCode}`,
+        durationMs: Date.now() - gcStart,
+        bytes: 0,
+        mirrorSizeBytes: sizeBefore ?? 0
       }
     }
     core.debug('[git-mirror] Completed git gc --auto')
-    return {success: true, timedOut: false}
+    // Duration is the gc alone; the reads below are measurement cost.
+    const durationMs = Date.now() - gcStart
+    const packsAfter = await packNamesOrNull(mirrorPath)
+    if (
+      packsBefore !== null &&
+      packsAfter !== null &&
+      samePackNames(packsBefore, packsAfter)
+    ) {
+      core.debug('[git-mirror] gc --auto found nothing to collect')
+      return {
+        success: true,
+        timedOut: false,
+        skipped: true,
+        durationMs,
+        bytes: 0,
+        mirrorSizeBytes: sizeBefore ?? 0
+      }
+    }
+    const sizeAfter = await packSizeBytesOrNull(mirrorPath)
+    return {
+      success: true,
+      timedOut: false,
+      durationMs,
+      // Only report a delta when both reads succeeded — a failed read is 0
+      // and would report the whole mirror as reclaimed.
+      bytes:
+        sizeBefore !== null && sizeAfter !== null
+          ? Math.max(0, sizeBefore - sizeAfter)
+          : 0,
+      mirrorSizeBytes: sizeAfter ?? 0
+    }
   } catch (error) {
     const msg = (error as Error).message || String(error)
     core.warning(`[git-mirror] GC failed: ${msg}`)
-    return {success: false, timedOut: false, error: msg}
+    return {
+      success: false,
+      timedOut: false,
+      error: msg,
+      durationMs: Date.now() - gcStart,
+      bytes: 0,
+      mirrorSizeBytes: sizeBefore ?? 0
+    }
   }
 }
 
@@ -1875,7 +1988,9 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   let vmHydratedGitMirror = options.vmHydratedGitMirror
 
   const result: CleanupResult = {
-    gcResult: {success: true, timedOut: false}
+    // skipped until GC actually runs, so an unchanged mirror (no mirrorPath)
+    // never reports a successful zero-measurement gc row.
+    gcResult: {success: true, timedOut: false, skipped: true}
   }
 
   core.info(
