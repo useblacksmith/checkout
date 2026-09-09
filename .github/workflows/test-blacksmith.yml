@@ -114,3 +114,84 @@ jobs:
 
           git fsck --no-dangling
           echo "Reused deep checkout verified"
+
+      # A job container runs git as root, a VM job as the runner user; both
+      # share one mirror through the sticky disk. Hand the mirror to root and
+      # check the next checkout takes it back instead of failing on dubious
+      # ownership / an unwritable mirror.
+      - name: Hand the mirror to another user
+        run: |
+          set -euo pipefail
+          mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
+          test -d "$mirror"
+          sudo chown -R root:root "$(dirname "$mirror")"
+          test "$(stat -c %u "$mirror")" = 0
+          echo "MIRROR_PATH=$mirror" >> "$GITHUB_ENV"
+
+      - name: Test checkout against a mirror owned by another user
+        uses: ./
+        with:
+          path: takeover-checkout
+
+      - name: Verify the mirror was taken over and used
+        run: |
+          set -euo pipefail
+          test "$(stat -c %u "$MIRROR_PATH")" = "$(id -u)"
+          grep -qF "$MIRROR_PATH/objects" takeover-checkout/.git/objects/info/alternates
+          git -C takeover-checkout fsck --no-dangling
+          echo "Mirror takeover verified"
+
+  # The shape that bit real container jobs: a privileged job container with the
+  # runner's devices passed through, checking out into the workspace root
+  # (bind-mounted from the host, owned by the runner user) as root, then
+  # dissociating from the mirror. Without the checkout's git environment the
+  # dissociate repack fails with "dubious ownership".
+  test-git-mirror-container:
+    runs-on: blacksmith
+    container:
+      image: ubuntu:24.04
+      options: --privileged -v /dev:/dev
+    steps:
+      - name: Install git, sudo and the sticky disk tooling
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git sudo util-linux e2fsprogs mount ca-certificates
+
+      - name: Checkout action repo
+        uses: actions/checkout@v4
+        with:
+          path: action
+
+      - name: Test checkout with git mirror inside the container (dissociate)
+        uses: ./action
+        with:
+          allow-inside-container: true
+          dissociate: true
+
+      - name: Verify the mirror was mounted and the workspace dissociated
+        run: |
+          set -euo pipefail
+          test "$(id -u)" = 0
+          mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
+          if ! mountpoint -q "$(dirname "$(dirname "$mirror")")"; then
+            echo "Sticky disk is not mounted inside the container; the mirror path was not exercised"
+            exit 1
+          fi
+          test -d "$mirror"
+          if [ -e .git/objects/info/alternates ]; then
+            echo "alternates file survived dissociate"
+            exit 1
+          fi
+          git config --global --add safe.directory "$PWD"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fsck --no-dangling
+          echo "Container checkout with dissociate verified"
+
+      # The root checkout wiped the action code; restore it so the post step
+      # of ./action can run.
+      - name: Restore action code for the post step
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          path: action
