@@ -79,28 +79,38 @@ async function cleanup(): Promise<void> {
     let cleanupResult: blacksmithCache.CleanupResult | undefined
 
     try {
-      // Check for previous step failures by reading runner logs
-      // This is the same approach used by setup-docker-builder (BPA)
-      core.info(
-        '[git-mirror] Checking for previous step failures before committing'
-      )
-      const failureCheck = await checkPreviousStepFailures()
-
       let shouldCommit = true
       let skipReason = ''
 
-      if (failureCheck.error) {
-        // If we can't determine failure status, skip commit to be safe
+      const commitEarlyDenyReason =
+        stateHelper.BlacksmithCacheCommitEarlyDenyReason
+      if (commitEarlyDenyReason) {
+        // The host already told us at mount time that this job's writes are
+        // discarded, so there is nothing to persist and no need to inspect
+        // step results.
         shouldCommit = false
-        skipReason = `Unable to check for step failures: ${failureCheck.error}`
-      } else if (failureCheck.hasFailures) {
-        shouldCommit = false
-        skipReason = `Found ${failureCheck.failedCount} failed/cancelled steps`
-        if (failureCheck.failedSteps) {
-          for (const step of failureCheck.failedSteps) {
-            core.warning(
-              `[git-mirror]   - Step: ${step.stepName || step.action || 'unknown'} (${step.result})`
-            )
+        skipReason = `commit denied for this job (${commitEarlyDenyReason}); mirror changes are discarded`
+      } else {
+        // Check for previous step failures by reading runner logs
+        // This is the same approach used by setup-docker-builder (BPA)
+        core.info(
+          '[git-mirror] Checking for previous step failures before committing'
+        )
+        const failureCheck = await checkPreviousStepFailures()
+
+        if (failureCheck.error) {
+          // If we can't determine failure status, skip commit to be safe
+          shouldCommit = false
+          skipReason = `Unable to check for step failures: ${failureCheck.error}`
+        } else if (failureCheck.hasFailures) {
+          shouldCommit = false
+          skipReason = `Found ${failureCheck.failedCount} failed/cancelled steps`
+          if (failureCheck.failedSteps) {
+            for (const step of failureCheck.failedSteps) {
+              core.warning(
+                `[git-mirror]   - Step: ${step.stepName || step.action || 'unknown'} (${step.result})`
+              )
+            }
           }
         }
       }
@@ -109,7 +119,7 @@ async function cleanup(): Promise<void> {
         core.warning(`[git-mirror] Skipping cache commit: ${skipReason}`)
         if (performedHydration) {
           core.warning(
-            '[git-mirror] Initial hydration was in progress but job failed - backend will delete entry for retry'
+            '[git-mirror] Initial hydration was performed but is not being committed - backend will delete entry for retry'
           )
         }
       } else {

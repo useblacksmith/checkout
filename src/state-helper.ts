@@ -99,6 +99,14 @@ export const BlacksmithCacheVerbose =
   core.getState('blacksmithCacheVerbose') === 'true'
 
 /**
+ * Reason the host gave at mount time for denying this job's sticky disk commit
+ * (e.g. branch protection). Empty when no denial was reported.
+ */
+export const BlacksmithCacheCommitEarlyDenyReason = core.getState(
+  'blacksmithCacheCommitEarlyDenyReason'
+)
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -215,6 +223,14 @@ export function setBlacksmithCacheRepoUrl(repoUrl: string) {
  */
 export function setBlacksmithCacheVerbose(verbose: boolean) {
   core.saveState('blacksmithCacheVerbose', verbose ? 'true' : 'false')
+}
+
+/**
+ * Save the host's early commit denial reason so the POST action can skip the
+ * commit and explain why.
+ */
+export function setBlacksmithCacheCommitEarlyDenyReason(reason: string) {
+  core.saveState('blacksmithCacheCommitEarlyDenyReason', reason)
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
