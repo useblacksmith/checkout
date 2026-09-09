@@ -142,10 +142,12 @@ jobs:
           echo "Mirror takeover verified"
 
   # The shape that bit real container jobs: a privileged job container with the
-  # runner's devices passed through, checking out into the workspace root
-  # (bind-mounted from the host, owned by the runner user) as root, then
-  # dissociating from the mirror. Without the checkout's git environment the
-  # dissociate repack fails with "dubious ownership".
+  # runner's devices passed through, checking out as root into a directory
+  # owned by the runner user (the workspace is bind-mounted from the host),
+  # then dissociating from the mirror. Without the checkout's git environment
+  # the dissociate repack fails with "dubious ownership". The target is a
+  # subdirectory given the workspace's owner rather than the workspace root,
+  # so the checkout does not wipe the action code out from under the job.
   test-git-mirror-container:
     runs-on: blacksmith
     container:
@@ -163,9 +165,19 @@ jobs:
         with:
           path: action
 
+      - name: Create a checkout directory owned by the runner user
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" = 0
+          mkdir host-owned && chown --reference=. host-owned
+          test "$(stat -c %u host-owned)" != 0
+          echo "workspace owned by uid $(stat -c %u .), git runs as uid $(id -u)"
+
       - name: Test checkout with git mirror inside the container (dissociate)
         uses: ./action
         with:
+          path: host-owned
           allow-inside-container: true
           dissociate: true
 
@@ -180,6 +192,7 @@ jobs:
             exit 1
           fi
           test -d "$mirror"
+          cd host-owned
           if [ -e .git/objects/info/alternates ]; then
             echo "alternates file survived dissociate"
             exit 1
@@ -188,11 +201,3 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git fsck --no-dangling
           echo "Container checkout with dissociate verified"
-
-      # The root checkout wiped the action code; restore it so the post step
-      # of ./action can run.
-      - name: Restore action code for the post step
-        if: always()
-        uses: actions/checkout@v4
-        with:
-          path: action
