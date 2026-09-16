@@ -376,22 +376,29 @@ describe('runMirrorMaintenance (real git)', () => {
   })
 
   describe('reclaim', () => {
+    // Pushes a branch into its own kept pack, optionally records it in the
+    // commit-graph, then deletes the branch so its objects are unreachable.
     function addGarbage(
       root: string,
-      mirror: string
-    ): {pack: string; blob: string} {
+      mirror: string,
+      options: {commitGraph?: boolean} = {}
+    ): {pack: string; blob: string; commit: string} {
       const src = path.join(root, 'src')
       const before = new Set(packs(mirror))
       commitBlob(src, 'garbage', 600 * 1024)
       const blob = git(src, 'rev-parse', 'HEAD:garbage')
+      const commit = git(src, 'rev-parse', 'HEAD')
       pushPack(src, mirror, 'garbage')
       const pack = packs(mirror).find(p => !before.has(p)) as string
       fs.writeFileSync(
         path.join(mirror, 'objects', 'pack', pack.replace(/\.pack$/, '.keep')),
         ''
       )
+      if (options.commitGraph) {
+        git(mirror, 'commit-graph', 'write', '--reachable', '--split')
+      }
       git(mirror, 'update-ref', '-d', 'refs/heads/garbage')
-      return {pack, blob}
+      return {pack, blob, commit}
     }
 
     function hasObject(mirror: string, oid: string): boolean {
@@ -435,7 +442,12 @@ describe('runMirrorMaintenance (real git)', () => {
 
     it('rewrites the whole mirror and drops unreachable objects when due', async () => {
       const {mirror, basePack} = buildMirror(root)
-      const {pack, blob} = addGarbage(root, mirror)
+      const {
+        pack,
+        blob,
+        commit: garbageCommit
+      } = addGarbage(root, mirror, {commitGraph: true})
+      expect(blacksmithCache.hasCommitGraph(mirror)).toBe(true)
       stampReclaim(mirror, 0)
 
       const result = await blacksmithCache.runMirrorMaintenance(mirror, {
@@ -465,6 +477,10 @@ describe('runMirrorMaintenance (real git)', () => {
           .trim()
       ).toBe('20000')
       expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(true)
+      // The graph was rebuilt without the pruned commit.
+      expect(blacksmithCache.hasCommitGraph(mirror)).toBe(true)
+      git(mirror, 'commit-graph', 'verify')
+      expect(hasObject(mirror, garbageCommit)).toBe(false)
       fsck(mirror)
       refsResolve(mirror)
 

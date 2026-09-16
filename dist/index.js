@@ -1393,6 +1393,22 @@ function writeCommitGraph(mirrorPath_1) {
         }
     });
 }
+function removeCommitGraph(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const info = path.join(mirrorPath, 'objects', 'info');
+        for (const target of [
+            path.join(info, 'commit-graph'),
+            path.join(info, 'commit-graphs')
+        ]) {
+            try {
+                yield fs.promises.rm(target, { recursive: true, force: true });
+            }
+            catch (error) {
+                core.warning(`[git-mirror] Failed to remove ${target}: ${error}`);
+            }
+        }
+    });
+}
 /**
  * Whether the mirror has a commit-graph (single file or split chain).
  * Determines if the sync fetch can write incrementally.
@@ -1677,6 +1693,11 @@ function runMirrorMaintenance(mirrorPath_1) {
                 if (prune.exitCode !== 0) {
                     return yield fail(false, `git prune failed with exit code ${prune.exitCode}`);
                 }
+                // The commit-graph still lists the commits just pruned; fsck and
+                // incremental graph writes fail on such entries. Rebuild it from
+                // what is reachable now.
+                yield removeCommitGraph(mirrorPath);
+                yield writeCommitGraph(mirrorPath, remainingSecs());
             }
             const packRefs = yield exec.getExecOutput('timeout', [String(remainingSecs()), 'git', '-C', mirrorPath, 'pack-refs', '--all'], { silent: true, ignoreReturnCode: true });
             if (packRefs.exitCode === TIMEOUT_EXIT_CODE) {

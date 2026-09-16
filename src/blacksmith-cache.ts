@@ -1659,6 +1659,20 @@ async function writeCommitGraph(
   }
 }
 
+async function removeCommitGraph(mirrorPath: string): Promise<void> {
+  const info = path.join(mirrorPath, 'objects', 'info')
+  for (const target of [
+    path.join(info, 'commit-graph'),
+    path.join(info, 'commit-graphs')
+  ]) {
+    try {
+      await fs.promises.rm(target, {recursive: true, force: true})
+    } catch (error) {
+      core.warning(`[git-mirror] Failed to remove ${target}: ${error}`)
+    }
+  }
+}
+
 /**
  * Whether the mirror has a commit-graph (single file or split chain).
  * Determines if the sync fetch can write incrementally.
@@ -2013,6 +2027,11 @@ export async function runMirrorMaintenance(
           `git prune failed with exit code ${prune.exitCode}`
         )
       }
+      // The commit-graph still lists the commits just pruned; fsck and
+      // incremental graph writes fail on such entries. Rebuild it from
+      // what is reachable now.
+      await removeCommitGraph(mirrorPath)
+      await writeCommitGraph(mirrorPath, remainingSecs())
     }
 
     const packRefs = await exec.getExecOutput(
