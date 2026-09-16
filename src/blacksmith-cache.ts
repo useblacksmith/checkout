@@ -23,13 +23,27 @@ const MIRROR_VERSION = 'v1'
 // burns checkout time on a mirror disk that is having a bad day. The
 // window is kept generous so slow-but-healthy syncs still complete.
 const REFRESH_TIMEOUT_SECS = 120 // 2 minutes, single attempt
-// Post-step mirror maintenance is bounded by construction (it never rewrites
-// packs at or above MAINTENANCE_KEEP_PACK_BYTES), so this deadline is a
-// safety net rather than an expected cost. Running out of it does not
-// affect the commit: the mirror was already synced, maintenance is a pure
-// optimization.
+// Post-step mirror maintenance is bounded by construction (a run never
+// rewrites more than MAINTENANCE_KEEP_PACK_BYTES of existing packs), so this
+// deadline is a safety net rather than an expected cost. Running out of it
+// does not affect the commit: the mirror was already synced, maintenance is
+// a pure optimization.
 const MAINTENANCE_TIMEOUT_SECS = 120 // 2 minutes
+// Packs at or above this size are kept permanently; the packs below it that
+// one run rewrites are chosen so their combined size stays under it too.
 const MAINTENANCE_KEEP_PACK_BYTES = 256 * 1024 * 1024
+// Kept packs hold on to objects that later become unreachable (deleted or
+// rewritten branches). A full rewrite with the keeps lifted reclaims them;
+// it is unbounded in size, so it runs rarely and under its own deadline.
+const MAINTENANCE_RECLAIM_INTERVAL_MS = 14 * 24 * 60 * 60 * 1000
+const MAINTENANCE_RECLAIM_TIMEOUT_SECS = 600
+// Loose objects younger than this survive a reclaim, the usual guard against
+// deleting objects a concurrent writer has stored but not yet referenced.
+const MAINTENANCE_RECLAIM_PRUNE_EXPIRE = '2.weeks.ago'
+// Marker in the mirror root recording the last reclaim attempt.
+export const MAINTENANCE_RECLAIM_STAMP = 'blacksmith-maintenance-reclaim'
+// Content of a `.keep` written only for the duration of one run.
+const DEFERRED_KEEP_MARKER = 'blacksmith-checkout: deferred to a later run\n'
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3 // Number of unmount retry attempts
@@ -1664,11 +1678,28 @@ export function hasCommitGraph(mirrorPath: string): boolean {
   )
 }
 
+export interface KeepSelection {
+  /** Packs with a permanent `.keep`: at or above the keep threshold. */
+  kept: string[]
+  /**
+   * Packs under the threshold that this run leaves alone so that the packs
+   * it does rewrite stay under the threshold combined. Their `.keep` is
+   * removed once the run is over.
+   */
+  deferred: string[]
+}
+
 /**
- * Mark every pack at or above MAINTENANCE_KEEP_PACK_BYTES with a `.keep`
- * file so that no repack - this maintenance, or `gc` run by an older action
- * version on the same mirror - ever rewrites or deletes it. Returns the
- * names (without extension) of all kept packs.
+ * Choose which packs the geometric repack may rewrite. Every pack at or
+ * above `keepBytes` gets a permanent `.keep` file so that no repack - this
+ * maintenance, or `gc` run by an older action version on the same mirror -
+ * ever rewrites or deletes it. Of the remaining packs, the largest are given
+ * a `.keep` for this run only until the rest add up to less than `keepBytes`:
+ * git picks the packs to roll up by object count, so without this several
+ * medium packs could combine into a rewrite far larger than any one of them.
+ * A deferred pack is reconsidered on the next run, once the small packs
+ * around it have been folded. Returns the names (without extension) of both
+ * groups.
  *
  * `.keep` files are used rather than `repack --keep-pack`: git 2.34's
  * geometric repack does not exclude `--keep-pack` packs from the roll-up,
@@ -1680,40 +1711,84 @@ export function hasCommitGraph(mirrorPath: string): boolean {
 export async function markKeepPacks(
   mirrorPath: string,
   keepBytes: number = MAINTENANCE_KEEP_PACK_BYTES
-): Promise<string[]> {
+): Promise<KeepSelection> {
   const packDir = path.join(mirrorPath, 'objects', 'pack')
   const kept: string[] = []
+  const deferred: string[] = []
   let entries: string[]
   try {
     entries = await fs.promises.readdir(packDir)
   } catch {
-    return kept
+    return {kept, deferred}
   }
   const names = new Set(entries)
+  const candidates: Array<{base: string; size: number}> = []
   for (const entry of entries) {
     if (!entry.startsWith('pack-') || !entry.endsWith('.pack')) {
       continue
     }
     const base = entry.slice(0, -'.pack'.length)
-    if (names.has(`${base}.keep`)) {
-      kept.push(base)
-      continue
-    }
+    const keepFile = path.join(packDir, `${base}.keep`)
     try {
+      if (names.has(`${base}.keep`)) {
+        const content = await fs.promises.readFile(keepFile, 'utf8')
+        if (content !== DEFERRED_KEEP_MARKER) {
+          kept.push(base)
+          continue
+        }
+        // Left behind by a run that was killed before it could clean up.
+        await fs.promises.rm(keepFile, {force: true})
+      }
       const stat = await fs.promises.stat(path.join(packDir, entry))
-      if (stat.size < keepBytes) {
+      if (stat.size >= keepBytes) {
+        await fs.promises.writeFile(keepFile, '')
+        core.info(
+          `[git-mirror] Marked ${base} (${Math.round(stat.size / (1024 * 1024))} MiB) as kept`
+        )
+        kept.push(base)
         continue
       }
-      await fs.promises.writeFile(path.join(packDir, `${base}.keep`), '')
-      core.info(
-        `[git-mirror] Marked ${base} (${Math.round(stat.size / (1024 * 1024))} MiB) as kept`
-      )
-      kept.push(base)
+      candidates.push({base, size: stat.size})
     } catch (error) {
       core.warning(`[git-mirror] Failed to mark ${base} as kept: ${error}`)
     }
   }
-  return kept.sort()
+
+  candidates.sort((a, b) => b.size - a.size)
+  let total = candidates.reduce((sum, c) => sum + c.size, 0)
+  for (const {base, size} of candidates) {
+    if (total < keepBytes) {
+      break
+    }
+    try {
+      await fs.promises.writeFile(
+        path.join(packDir, `${base}.keep`),
+        DEFERRED_KEEP_MARKER
+      )
+      core.info(
+        `[git-mirror] Deferred ${base} (${(size / (1024 * 1024)).toFixed(1)} MiB) to a later run`
+      )
+      deferred.push(base)
+      total -= size
+    } catch (error) {
+      core.warning(`[git-mirror] Failed to defer ${base}: ${error}`)
+    }
+  }
+  return {kept: kept.sort(), deferred: deferred.sort()}
+}
+
+async function removeKeepFiles(
+  mirrorPath: string,
+  packs: string[]
+): Promise<void> {
+  for (const base of packs) {
+    const keepFile = path.join(mirrorPath, 'objects', 'pack', `${base}.keep`)
+    try {
+      await fs.promises.rm(keepFile, {force: true})
+    } catch (error) {
+      core.warning(`[git-mirror] Failed to remove ${base}.keep: ${error}`)
+    }
+  }
 }
 
 /**
@@ -1768,17 +1843,70 @@ async function removeMaintenanceLeftovers(mirrorPath: string): Promise<void> {
 }
 
 /**
+ * Whether a reclaim is due, and if so, record this attempt. The stamp is
+ * written before the reclaim runs so that a reclaim that times out is not
+ * retried by every following job. A mirror without a stamp (freshly
+ * hydrated, or maintained by an older action version) starts its interval
+ * now rather than reclaiming immediately, so a rollout does not make every
+ * job in the fleet rewrite its mirror at once.
+ */
+async function reclaimDue(
+  mirrorPath: string,
+  now: number,
+  intervalMs: number
+): Promise<boolean> {
+  const stamp = path.join(mirrorPath, MAINTENANCE_RECLAIM_STAMP)
+  let last: number | undefined
+  try {
+    const parsed = Number((await fs.promises.readFile(stamp, 'utf8')).trim())
+    if (Number.isFinite(parsed)) {
+      last = parsed
+    }
+  } catch {
+    // no stamp yet
+  }
+  if (last !== undefined && now - last < intervalMs) {
+    return false
+  }
+  try {
+    await fs.promises.writeFile(stamp, `${now}\n`)
+  } catch (error) {
+    core.warning(`[git-mirror] Failed to write the reclaim stamp: ${error}`)
+    return false
+  }
+  return last !== undefined
+}
+
+export interface MaintenanceOptions {
+  timeoutSecs?: number
+  keepBytes?: number
+  reclaimIntervalMs?: number
+  reclaimTimeoutSecs?: number
+  now?: number
+}
+
+/**
  * Bounded mirror maintenance, run in the post step once the mirror has been
  * synced. Each sync leaves a new small pack (or loose objects) behind;
  * left alone they accumulate until object lookup slows down. Instead of
  * `gc --auto` - whose "auto packing" step rewrites every pack including the
  * repository's multi-gigabyte base pack, taking minutes on large mirrors -
- * this folds only the small packs and loose objects together with a
- * geometric repack, explicitly keeping any pack at or above
- * MAINTENANCE_KEEP_PACK_BYTES out of the rewrite. A rolled-up pack that
- * grows past that size simply becomes another kept pack, so the cost of a
- * single run is bounded by the keep threshold, never by the size of the
- * repository. The multi-pack-index keeps lookups fast across the kept packs.
+ * this folds only small packs and loose objects together with a geometric
+ * repack. Packs at or above MAINTENANCE_KEEP_PACK_BYTES are kept out of the
+ * rewrite for good, and the packs below it that one run does rewrite are
+ * chosen so their combined size stays under that bound as well (see
+ * markKeepPacks). A rolled-up pack that grows past the threshold simply
+ * becomes another kept pack, so the cost of a single run is bounded by the
+ * threshold, never by the size of the repository. The multi-pack-index
+ * keeps lookups fast across the kept packs.
+ *
+ * Kept packs never lose objects, so history that becomes unreachable stays
+ * on disk. Once per MAINTENANCE_RECLAIM_INTERVAL_MS the run instead lifts
+ * every `.keep` and rewrites the whole mirror into a single pack, dropping
+ * unreachable objects, under the longer MAINTENANCE_RECLAIM_TIMEOUT_SECS.
+ * That rewrite is the one unbounded step; the stamp written beforehand
+ * keeps a mirror too large for the deadline from retrying it every job,
+ * and the incremental runs in between are unaffected either way.
  *
  * Maintenance is optional: its failure or timeout is reported but must not
  * prevent the synced mirror from being committed - otherwise a mirror that
@@ -1787,78 +1915,130 @@ async function removeMaintenanceLeftovers(mirrorPath: string): Promise<void> {
  */
 export async function runMirrorMaintenance(
   mirrorPath: string,
-  timeoutSecs: number = MAINTENANCE_TIMEOUT_SECS,
-  keepBytes: number = MAINTENANCE_KEEP_PACK_BYTES
+  options: MaintenanceOptions = {}
 ): Promise<OperationResult> {
+  const timeoutSecs = options.timeoutSecs ?? MAINTENANCE_TIMEOUT_SECS
+  const keepBytes = options.keepBytes ?? MAINTENANCE_KEEP_PACK_BYTES
+  const reclaimIntervalMs =
+    options.reclaimIntervalMs ?? MAINTENANCE_RECLAIM_INTERVAL_MS
+  const reclaimTimeoutSecs =
+    options.reclaimTimeoutSecs ?? MAINTENANCE_RECLAIM_TIMEOUT_SECS
+  const now = options.now ?? Date.now()
   const start = Date.now()
-  const keptPacks = await markKeepPacks(mirrorPath, keepBytes)
-  core.info(
-    `[git-mirror] Running incremental maintenance (timeout: ${timeoutSecs}s, ${keptPacks.length} kept pack(s))`
-  )
+
+  const reclaim = await reclaimDue(mirrorPath, now, reclaimIntervalMs)
+  const budgetSecs = reclaim ? reclaimTimeoutSecs : timeoutSecs
+  const deadline = start + budgetSecs * 1000
+  const remainingSecs = (): number =>
+    Math.max(1, Math.ceil((deadline - Date.now()) / 1000))
+
+  let deferred: string[] = []
+  let label: string
+  let repackArgs: string[]
+  if (reclaim) {
+    const {kept} = await markKeepPacks(mirrorPath, Number.MAX_SAFE_INTEGER)
+    await removeKeepFiles(mirrorPath, kept)
+    label = 'Reclaim'
+    repackArgs = ['-a', '-d', '-l', '-n', '--write-midx']
+    core.info(
+      `[git-mirror] Running reclaim maintenance (timeout: ${budgetSecs}s, ${kept.length} kept pack(s) released)`
+    )
+  } else {
+    const selection = await markKeepPacks(mirrorPath, keepBytes)
+    deferred = selection.deferred
+    label = 'Incremental'
+    repackArgs = ['-d', '-l', '-n', '--geometric=2', '--write-midx']
+    core.info(
+      `[git-mirror] Running incremental maintenance (timeout: ${budgetSecs}s, ${selection.kept.length} kept pack(s), ${deferred.length} deferred)`
+    )
+  }
+
+  const fail = async (
+    timedOut: boolean,
+    error: string
+  ): Promise<OperationResult> => {
+    core.warning(
+      `[git-mirror] ${
+        timedOut ? `Maintenance timed out after ${budgetSecs}s` : error
+      }; committing the synced mirror without it`
+    )
+    await removeMaintenanceLeftovers(mirrorPath)
+    return {success: false, timedOut, error}
+  }
 
   try {
     const result = await exec.getExecOutput(
       'timeout',
       [
-        String(timeoutSecs),
+        String(remainingSecs()),
         'git',
         '-c',
         'repack.writeBitmaps=false',
         '-C',
         mirrorPath,
         'repack',
-        '-d',
-        '-l',
-        '-n',
-        '--geometric=2',
-        '--write-midx'
+        ...repackArgs
       ],
       {ignoreReturnCode: true}
     )
     if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.warning(
-        `[git-mirror] Maintenance timed out after ${timeoutSecs}s; committing the synced mirror without it`
-      )
-      await removeMaintenanceLeftovers(mirrorPath)
-      return {
-        success: false,
-        timedOut: true,
-        error: `git repack timed out after ${timeoutSecs}s`
-      }
+      return await fail(true, `git repack timed out after ${budgetSecs}s`)
     }
     if (result.exitCode !== 0) {
-      core.warning(
-        `[git-mirror] Maintenance failed with exit code ${result.exitCode}; committing the synced mirror without it`
+      return await fail(
+        false,
+        `git repack failed with exit code ${result.exitCode}`
       )
-      await removeMaintenanceLeftovers(mirrorPath)
-      return {
-        success: false,
-        timedOut: false,
-        error: `git repack failed with exit code ${result.exitCode}`
+    }
+
+    if (reclaim) {
+      const prune = await exec.getExecOutput(
+        'timeout',
+        [
+          String(remainingSecs()),
+          'git',
+          '-C',
+          mirrorPath,
+          'prune',
+          `--expire=${MAINTENANCE_RECLAIM_PRUNE_EXPIRE}`
+        ],
+        {silent: true, ignoreReturnCode: true}
+      )
+      if (prune.exitCode === TIMEOUT_EXIT_CODE) {
+        return await fail(true, `git prune timed out after ${budgetSecs}s`)
+      }
+      if (prune.exitCode !== 0) {
+        return await fail(
+          false,
+          `git prune failed with exit code ${prune.exitCode}`
+        )
       }
     }
 
     const packRefs = await exec.getExecOutput(
       'timeout',
-      [String(timeoutSecs), 'git', '-C', mirrorPath, 'pack-refs', '--all'],
+      [String(remainingSecs()), 'git', '-C', mirrorPath, 'pack-refs', '--all'],
       {silent: true, ignoreReturnCode: true}
     )
+    if (packRefs.exitCode === TIMEOUT_EXIT_CODE) {
+      return await fail(true, `git pack-refs timed out after ${budgetSecs}s`)
+    }
     if (packRefs.exitCode !== 0) {
-      core.warning(
-        `[git-mirror] pack-refs failed with exit code ${packRefs.exitCode}`
+      return await fail(
+        false,
+        `git pack-refs failed with exit code ${packRefs.exitCode}`
       )
-      await removeMaintenanceLeftovers(mirrorPath)
     }
 
     core.info(
-      `[git-mirror] Incremental maintenance finished in ${Date.now() - start}ms`
+      `[git-mirror] ${label} maintenance finished in ${Date.now() - start}ms`
     )
     return {success: true, timedOut: false}
   } catch (error) {
     const msg = (error as Error).message || String(error)
-    core.warning(`[git-mirror] Maintenance failed: ${msg}`)
-    await removeMaintenanceLeftovers(mirrorPath)
-    return {success: false, timedOut: false, error: msg}
+    return await fail(false, msg)
+  } finally {
+    await removeKeepFiles(mirrorPath, deferred)
   }
 }
 

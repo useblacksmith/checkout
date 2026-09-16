@@ -43,6 +43,10 @@ function isRepack(args: string[] | undefined): boolean {
   return (args || []).includes('repack')
 }
 
+function isPackRefs(args: string[] | undefined): boolean {
+  return (args || []).includes('pack-refs')
+}
+
 function commands(): string[][] {
   return mockGetExecOutput.mock.calls.map(([tool, args]) => [
     tool,
@@ -53,6 +57,7 @@ function commands(): string[][] {
 describe('cleanup commit decision', () => {
   let mirrorPath: string
   let repackExitCode: number
+  let packRefsExitCode: number
 
   beforeEach(() => {
     jest.clearAllMocks()
@@ -61,9 +66,14 @@ describe('cleanup commit decision', () => {
     mirrorPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-cleanup-'))
     fs.mkdirSync(path.join(mirrorPath, 'objects', 'pack'), {recursive: true})
     repackExitCode = 0
+    packRefsExitCode = 0
     mockExec.mockResolvedValue(0)
     mockGetExecOutput.mockImplementation(async (_tool, args) => ({
-      exitCode: isRepack(args) ? repackExitCode : 0,
+      exitCode: isRepack(args)
+        ? repackExitCode
+        : isPackRefs(args)
+          ? packRefsExitCode
+          : 0,
       stdout: '',
       stderr: ''
     }))
@@ -123,6 +133,34 @@ describe('cleanup commit decision', () => {
       success: false,
       timedOut: false,
       error: expect.stringContaining('128')
+    })
+    expect(mockCommitStickyDisk).toHaveBeenCalledWith(
+      expect.objectContaining({shouldCommit: true, vmHydratedGitMirror: true})
+    )
+  })
+
+  it('reports a pack-refs failure and still commits', async () => {
+    packRefsExitCode = 1
+    const result = await blacksmithCache.cleanup({...base, mirrorPath})
+
+    expect(result.maintenanceResult).toEqual({
+      success: false,
+      timedOut: false,
+      error: expect.stringContaining('pack-refs failed with exit code 1')
+    })
+    expect(mockCommitStickyDisk).toHaveBeenCalledWith(
+      expect.objectContaining({shouldCommit: true, vmHydratedGitMirror: true})
+    )
+  })
+
+  it('reports a pack-refs timeout and still commits', async () => {
+    packRefsExitCode = 124
+    const result = await blacksmithCache.cleanup({...base, mirrorPath})
+
+    expect(result.maintenanceResult).toEqual({
+      success: false,
+      timedOut: true,
+      error: expect.stringContaining('pack-refs timed out')
     })
     expect(mockCommitStickyDisk).toHaveBeenCalledWith(
       expect.objectContaining({shouldCommit: true, vmHydratedGitMirror: true})
