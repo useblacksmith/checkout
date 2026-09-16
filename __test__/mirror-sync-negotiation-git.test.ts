@@ -54,16 +54,21 @@ function commit(repo: string, msg: string): string {
   return git(repo, 'rev-parse', 'HEAD')
 }
 
-/** Loose + packed object count, i.e. everything a fetch wrote so far. */
-function objectCount(repo: string): number {
-  let total = 0
+function countObjects(repo: string): {loose: number; packed: number} {
+  const counts = {loose: 0, packed: 0}
   for (const line of git(repo, 'count-objects', '-v').split('\n')) {
     const match = /^(count|in-pack): (\d+)$/.exec(line.trim())
     if (match) {
-      total += parseInt(match[2], 10)
+      counts[match[1] === 'count' ? 'loose' : 'packed'] = parseInt(match[2], 10)
     }
   }
-  return total
+  return counts
+}
+
+/** Loose + packed object count, i.e. everything a fetch wrote so far. */
+function objectCount(repo: string): number {
+  const {loose, packed} = countObjects(repo)
+  return loose + packed
 }
 
 function packetLines(packetTrace: string, re: RegExp): Set<string> {
@@ -163,6 +168,10 @@ describe('mirror sync negotiation with real git', () => {
     const packetTrace = path.join(tmpDir, 'sync-packets')
     process.env['GIT_TRACE_PACKET'] = packetTrace
     const before = objectCount(mirrorPath)
+    const looseBefore = countObjects(mirrorPath).loose
+    const packsBefore = fs
+      .readdirSync(path.join(mirrorPath, 'objects', 'pack'))
+      .filter(f => f.endsWith('.pack'))
 
     const result = await blacksmithCache.syncMirrorFromRemote(
       mirrorPath,
@@ -192,5 +201,13 @@ describe('mirror sync negotiation with real git', () => {
     const received = objectCount(mirrorPath) - before
     expect(received).toBeGreaterThan(0)
     expect(received).toBeLessThan(TRUNK_COMMITS_AFTER_FORK)
+
+    // Small as it is, the fetch is stored as a pack rather than loose
+    // objects, so maintenance sees its size.
+    expect(countObjects(mirrorPath).loose).toBe(looseBefore)
+    const packsAfter = fs
+      .readdirSync(path.join(mirrorPath, 'objects', 'pack'))
+      .filter(f => f.endsWith('.pack'))
+    expect(packsAfter.length).toBe(packsBefore.length + 1)
   })
 })

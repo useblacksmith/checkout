@@ -869,6 +869,12 @@ function syncMirrorFromRemote(mirrorPath_1, repoUrl_1, authToken_1) {
                         'gc.auto=0',
                         '-c',
                         'fetch.negotiationAlgorithm=skipping',
+                        // Always store what a sync receives as a pack, never as loose
+                        // objects: maintenance bounds the bytes it rewrites per run by
+                        // pack size (see markKeepPacks), and a large blob that arrived
+                        // loose would not be counted.
+                        '-c',
+                        'fetch.unpackLimit=1',
                         // Keep the commit-graph current so ref-tip commit parsing
                         // (mark_complete_local_refs and negotiation walks) reads one
                         // compact mmap'd file instead of scattered pack entries. Only
@@ -1405,8 +1411,10 @@ function removeCommitGraph(mirrorPath) {
             }
             catch (error) {
                 core.warning(`[git-mirror] Failed to remove ${target}: ${error}`);
+                return false;
             }
         }
+        return true;
     });
 }
 /**
@@ -1635,7 +1643,14 @@ function runMirrorMaintenance(mirrorPath_1) {
         const reclaimTimeoutSecs = (_d = options.reclaimTimeoutSecs) !== null && _d !== void 0 ? _d : MAINTENANCE_RECLAIM_TIMEOUT_SECS;
         const now = (_e = options.now) !== null && _e !== void 0 ? _e : Date.now();
         const start = Date.now();
-        const reclaim = yield reclaimDue(mirrorPath, now, reclaimIntervalMs);
+        // A commit-graph that outlived the full rewrite would still list the
+        // commits it drops; should prune or a later step then fail, the mirror
+        // is committed with that graph and fsck breaks in every following job.
+        // So the graph is removed first, and reclaim is skipped when that fails.
+        // Without a graph git only walks commits the slow way until a new one is
+        // written after a successful prune.
+        const reclaim = (yield reclaimDue(mirrorPath, now, reclaimIntervalMs)) &&
+            (yield removeCommitGraph(mirrorPath));
         const budgetSecs = reclaim ? reclaimTimeoutSecs : timeoutSecs;
         const deadline = start + budgetSecs * 1000;
         const remainingSecs = () => Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
@@ -1693,10 +1708,6 @@ function runMirrorMaintenance(mirrorPath_1) {
                 if (prune.exitCode !== 0) {
                     return yield fail(false, `git prune failed with exit code ${prune.exitCode}`);
                 }
-                // The commit-graph still lists the commits just pruned; fsck and
-                // incremental graph writes fail on such entries. Rebuild it from
-                // what is reachable now.
-                yield removeCommitGraph(mirrorPath);
                 yield writeCommitGraph(mirrorPath, remainingSecs());
             }
             const packRefs = yield exec.getExecOutput('timeout', [String(remainingSecs()), 'git', '-C', mirrorPath, 'pack-refs', '--all'], { silent: true, ignoreReturnCode: true });

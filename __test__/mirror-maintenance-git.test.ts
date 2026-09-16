@@ -375,43 +375,43 @@ describe('runMirrorMaintenance (real git)', () => {
     expect(withoutLimit.deferred).toEqual([])
   })
 
+  // Pushes a branch into its own kept pack, optionally records it in the
+  // commit-graph, then deletes the branch so its objects are unreachable.
+  function addGarbage(
+    root: string,
+    mirror: string,
+    options: {commitGraph?: boolean} = {}
+  ): {pack: string; blob: string; commit: string} {
+    const src = path.join(root, 'src')
+    const before = new Set(packs(mirror))
+    commitBlob(src, 'garbage', 600 * 1024)
+    const blob = git(src, 'rev-parse', 'HEAD:garbage')
+    const commit = git(src, 'rev-parse', 'HEAD')
+    pushPack(src, mirror, 'garbage')
+    const pack = packs(mirror).find(p => !before.has(p)) as string
+    fs.writeFileSync(
+      path.join(mirror, 'objects', 'pack', pack.replace(/\.pack$/, '.keep')),
+      ''
+    )
+    if (options.commitGraph) {
+      git(mirror, 'commit-graph', 'write', '--reachable', '--split')
+    }
+    git(mirror, 'update-ref', '-d', 'refs/heads/garbage')
+    return {pack, blob, commit}
+  }
+
+  function hasObject(mirror: string, oid: string): boolean {
+    try {
+      execFileSync('git', ['-C', mirror, 'cat-file', '-e', oid], {
+        stdio: 'pipe'
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
   describe('reclaim', () => {
-    // Pushes a branch into its own kept pack, optionally records it in the
-    // commit-graph, then deletes the branch so its objects are unreachable.
-    function addGarbage(
-      root: string,
-      mirror: string,
-      options: {commitGraph?: boolean} = {}
-    ): {pack: string; blob: string; commit: string} {
-      const src = path.join(root, 'src')
-      const before = new Set(packs(mirror))
-      commitBlob(src, 'garbage', 600 * 1024)
-      const blob = git(src, 'rev-parse', 'HEAD:garbage')
-      const commit = git(src, 'rev-parse', 'HEAD')
-      pushPack(src, mirror, 'garbage')
-      const pack = packs(mirror).find(p => !before.has(p)) as string
-      fs.writeFileSync(
-        path.join(mirror, 'objects', 'pack', pack.replace(/\.pack$/, '.keep')),
-        ''
-      )
-      if (options.commitGraph) {
-        git(mirror, 'commit-graph', 'write', '--reachable', '--split')
-      }
-      git(mirror, 'update-ref', '-d', 'refs/heads/garbage')
-      return {pack, blob, commit}
-    }
-
-    function hasObject(mirror: string, oid: string): boolean {
-      try {
-        execFileSync('git', ['-C', mirror, 'cat-file', '-e', oid], {
-          stdio: 'pipe'
-        })
-        return true
-      } catch {
-        return false
-      }
-    }
-
     it('starts the interval on first sight instead of reclaiming at once', async () => {
       const {mirror} = buildMirror(root)
       const {pack, blob} = addGarbage(root, mirror)
@@ -662,6 +662,33 @@ PATH="${binDir}:$PATH" exec ${realTimeout} "$@"
       expect(fs.existsSync(keepFile)).toBe(true)
       expect(packs(mirror)).toContain(basePack)
       fsck(mirror)
+    })
+
+    it('a prune failure after the reclaim repack leaves no stale commit-graph', async () => {
+      const {mirror} = buildMirror(root)
+      const {commit} = addGarbage(root, mirror, {commitGraph: true})
+      expect(blacksmithCache.hasCommitGraph(mirror)).toBe(true)
+      stampReclaim(mirror, 0)
+      installFakeGit('    exit 7', 'prune')
+
+      const result = await blacksmithCache.runMirrorMaintenance(mirror, {
+        timeoutSecs: 60,
+        keepBytes: KEEP_BYTES,
+        reclaimIntervalMs: 10_000,
+        now: 20_000
+      })
+      expect(result).toEqual({
+        success: false,
+        timedOut: false,
+        error: expect.stringContaining('prune failed with exit code 7')
+      })
+
+      // The repack already dropped the unreachable commit; a graph still
+      // listing it would fail fsck in every later job.
+      expect(hasObject(mirror, commit)).toBe(false)
+      expect(blacksmithCache.hasCommitGraph(mirror)).toBe(false)
+      fsck(mirror)
+      refsResolve(mirror)
     })
   })
 })

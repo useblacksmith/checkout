@@ -1010,6 +1010,12 @@ export async function syncMirrorFromRemote(
           'gc.auto=0',
           '-c',
           'fetch.negotiationAlgorithm=skipping',
+          // Always store what a sync receives as a pack, never as loose
+          // objects: maintenance bounds the bytes it rewrites per run by
+          // pack size (see markKeepPacks), and a large blob that arrived
+          // loose would not be counted.
+          '-c',
+          'fetch.unpackLimit=1',
           // Keep the commit-graph current so ref-tip commit parsing
           // (mark_complete_local_refs and negotiation walks) reads one
           // compact mmap'd file instead of scattered pack entries. Only
@@ -1659,7 +1665,7 @@ async function writeCommitGraph(
   }
 }
 
-async function removeCommitGraph(mirrorPath: string): Promise<void> {
+async function removeCommitGraph(mirrorPath: string): Promise<boolean> {
   const info = path.join(mirrorPath, 'objects', 'info')
   for (const target of [
     path.join(info, 'commit-graph'),
@@ -1669,8 +1675,10 @@ async function removeCommitGraph(mirrorPath: string): Promise<void> {
       await fs.promises.rm(target, {recursive: true, force: true})
     } catch (error) {
       core.warning(`[git-mirror] Failed to remove ${target}: ${error}`)
+      return false
     }
   }
+  return true
 }
 
 /**
@@ -1940,7 +1948,15 @@ export async function runMirrorMaintenance(
   const now = options.now ?? Date.now()
   const start = Date.now()
 
-  const reclaim = await reclaimDue(mirrorPath, now, reclaimIntervalMs)
+  // A commit-graph that outlived the full rewrite would still list the
+  // commits it drops; should prune or a later step then fail, the mirror
+  // is committed with that graph and fsck breaks in every following job.
+  // So the graph is removed first, and reclaim is skipped when that fails.
+  // Without a graph git only walks commits the slow way until a new one is
+  // written after a successful prune.
+  const reclaim =
+    (await reclaimDue(mirrorPath, now, reclaimIntervalMs)) &&
+    (await removeCommitGraph(mirrorPath))
   const budgetSecs = reclaim ? reclaimTimeoutSecs : timeoutSecs
   const deadline = start + budgetSecs * 1000
   const remainingSecs = (): number =>
@@ -2027,10 +2043,6 @@ export async function runMirrorMaintenance(
           `git prune failed with exit code ${prune.exitCode}`
         )
       }
-      // The commit-graph still lists the commits just pruned; fsck and
-      // incremental graph writes fail on such entries. Rebuild it from
-      // what is reachable now.
-      await removeCommitGraph(mirrorPath)
       await writeCommitGraph(mirrorPath, remainingSecs())
     }
 
