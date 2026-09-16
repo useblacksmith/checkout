@@ -164,9 +164,11 @@ async function cleanup(): Promise<void> {
       })
     }
     if (cleanupResult) {
-      if (!cleanupResult.gcResult.success) {
+      if (!cleanupResult.maintenanceResult.success) {
         await reportInternalMetric('git_mirror_gc_failure', 1, {
-          reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
+          reason: cleanupResult.maintenanceResult.timedOut
+            ? 'timeout'
+            : 'failure'
         })
       }
     }

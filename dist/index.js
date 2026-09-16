@@ -65,6 +65,8 @@ exports.fetchRefsFromMirror = fetchRefsFromMirror;
 exports.writeAlternates = writeAlternates;
 exports.dissociate = dissociate;
 exports.hasCommitGraph = hasCommitGraph;
+exports.markKeepPacks = markKeepPacks;
+exports.runMirrorMaintenance = runMirrorMaintenance;
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -73,7 +75,7 @@ const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
 const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
-const stickydisk_connect_1 = __nccwpck_require__(2880);
+const stickydisk_connect_1 = __nccwpck_require__(783);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const container_detector_1 = __nccwpck_require__(6424);
 // Without a deadline, a black-holed dial stalls the checkout until the OS
@@ -89,7 +91,13 @@ const MIRROR_VERSION = 'v1';
 // burns checkout time on a mirror disk that is having a bad day. The
 // window is kept generous so slow-but-healthy syncs still complete.
 const REFRESH_TIMEOUT_SECS = 120; // 2 minutes, single attempt
-const GC_TIMEOUT_SECS = 120; // 2 minutes
+// Post-step mirror maintenance is bounded by construction (it never rewrites
+// packs at or above MAINTENANCE_KEEP_PACK_BYTES), so this deadline is a
+// safety net rather than an expected cost. Running out of it does not
+// affect the commit: the mirror was already synced, maintenance is a pure
+// optimization.
+const MAINTENANCE_TIMEOUT_SECS = 120; // 2 minutes
+const MAINTENANCE_KEEP_PACK_BYTES = 256 * 1024 * 1024;
 const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
 const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
@@ -1338,13 +1346,12 @@ function dissociate(workspacePath, env) {
 /**
  * Write the mirror's commit-graph so subsequent commit parsing (e.g. the
  * per-ref walks inside fetch) is a lookup in one compact file instead of
- * scattered pack reads. Reading commit-graphs is enabled by default in git;
- * writing only happens during a real gc, so a freshly cloned mirror has
- * none until the first threshold-tripping `gc --auto`. Failure is
- * non-fatal - the graph is a pure cache.
+ * scattered pack reads. Reading commit-graphs is enabled by default in git,
+ * but a freshly cloned mirror has none until something writes it. Failure
+ * is non-fatal - the graph is a pure cache.
  */
 function writeCommitGraph(mirrorPath_1) {
-    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = MAINTENANCE_TIMEOUT_SECS) {
         try {
             const start = Date.now();
             const result = yield exec.getExecOutput('timeout', [
@@ -1380,52 +1387,176 @@ function hasCommitGraph(mirrorPath) {
         fs.existsSync(path.join(mirrorPath, 'objects', 'info', 'commit-graphs', 'commit-graph-chain')));
 }
 /**
- * Run lightweight garbage collection on the mirror.
- * Uses --auto to only run GC when git determines it's needed (based on loose object count).
- * This avoids expensive full repacks on every run while still keeping the repo tidy over time.
+ * Mark every pack at or above MAINTENANCE_KEEP_PACK_BYTES with a `.keep`
+ * file so that no repack - this maintenance, or `gc` run by an older action
+ * version on the same mirror - ever rewrites or deletes it. Returns the
+ * names (without extension) of all kept packs.
+ *
+ * `.keep` files are used rather than `repack --keep-pack`: git 2.34's
+ * geometric repack does not exclude `--keep-pack` packs from the roll-up,
+ * so with `-d` it deletes the kept pack and loses its objects. Kept packs
+ * are ignored by `--honor-pack-keep` only in the repository they live in,
+ * so a workspace repack over the mirror alternate (dissociate) still copies
+ * their objects.
  */
-function runMirrorGC(mirrorPath_1) {
-    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = GC_TIMEOUT_SECS) {
-        core.info(`[git-mirror] Running auto garbage collection (timeout: ${timeoutSecs}s)`);
+function markKeepPacks(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, keepBytes = MAINTENANCE_KEEP_PACK_BYTES) {
+        const packDir = path.join(mirrorPath, 'objects', 'pack');
+        const kept = [];
+        let entries;
         try {
-            // --auto: only run if thresholds exceeded (default: 6700 loose objects or 50 packs)
-            // This is much faster than a full gc when not needed
-            // gc.autoDetach=false: prevent git from forking a background daemon for GC.
-            // Without this, the parent `git gc --auto` returns immediately while the
-            // daemonized child keeps running with cwd and mmap'd pack files on the
-            // mirror mount, causing the subsequent `umount` to fail with EBUSY.
+            entries = yield fs.promises.readdir(packDir);
+        }
+        catch (_a) {
+            return kept;
+        }
+        const names = new Set(entries);
+        for (const entry of entries) {
+            if (!entry.startsWith('pack-') || !entry.endsWith('.pack')) {
+                continue;
+            }
+            const base = entry.slice(0, -'.pack'.length);
+            if (names.has(`${base}.keep`)) {
+                kept.push(base);
+                continue;
+            }
+            try {
+                const stat = yield fs.promises.stat(path.join(packDir, entry));
+                if (stat.size < keepBytes) {
+                    continue;
+                }
+                yield fs.promises.writeFile(path.join(packDir, `${base}.keep`), '');
+                core.info(`[git-mirror] Marked ${base} (${Math.round(stat.size / (1024 * 1024))} MiB) as kept`);
+                kept.push(base);
+            }
+            catch (error) {
+                core.warning(`[git-mirror] Failed to mark ${base} as kept: ${error}`);
+            }
+        }
+        return kept.sort();
+    });
+}
+/**
+ * Remove temporary files and lock files a killed maintenance process may
+ * have left in the mirror. Only the post step touches the mirror, and
+ * `timeout` has already signalled the whole process group by the time this
+ * runs, so any such file is stale and would make the next job's sync fail
+ * on a lock that nobody holds. Best effort: a still-exiting process removing
+ * the same file is harmless.
+ */
+function removeMaintenanceLeftovers(mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const sweeps = [
+            {
+                dir: path.join(mirrorPath, 'objects', 'pack'),
+                match: name => name.startsWith('tmp_') ||
+                    name.startsWith('.tmp-') ||
+                    name.endsWith('.lock')
+            },
+            {
+                dir: path.join(mirrorPath, 'objects', 'info'),
+                match: name => name.endsWith('.lock')
+            },
+            {
+                dir: path.join(mirrorPath, 'objects', 'info', 'commit-graphs'),
+                match: name => name.endsWith('.lock')
+            },
+            {
+                dir: mirrorPath,
+                match: name => name === 'packed-refs.lock'
+            }
+        ];
+        for (const { dir, match } of sweeps) {
+            let entries;
+            try {
+                entries = yield fs.promises.readdir(dir);
+            }
+            catch (_a) {
+                continue;
+            }
+            for (const entry of entries) {
+                if (!match(entry)) {
+                    continue;
+                }
+                try {
+                    yield fs.promises.rm(path.join(dir, entry), { force: true });
+                    core.info(`[git-mirror] Removed stale maintenance file ${entry}`);
+                }
+                catch (error) {
+                    core.warning(`[git-mirror] Failed to remove ${entry}: ${error}`);
+                }
+            }
+        }
+    });
+}
+/**
+ * Bounded mirror maintenance, run in the post step once the mirror has been
+ * synced. Each sync leaves a new small pack (or loose objects) behind;
+ * left alone they accumulate until object lookup slows down. Instead of
+ * `gc --auto` - whose "auto packing" step rewrites every pack including the
+ * repository's multi-gigabyte base pack, taking minutes on large mirrors -
+ * this folds only the small packs and loose objects together with a
+ * geometric repack, explicitly keeping any pack at or above
+ * MAINTENANCE_KEEP_PACK_BYTES out of the rewrite. A rolled-up pack that
+ * grows past that size simply becomes another kept pack, so the cost of a
+ * single run is bounded by the keep threshold, never by the size of the
+ * repository. The multi-pack-index keeps lookups fast across the kept packs.
+ *
+ * Maintenance is optional: its failure or timeout is reported but must not
+ * prevent the synced mirror from being committed - otherwise a mirror that
+ * needs more maintenance than the deadline allows is never persisted, and
+ * every subsequent job repeats the same doomed work.
+ */
+function runMirrorMaintenance(mirrorPath_1) {
+    return __awaiter(this, arguments, void 0, function* (mirrorPath, timeoutSecs = MAINTENANCE_TIMEOUT_SECS, keepBytes = MAINTENANCE_KEEP_PACK_BYTES) {
+        const start = Date.now();
+        const keptPacks = yield markKeepPacks(mirrorPath, keepBytes);
+        core.info(`[git-mirror] Running incremental maintenance (timeout: ${timeoutSecs}s, ${keptPacks.length} kept pack(s))`);
+        try {
             const result = yield exec.getExecOutput('timeout', [
                 String(timeoutSecs),
                 'git',
                 '-c',
-                'gc.autoDetach=false',
+                'repack.writeBitmaps=false',
                 '-C',
                 mirrorPath,
-                'gc',
-                '--auto'
+                'repack',
+                '-d',
+                '-l',
+                '-n',
+                '--geometric=2',
+                '--write-midx'
             ], { ignoreReturnCode: true });
             if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                core.warning(`[git-mirror] GC timed out after ${timeoutSecs}s`);
+                core.warning(`[git-mirror] Maintenance timed out after ${timeoutSecs}s; committing the synced mirror without it`);
+                yield removeMaintenanceLeftovers(mirrorPath);
                 return {
                     success: false,
                     timedOut: true,
-                    error: `git gc timed out after ${timeoutSecs}s`
+                    error: `git repack timed out after ${timeoutSecs}s`
                 };
             }
             if (result.exitCode !== 0) {
-                core.warning(`[git-mirror] GC failed with exit code ${result.exitCode}`);
+                core.warning(`[git-mirror] Maintenance failed with exit code ${result.exitCode}; committing the synced mirror without it`);
+                yield removeMaintenanceLeftovers(mirrorPath);
                 return {
                     success: false,
                     timedOut: false,
-                    error: `git gc failed with exit code ${result.exitCode}`
+                    error: `git repack failed with exit code ${result.exitCode}`
                 };
             }
-            core.debug('[git-mirror] Completed git gc --auto');
+            const packRefs = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'git', '-C', mirrorPath, 'pack-refs', '--all'], { silent: true, ignoreReturnCode: true });
+            if (packRefs.exitCode !== 0) {
+                core.warning(`[git-mirror] pack-refs failed with exit code ${packRefs.exitCode}`);
+                yield removeMaintenanceLeftovers(mirrorPath);
+            }
+            core.info(`[git-mirror] Incremental maintenance finished in ${Date.now() - start}ms`);
             return { success: true, timedOut: false };
         }
         catch (error) {
             const msg = error.message || String(error);
-            core.warning(`[git-mirror] GC failed: ${msg}`);
+            core.warning(`[git-mirror] Maintenance failed: ${msg}`);
+            yield removeMaintenanceLeftovers(mirrorPath);
             return { success: false, timedOut: false, error: msg };
         }
     });
@@ -1522,10 +1653,11 @@ function flushBlockDevice(devicePath) {
     });
 }
 /**
- * Cleanup: run GC, sync, unmount, and commit the sticky disk.
+ * Cleanup: run mirror maintenance, sync, unmount, and commit the sticky disk.
  *
- * Execution order: GC → sync → unmount (with retry) → flush → commit
- * If the mirror sync or GC failed or timed out, shouldCommit is set to false.
+ * Execution order: maintenance → sync → unmount (with retry) → flush → commit
+ * If the mirror sync failed or timed out, shouldCommit is set to false.
+ * Maintenance failure or timeout does not affect the commit.
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -1533,12 +1665,12 @@ function cleanup(options) {
         const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut } = options;
         let { shouldCommit } = options;
         // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
-        // (due to GC/refresh failure), we must not tell the backend that
-        // hydration completed, otherwise it marks the entry as ready despite no
-        // valid disk being persisted.
+        // (due to sync failure), we must not tell the backend that hydration
+        // completed, otherwise it marks the entry as ready despite no valid disk
+        // being persisted.
         let vmHydratedGitMirror = options.vmHydratedGitMirror;
         const result = {
-            gcResult: { success: true, timedOut: false }
+            maintenanceResult: { success: true, timedOut: false }
         };
         core.info(`[git-mirror] Starting cleanup: exposeId=${exposeId}, stickyDiskKey=${stickyDiskKey}, shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
         // If the mirror sync failed or timed out, don't commit
@@ -1548,19 +1680,14 @@ function cleanup(options) {
             shouldCommit = false;
             vmHydratedGitMirror = false;
         }
-        if (mirrorPath) {
-            // Run GC on the mirror
-            result.gcResult = yield runMirrorGC(mirrorPath);
-            if (!result.gcResult.success) {
-                core.warning('[git-mirror] GC failed or timed out, will not commit sticky disk');
-                shouldCommit = false;
-                vmHydratedGitMirror = false;
-            }
+        // Maintenance only pays off if the result is persisted.
+        if (mirrorPath && shouldCommit) {
+            result.maintenanceResult = yield runMirrorMaintenance(mirrorPath);
             // Catch-up for mirrors that predate commit-graph writing: build the
             // initial graph here in the post step, off the checkout critical path.
-            // Once it exists, the sync fetch keeps it current incrementally. Only
-            // worth doing when the disk is being committed; failure is non-fatal.
-            if (shouldCommit && !hasCommitGraph(mirrorPath)) {
+            // Once it exists, the sync fetch keeps it current incrementally.
+            // Failure is non-fatal.
+            if (!hasCommitGraph(mirrorPath)) {
                 yield writeCommitGraph(mirrorPath);
             }
         }
@@ -4272,9 +4399,11 @@ function cleanup() {
                 });
             }
             if (cleanupResult) {
-                if (!cleanupResult.gcResult.success) {
+                if (!cleanupResult.maintenanceResult.success) {
                     yield (0, internal_metrics_1.reportInternalMetric)('git_mirror_gc_failure', 1, {
-                        reason: cleanupResult.gcResult.timedOut ? 'timeout' : 'failure'
+                        reason: cleanupResult.maintenanceResult.timedOut
+                            ? 'timeout'
+                            : 'failure'
                     });
                 }
             }
@@ -61420,7 +61549,7 @@ module.exports = parseParams
 
 /***/ }),
 
-/***/ 2880:
+/***/ 783:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 "use strict";
@@ -65151,7 +65280,7 @@ const proto3 = makeProtoRuntime("proto3", (fields) => {
     }
 });
 
-;// CONCATENATED MODULE: ./node_modules/@buf/blacksmith_vm-agent.connectrpc_es/node_modules/@buf/blacksmith_vm-agent.bufbuild_es/stickydisk/v1/stickydisk_pb.js
+;// CONCATENATED MODULE: ./node_modules/@buf/blacksmith_vm-agent.bufbuild_es/stickydisk/v1/stickydisk_pb.js
 // @generated by protoc-gen-es v1.10.0
 // @generated from file stickydisk/v1/stickydisk.proto (package stickydisk.v1, syntax proto3)
 /* eslint-disable */
@@ -65227,6 +65356,8 @@ const CommitSkipReason = /*@__PURE__*/ proto3.makeEnum(
     {no: 4, name: "COMMIT_SKIP_REASON_CLEANUP_ERROR", localName: "CLEANUP_ERROR"},
     {no: 5, name: "COMMIT_SKIP_REASON_AMBIGUOUS", localName: "AMBIGUOUS"},
     {no: 6, name: "COMMIT_SKIP_REASON_NO_EXPOSE", localName: "NO_EXPOSE"},
+    {no: 7, name: "COMMIT_SKIP_REASON_SERVER_DECLINED", localName: "SERVER_DECLINED"},
+    {no: 8, name: "COMMIT_SKIP_REASON_HOOK_SKIPPED", localName: "HOOK_SKIPPED"},
   ],
 );
 
@@ -65453,6 +65584,12 @@ const DockerJobLifecycle = /*@__PURE__*/ proto3.makeMessageType(
     { no: 19, name: "buildkitd_sigkill_used", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 20, name: "history_export_timed_out", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 21, name: "history_prune_failed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 22, name: "timeline_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 23, name: "timeline_truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 24, name: "history_export_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 25, name: "traces_dropped_oversize", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 26, name: "traces_dropped_payload_cap", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 27, name: "records_dropped_payload_cap", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
   ],
 );
 
