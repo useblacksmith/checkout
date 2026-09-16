@@ -88,13 +88,18 @@ function fsck(mirror: string): void {
 
 /**
  * Bare mirror with one base pack larger than KEEP_BYTES, several small
- * packs (pushed with receive.unpackLimit=1) and a few loose objects.
+ * packs (pushed with receive.unpackLimit=1) and a few loose objects. Auto
+ * maintenance on the receiving side is disabled so the pack layout is
+ * exactly what the pushes produced, whatever the git version.
  */
 function buildMirror(root: string): {mirror: string; basePack: string} {
   const src = path.join(root, 'src')
   const mirror = path.join(root, 'mirror.git')
   fs.mkdirSync(src)
   git(root, 'init', '-q', '--bare', 'mirror.git')
+  git(mirror, 'config', 'gc.auto', '0')
+  git(mirror, 'config', 'receive.autogc', 'false')
+  git(mirror, 'config', 'maintenance.auto', 'false')
   git(root, 'init', '-q', '-b', 'main', 'src')
   for (let i = 0; i < 6; i++) {
     commitBlob(src, `base-${i}`, 300 * 1024)
