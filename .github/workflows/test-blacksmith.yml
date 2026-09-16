@@ -128,6 +128,11 @@ jobs:
   # checkout step mounts its own copy of the last commit, so ownership cannot be
   # flipped between two steps of one job; the takeover is only observable
   # across jobs, and in the VM direction only after a container job committed.)
+  #
+  # With sticky disk branch protection on, only trusted triggers (push to main)
+  # may hydrate the mirror. When no hydrated mirror exists yet, PR runs are
+  # sent down the direct-checkout fallback; they verify that fallback and
+  # report the mirror assertions as skipped instead of failing.
   test-git-mirror-container:
     runs-on: blacksmith
     container:
@@ -168,6 +173,14 @@ jobs:
           test "$(id -u)" = 0
           mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
           if ! mountpoint -q "$(dirname "$(dirname "$mirror")")"; then
+            if [ "$GITHUB_EVENT_NAME" != push ]; then
+              echo "::notice::Sticky disk not mounted (mirror not hydrated for a ${GITHUB_EVENT_NAME} run); verifying the direct-checkout fallback only"
+              cd host-owned
+              git config --global --add safe.directory "$PWD"
+              test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+              git fsck --no-dangling
+              exit 0
+            fi
             echo "Sticky disk is not mounted inside the container; the mirror path was not exercised"
             exit 1
           fi
@@ -205,6 +218,16 @@ jobs:
         run: |
           set -euo pipefail
           mirror="/blacksmith-git-mirror/${GITHUB_REPOSITORY}/v1/${GITHUB_REPOSITORY_OWNER}-${GITHUB_REPOSITORY#*/}.git"
+          if ! mountpoint -q "$(dirname "$(dirname "$mirror")")"; then
+            if [ "$GITHUB_EVENT_NAME" != push ]; then
+              echo "::notice::Sticky disk not mounted (mirror not hydrated for a ${GITHUB_EVENT_NAME} run); verifying the direct-checkout fallback only"
+              test "$(git -C after-container rev-parse HEAD)" = "$GITHUB_SHA"
+              git -C after-container fsck --no-dangling
+              exit 0
+            fi
+            echo "Sticky disk is not mounted; the mirror path was not exercised"
+            exit 1
+          fi
           test -d "$mirror"
           test "$(stat -c %u "$mirror")" = "$(id -u)"
           grep -qF "$mirror/objects" after-container/.git/objects/info/alternates
