@@ -133,8 +133,14 @@ jobs:
   # may hydrate the mirror. When no hydrated mirror exists yet, PR runs are
   # sent down the direct-checkout fallback; they verify that fallback and
   # report the mirror assertions as skipped instead of failing.
+  #
+  # Runs after the VM job: while one job hydrates a fresh mirror entity, the
+  # backend answers concurrent requests with "hydration in progress" and those
+  # jobs clone directly, so a container job started alongside the VM job would
+  # miss the mirror whenever the entity was new (first push after a purge).
   test-git-mirror-container:
     runs-on: blacksmith
+    needs: test-git-mirror
     container:
       image: ubuntu:24.04
       options: --privileged -v /dev:/dev
