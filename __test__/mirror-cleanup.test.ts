@@ -95,7 +95,10 @@ describe('cleanup commit decision', () => {
   it('runs bounded maintenance instead of gc --auto and commits', async () => {
     const result = await blacksmithCache.cleanup({...base, mirrorPath})
 
-    expect(result.maintenanceResult).toEqual({success: true, timedOut: false})
+    expect(result.maintenanceResult).toMatchObject({
+      success: true,
+      timedOut: false
+    })
     const repack = commands().find(c => c.includes('repack'))
     expect(repack).toBeDefined()
     expect(repack).toEqual(
@@ -129,7 +132,7 @@ describe('cleanup commit decision', () => {
     repackExitCode = 128
     const result = await blacksmithCache.cleanup({...base, mirrorPath})
 
-    expect(result.maintenanceResult).toEqual({
+    expect(result.maintenanceResult).toMatchObject({
       success: false,
       timedOut: false,
       error: expect.stringContaining('128')
@@ -143,7 +146,7 @@ describe('cleanup commit decision', () => {
     packRefsExitCode = 1
     const result = await blacksmithCache.cleanup({...base, mirrorPath})
 
-    expect(result.maintenanceResult).toEqual({
+    expect(result.maintenanceResult).toMatchObject({
       success: false,
       timedOut: false,
       error: expect.stringContaining('pack-refs failed with exit code 1')
@@ -157,7 +160,7 @@ describe('cleanup commit decision', () => {
     packRefsExitCode = 124
     const result = await blacksmithCache.cleanup({...base, mirrorPath})
 
-    expect(result.maintenanceResult).toEqual({
+    expect(result.maintenanceResult).toMatchObject({
       success: false,
       timedOut: true,
       error: expect.stringContaining('pack-refs timed out')
@@ -174,7 +177,11 @@ describe('cleanup commit decision', () => {
       mirrorSyncFailed: true
     })
 
-    expect(result.maintenanceResult).toEqual({success: true, timedOut: false})
+    expect(result.maintenanceResult).toEqual({
+      success: true,
+      timedOut: false,
+      skipped: true
+    })
     expect(commands().some(c => c.includes('repack'))).toBe(false)
     expect(mockCommitStickyDisk).toHaveBeenCalledWith(
       expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: false})

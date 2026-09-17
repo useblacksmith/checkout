@@ -190,7 +190,9 @@ describe('runMirrorMaintenance (real git)', () => {
       timeoutSecs: 60,
       keepBytes: KEEP_BYTES
     })
-    expect(result).toEqual({success: true, timedOut: false})
+    expect(result).toMatchObject({success: true, timedOut: false})
+    expect(result.skipped).toBeUndefined()
+    expect(result.mirrorSizeBytes).toBeGreaterThan(before.size)
 
     const packDir = path.join(mirror, 'objects', 'pack')
     expect(
@@ -222,7 +224,11 @@ describe('runMirrorMaintenance (real git)', () => {
       timeoutSecs: 60,
       keepBytes: KEEP_BYTES
     })
-    expect(result).toEqual({success: true, timedOut: false})
+    expect(result).toMatchObject({
+      success: true,
+      timedOut: false,
+      skipped: true
+    })
     expect(packs(mirror)).toEqual(first)
     fsck(mirror)
   })
@@ -322,7 +328,7 @@ describe('runMirrorMaintenance (real git)', () => {
         timeoutSecs: 60,
         keepBytes: KEEP_BYTES
       })
-      expect(result).toEqual({success: true, timedOut: false})
+      expect(result).toMatchObject({success: true, timedOut: false})
       const after = packSizes(mirror)
       expect(bytesWritten(before, after)).toBeLessThan(KEEP_BYTES)
       expect(after.has(basePack)).toBe(true)
@@ -423,7 +429,7 @@ describe('runMirrorMaintenance (real git)', () => {
         keepBytes: KEEP_BYTES,
         now: 1000
       })
-      expect(result).toEqual({success: true, timedOut: false})
+      expect(result).toMatchObject({success: true, timedOut: false})
       expect(fs.readFileSync(stamp, 'utf8').trim()).toBe('1000')
       expect(packs(mirror)).toContain(pack)
       expect(hasObject(mirror, blob)).toBe(true)
@@ -456,7 +462,7 @@ describe('runMirrorMaintenance (real git)', () => {
         reclaimIntervalMs: 10_000,
         now: 20_000
       })
-      expect(result).toEqual({success: true, timedOut: false})
+      expect(result).toMatchObject({success: true, timedOut: false})
 
       const packDir = path.join(mirror, 'objects', 'pack')
       const remaining = packs(mirror)
@@ -491,7 +497,7 @@ describe('runMirrorMaintenance (real git)', () => {
         reclaimIntervalMs: 10_000,
         now: 25_000
       })
-      expect(next).toEqual({success: true, timedOut: false})
+      expect(next).toMatchObject({success: true, timedOut: false})
       expect(packs(mirror)).toEqual(remaining)
       expect(fs.readdirSync(packDir).filter(f => f.endsWith('.keep'))).toEqual([
         remaining[0].replace(/\.pack$/, '.keep')
@@ -594,7 +600,7 @@ PATH="${binDir}:$PATH" exec ${realTimeout} "$@"
         timeoutSecs: 60,
         keepBytes: KEEP_BYTES
       })
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         timedOut: false,
         error: expect.stringContaining('pack-refs failed with exit code 3')
@@ -615,7 +621,7 @@ PATH="${binDir}:$PATH" exec ${realTimeout} "$@"
         timeoutSecs: 1,
         keepBytes: KEEP_BYTES
       })
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         timedOut: true,
         error: expect.stringContaining('pack-refs timed out')
@@ -658,7 +664,7 @@ PATH="${binDir}:$PATH" exec ${realTimeout} "$@"
         reclaimIntervalMs: 10_000,
         now: 25_000
       })
-      expect(next).toEqual({success: true, timedOut: false})
+      expect(next).toMatchObject({success: true, timedOut: false})
       expect(fs.existsSync(keepFile)).toBe(true)
       expect(packs(mirror)).toContain(basePack)
       fsck(mirror)
@@ -677,7 +683,7 @@ PATH="${binDir}:$PATH" exec ${realTimeout} "$@"
         reclaimIntervalMs: 10_000,
         now: 20_000
       })
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         success: false,
         timedOut: false,
         error: expect.stringContaining('prune failed with exit code 7')

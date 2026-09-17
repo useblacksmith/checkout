@@ -10,6 +10,7 @@ import * as refHelper from './ref-helper'
 import * as stateHelper from './state-helper'
 import * as urlHelper from './url-helper'
 import * as blacksmithCache from './blacksmith-cache'
+import * as mirrorTelemetry from './mirror-telemetry'
 import {
   FetchOptions,
   MinimumGitAlternateRefsCommandVersion,
@@ -19,11 +20,52 @@ import {
 import {IGitSourceSettings} from './git-source-settings'
 
 export async function getSource(settings: IGitSourceSettings): Promise<void> {
+  // Structured checkout telemetry, reported to the Blacksmith agent at the
+  // end of the main step. Fail-soft: measurement or reporting problems only
+  // degrade the report, never the checkout.
+  const report = mirrorTelemetry.newCheckoutReport()
+  const totalStart = Date.now()
+  let hydrationReport: mirrorTelemetry.HydrationReport | null = null
+  try {
+    await getSourceInner(settings, report, r => {
+      hydrationReport = r
+    })
+    report.outcome = 'success'
+  } catch (error) {
+    report.outcome = 'failure'
+    // Overwrite any recovered fallback error class: on failure the class must
+    // describe the error that actually failed the checkout.
+    report.error_class = mirrorTelemetry.classifyError(error)
+    throw error
+  } finally {
+    report.total_ms = Date.now() - totalStart
+    if (blacksmithCache.isBlacksmithEnvironment()) {
+      if (hydrationReport) {
+        await mirrorTelemetry.reportHydration(hydrationReport)
+      }
+      await mirrorTelemetry.reportCheckout(report)
+    }
+  }
+}
+
+async function getSourceInner(
+  settings: IGitSourceSettings,
+  report: mirrorTelemetry.CheckoutReport,
+  onHydrationReport: (r: mirrorTelemetry.HydrationReport) => void
+): Promise<void> {
   // Repository URL
   core.info(
     `Syncing repository: ${settings.repositoryOwner}/${settings.repositoryName}`
   )
   const repositoryUrl = urlHelper.getFetchUrl(settings)
+  report.sticky_disk_key = blacksmithCache.stickyDiskKeyFor(
+    settings.repositoryOwner,
+    settings.repositoryName
+  )
+  report.shallow = settings.fetchDepth > 0
+  report.filter = !!settings.filter || settings.sparseCheckout != null
+  report.submodules_enabled = settings.submodules
+  report.lfs_enabled = settings.lfs
 
   // Remove conflicting file path
   if (fsHelper.fileExistsSync(settings.repositoryPath)) {
@@ -119,16 +161,19 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // the workspace copy its refs from the mirror instead of the network.
     let mirrorFresh = false
     if (blacksmithCache.shouldUseBlacksmithCache()) {
+      const setupStart = Date.now()
       try {
         core.startGroup('Setting up Blacksmith git mirror cache')
         cacheInfo = await blacksmithCache.setupCache(
           settings.repositoryOwner,
           settings.repositoryName
         )
+        report.sticky_disk_setup_ms = Date.now() - setupStart
 
         // Check if hydration is in progress - another job is doing the initial git clone --mirror
         if (cacheInfo.hydrationInProgress) {
           // Warning already logged by setupCache, just fall back to standard checkout
+          report.serving_mode = 'fallback-contention'
           cacheInfo = null
           core.endGroup()
         } else {
@@ -142,18 +187,54 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
             cacheInfo.commitEarlyDenyReason
           )
 
-          const performedHydration = await blacksmithCache.ensureMirror(
-            cacheInfo.mirrorPath,
-            repositoryUrl,
-            settings.authToken,
-            settings.verbose
+          const mirrorExisted = fsHelper.directoryExistsSync(
+            cacheInfo.mirrorPath
           )
+          const cloneStart = Date.now()
+          let performedHydration = false
+          try {
+            performedHydration = await blacksmithCache.ensureMirror(
+              cacheInfo.mirrorPath,
+              repositoryUrl,
+              settings.authToken,
+              settings.verbose
+            )
+          } catch (error) {
+            if (!mirrorExisted) {
+              onHydrationReport({
+                sticky_disk_key: cacheInfo.stickyDiskKey,
+                clone_ms: Date.now() - cloneStart,
+                clone_bytes: 0,
+                ref_count: 0,
+                outcome: 'failure',
+                error_class: mirrorTelemetry.classifyError(error)
+              })
+            }
+            throw error
+          }
+          // Persist the mirror state before any measurement walk or
+          // telemetry POST: a cancel in that window must still leave the
+          // post step committing the hydration.
           stateHelper.setBlacksmithCachePerformedHydration(performedHydration)
+          if (performedHydration) {
+            stateHelper.setBlacksmithCacheMirrorChanged(true)
+            report.serving_mode = 'hydrating'
+            onHydrationReport({
+              sticky_disk_key: cacheInfo.stickyDiskKey,
+              clone_ms: Date.now() - cloneStart,
+              clone_bytes: await mirrorTelemetry.packSizeBytes(
+                cacheInfo.mirrorPath
+              ),
+              ref_count: await mirrorTelemetry.refCount(cacheInfo.mirrorPath),
+              outcome: 'success'
+            })
+          } else {
+            report.serving_mode = 'mirror'
+          }
 
           if (performedHydration) {
             // A freshly-cloned mirror is exactly the remote's current state
             mirrorFresh = true
-            stateHelper.setBlacksmithCacheMirrorChanged(true)
           } else if (settings.fetchDepth <= 0) {
             // Bring the mirror's branch/tag refs up to date with the remote
             // (ls-remote diff + targeted fetch of only the changed refs), so
@@ -163,7 +244,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
               cacheInfo.mirrorPath,
               repositoryUrl,
               settings.authToken,
-              settings.verbose
+              settings.verbose,
+              undefined,
+              () => stateHelper.setBlacksmithCacheMirrorChanged(true)
             )
             mirrorFresh = syncResult.success
             stateHelper.setBlacksmithCacheMirrorChanged(syncResult.changed)
@@ -173,6 +256,16 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
             stateHelper.setBlacksmithCacheMirrorSyncTimedOut(
               syncResult.timedOut
             )
+            if (!syncResult.skipped) {
+              // Structured refresh row (fire-and-forget; errors swallowed).
+              await mirrorTelemetry.reportMaintenance(
+                mirrorTelemetry.maintenanceRunFromResult(
+                  'refresh',
+                  cacheInfo.stickyDiskKey,
+                  syncResult
+                )
+              )
+            }
           } else {
             // Shallow checkouts never populate the workspace from mirror
             // refs, so the checkout step doesn't need a fresh mirror. Defer
@@ -189,6 +282,13 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         core.warning(
           `Blacksmith cache setup failed, using standard checkout: ${error}`
         )
+        // Stamp the setup duration only when setupCache itself failed; later
+        // failures (e.g. the hydration clone) are not sticky-disk setup time.
+        if (report.sticky_disk_setup_ms === 0) {
+          report.sticky_disk_setup_ms = Date.now() - setupStart
+        }
+        report.serving_mode = 'fallback-error'
+        report.error_class = mirrorTelemetry.classifyError(error)
         // Don't clear cacheInfo.exposeId/stickyDiskKey from state - they're already saved
         // so cleanup can still call commitStickyDisk with shouldCommit: false
         cacheInfo = null
@@ -200,6 +300,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       !fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))
     ) {
       core.startGroup('Initializing the repository')
+      const initStart = Date.now()
       await git.init()
       // Setup alternates to use objects from Blacksmith mirror if available
       if (cacheInfo) {
@@ -209,6 +310,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         )
       }
       await git.remoteAdd('origin', repositoryUrl)
+      if (cacheInfo) {
+        report.clone_from_mirror_ms += Date.now() - initStart
+      }
       core.endGroup()
     }
 
@@ -253,6 +357,11 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Fetch
     core.startGroup('Fetching the repository')
+    const objectsDir = path.join(settings.repositoryPath, '.git', 'objects')
+    const objectsBytesBefore = cacheInfo
+      ? await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+      : null
+    const fetchStart = Date.now()
     const fetchOptions: FetchOptions = {}
 
     if (settings.filter) {
@@ -353,6 +462,23 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
       await git.fetch(refSpec, fetchOptions)
     }
+    if (cacheInfo) {
+      // Mirror-served: the fetch pulls only the delta the mirror is missing.
+      report.delta_fetch_ms = Date.now() - fetchStart
+      const objectsBytesAfter =
+        await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+      report.delta_fetch_bytes =
+        objectsBytesBefore !== null && objectsBytesAfter !== null
+          ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
+          : 0
+      report.mirror_size_bytes = await mirrorTelemetry.packSizeBytes(
+        cacheInfo.mirrorPath
+      )
+      report.ref_count = await mirrorTelemetry.refCount(cacheInfo.mirrorPath)
+    } else {
+      // Fallback/bypass: the fetch is the full checkout cost.
+      report.full_checkout_ms = Date.now() - fetchStart
+    }
     core.endGroup()
 
     // Checkout info
@@ -370,7 +496,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // For sparse checkouts, let `checkout` fetch the needed objects lazily.
     if (settings.lfs && !settings.sparseCheckout) {
       core.startGroup('Fetching LFS objects')
+      const lfsStart = Date.now()
       await git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref)
+      report.lfs_ms = Date.now() - lfsStart
       core.endGroup()
     }
 
@@ -393,7 +521,17 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Checkout
     core.startGroup('Checking out the ref')
+    const checkoutStart = Date.now()
     await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
+    if (cacheInfo) {
+      // Materializing the working tree reads objects from the mirror through
+      // alternates — the second half of the clone-from-mirror cost.
+      report.clone_from_mirror_ms += Date.now() - checkoutStart
+    } else {
+      // Fallback/bypass: working-tree materialization is part of the full
+      // checkout cost, keeping phase totals comparable across serving modes.
+      report.full_checkout_ms += Date.now() - checkoutStart
+    }
     core.endGroup()
 
     // Dissociate from Blacksmith mirror if requested
@@ -409,6 +547,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Submodules
     if (settings.submodules) {
+      const submodulesStart = Date.now()
       // Temporarily override global config
       core.startGroup('Setting up auth for fetching submodules')
       await authHelper.configureGlobalAuth()
@@ -430,6 +569,7 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         await authHelper.configureSubmoduleAuth()
         core.endGroup()
       }
+      report.submodules_ms = Date.now() - submodulesStart
     }
 
     // Get commit information
