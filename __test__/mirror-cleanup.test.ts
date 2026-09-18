@@ -107,10 +107,10 @@ describe('cleanup commit decision', () => {
         '-l',
         '-n',
         '--geometric=2',
-        '--write-midx',
         'repack.writeBitmaps=false'
       ])
     )
+    expect(repack).not.toContain('--write-midx')
     expect(commands().some(c => c.includes('gc'))).toBe(false)
     expect(mockCommitStickyDisk).toHaveBeenCalledWith(
       expect.objectContaining({shouldCommit: true, vmHydratedGitMirror: true})
