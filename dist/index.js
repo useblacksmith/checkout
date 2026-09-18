@@ -1924,13 +1924,8 @@ function flushBlockDevice(devicePath) {
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
-        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut, vmHydratedGitMirror } = options;
         let { shouldCommit } = options;
-        // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
-        // (due to sync failure), we must not tell the backend that hydration
-        // completed, otherwise it marks the entry as ready despite no valid disk
-        // being persisted.
-        let vmHydratedGitMirror = options.vmHydratedGitMirror;
         const result = {
             // skipped until maintenance actually runs, so a mirror that is not
             // maintained (no mirrorPath, or not committing) never reports a
@@ -1943,7 +1938,6 @@ function cleanup(options) {
             const reason = mirrorSyncTimedOut ? 'timed out' : 'failed';
             core.warning(`[git-mirror] Mirror sync ${reason}, will not commit sticky disk`);
             shouldCommit = false;
-            vmHydratedGitMirror = false;
         }
         // Maintenance only pays off if the result is persisted.
         if (mirrorPath && shouldCommit) {
@@ -2043,7 +2037,6 @@ function cleanup(options) {
             if (!unmountSuccess) {
                 core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`);
                 shouldCommit = false;
-                vmHydratedGitMirror = false;
             }
         }
         // Flush block device buffers after unmount to ensure data durability
@@ -4792,8 +4785,10 @@ function cleanup() {
                     shouldCommit = false;
                     core.info('[git-mirror] Mirror unchanged since last commit, releasing sticky disk without commit');
                 }
-                // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
-                const vmHydratedGitMirror = shouldCommit && performedHydration;
+                // vmHydratedGitMirror reports whether this job performed the initial
+                // clone, independent of shouldCommit: the host combines the two to
+                // decide whether the hydration was persisted, and classifies a clone
+                // that is not committed separately from a clone that failed.
                 cleanupResult = yield blacksmithCache.cleanup({
                     exposeId,
                     stickyDiskKey,
@@ -4801,7 +4796,7 @@ function cleanup() {
                     mountPoint: mountPoint || undefined,
                     mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
                     shouldCommit,
-                    vmHydratedGitMirror,
+                    vmHydratedGitMirror: performedHydration,
                     mirrorSyncFailed,
                     mirrorSyncTimedOut
                 });

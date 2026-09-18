@@ -184,7 +184,7 @@ describe('cleanup commit decision', () => {
     })
     expect(commands().some(c => c.includes('repack'))).toBe(false)
     expect(mockCommitStickyDisk).toHaveBeenCalledWith(
-      expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: false})
+      expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: true})
     )
   })
 
@@ -197,7 +197,21 @@ describe('cleanup commit decision', () => {
 
     expect(commands().some(c => c.includes('repack'))).toBe(false)
     expect(mockCommitStickyDisk).toHaveBeenCalledWith(
-      expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: false})
+      expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: true})
+    )
+  })
+
+  it('reports a performed hydration as-is when the job is not committing', async () => {
+    await blacksmithCache.cleanup({
+      ...base,
+      mirrorPath,
+      shouldCommit: false,
+      vmHydratedGitMirror: true
+    })
+
+    expect(commands().some(c => c.includes('repack'))).toBe(false)
+    expect(mockCommitStickyDisk).toHaveBeenCalledWith(
+      expect.objectContaining({shouldCommit: false, vmHydratedGitMirror: true})
     )
   })
 

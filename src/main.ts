@@ -141,9 +141,10 @@ async function cleanup(): Promise<void> {
         )
       }
 
-      // Only set vmHydratedGitMirror to true if we're committing AND we performed hydration
-      const vmHydratedGitMirror = shouldCommit && performedHydration
-
+      // vmHydratedGitMirror reports whether this job performed the initial
+      // clone, independent of shouldCommit: the host combines the two to
+      // decide whether the hydration was persisted, and classifies a clone
+      // that is not committed separately from a clone that failed.
       cleanupResult = await blacksmithCache.cleanup({
         exposeId,
         stickyDiskKey,
@@ -151,7 +152,7 @@ async function cleanup(): Promise<void> {
         mountPoint: mountPoint || undefined,
         mirrorPath: mirrorChanged ? mirrorPath || undefined : undefined,
         shouldCommit,
-        vmHydratedGitMirror,
+        vmHydratedGitMirror: performedHydration,
         mirrorSyncFailed,
         mirrorSyncTimedOut
       })
