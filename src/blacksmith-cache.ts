@@ -2304,8 +2304,10 @@ export interface CleanupOptions {
   // shouldCommit indicates whether changes should be persisted.
   // Set to false if the job failed/was cancelled to avoid committing bad state.
   shouldCommit: boolean
-  // vmHydratedGitMirror indicates this job performed initial git mirror clone.
-  // Used by backend to mark hydration as complete.
+  // vmHydratedGitMirror indicates this job performed the initial git mirror
+  // clone. It is reported as-is, independent of shouldCommit: the host only
+  // marks hydration complete when the disk is also committed, and uses the
+  // pair to tell a clone that was not persisted apart from a failed clone.
   vmHydratedGitMirror: boolean
   // Mirror sync outcome from the main step.
   mirrorSyncFailed?: boolean
@@ -2327,14 +2329,10 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     mountPoint,
     mirrorPath,
     mirrorSyncFailed,
-    mirrorSyncTimedOut
+    mirrorSyncTimedOut,
+    vmHydratedGitMirror
   } = options
   let {shouldCommit} = options
-  // vmHydratedGitMirror must track shouldCommit: if we decide not to commit
-  // (due to sync failure), we must not tell the backend that hydration
-  // completed, otherwise it marks the entry as ready despite no valid disk
-  // being persisted.
-  let vmHydratedGitMirror = options.vmHydratedGitMirror
 
   const result: CleanupResult = {
     // skipped until maintenance actually runs, so a mirror that is not
@@ -2354,7 +2352,6 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       `[git-mirror] Mirror sync ${reason}, will not commit sticky disk`
     )
     shouldCommit = false
-    vmHydratedGitMirror = false
   }
 
   // Maintenance only pays off if the result is persisted.
@@ -2484,7 +2481,6 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
         `[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`
       )
       shouldCommit = false
-      vmHydratedGitMirror = false
     }
   }
 
