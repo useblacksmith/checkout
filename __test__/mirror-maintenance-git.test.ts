@@ -206,8 +206,37 @@ describe('runMirrorMaintenance (real git)', () => {
     expect(remaining).toContain(basePack)
     expect(remaining.length).toBeLessThanOrEqual(3)
     expect(looseObjects(mirror)).toBe(0)
-    expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(true)
+    expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(false)
     expect(fs.existsSync(path.join(mirror, 'packed-refs'))).toBe(true)
+    fsck(mirror)
+    refsResolve(mirror)
+  })
+
+  it('removes a multi-pack-index left by an earlier version and still rolls up the packs it lists', async () => {
+    const {mirror, basePack} = buildMirror(root)
+    const packDir = path.join(mirror, 'objects', 'pack')
+    git(mirror, 'multi-pack-index', 'write')
+    expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(true)
+    const before = packs(mirror)
+
+    const result = await blacksmithCache.runMirrorMaintenance(mirror, {
+      timeoutSecs: 60,
+      keepBytes: KEEP_BYTES
+    })
+    expect(result).toMatchObject({success: true, timedOut: false})
+    expect(result.skipped).toBeUndefined()
+
+    expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(false)
+    const remaining = packs(mirror)
+    expect(remaining).toContain(basePack)
+    expect(remaining.length).toBeLessThanOrEqual(3)
+    // Every small pack the stale index listed was folded, not skipped.
+    for (const p of before) {
+      if (p !== basePack) {
+        expect(remaining).not.toContain(p)
+      }
+    }
+    expect(looseObjects(mirror)).toBe(0)
     fsck(mirror)
     refsResolve(mirror)
   })
@@ -482,7 +511,7 @@ describe('runMirrorMaintenance (real git)', () => {
           )
           .trim()
       ).toBe('20000')
-      expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(true)
+      expect(fs.existsSync(path.join(packDir, 'multi-pack-index'))).toBe(false)
       // The graph was rebuilt without the pruned commit.
       expect(blacksmithCache.hasCommitGraph(mirror)).toBe(true)
       git(mirror, 'commit-graph', 'verify')

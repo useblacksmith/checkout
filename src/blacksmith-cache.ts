@@ -1724,6 +1724,17 @@ async function writeCommitGraph(
   }
 }
 
+async function removeMultiPackIndex(mirrorPath: string): Promise<boolean> {
+  const target = path.join(mirrorPath, 'objects', 'pack', 'multi-pack-index')
+  try {
+    await fs.promises.rm(target, {force: true})
+    return true
+  } catch (error) {
+    core.warning(`[git-mirror] Failed to remove ${target}: ${error}`)
+    return false
+  }
+}
+
 async function removeCommitGraph(mirrorPath: string): Promise<boolean> {
   const info = path.join(mirrorPath, 'objects', 'info')
   for (const target of [
@@ -1982,8 +1993,14 @@ export interface MaintenanceOptions {
  * chosen so their combined size stays under that bound as well (see
  * markKeepPacks). A rolled-up pack that grows past the threshold simply
  * becomes another kept pack, so the cost of a single run is bounded by the
- * threshold, never by the size of the repository. The multi-pack-index
- * keeps lookups fast across the kept packs.
+ * threshold, never by the size of the repository.
+ *
+ * No multi-pack-index is written: git rewrites it whole on every write,
+ * reading every pack's .idx and writing about as many bytes again, which
+ * on a mirror with millions of objects costs seconds of cold I/O per job -
+ * more than the roll-up itself - while lookups across the few packs the
+ * geometric repack leaves are fast without it. An index left by an earlier
+ * version is removed rather than left to go stale.
  *
  * Kept packs never lose objects, so history that becomes unreachable stays
  * on disk. Once per MAINTENANCE_RECLAIM_INTERVAL_MS the run instead lifts
@@ -2035,7 +2052,7 @@ export async function runMirrorMaintenance(
     const {kept} = await markKeepPacks(mirrorPath, Number.MAX_SAFE_INTEGER)
     await removeKeepFiles(mirrorPath, kept)
     label = 'Reclaim'
-    repackArgs = ['-a', '-d', '-l', '-n', '--write-midx']
+    repackArgs = ['-a', '-d', '-l', '-n']
     core.info(
       `[git-mirror] Running reclaim maintenance (timeout: ${budgetSecs}s, ${kept.length} kept pack(s) released)`
     )
@@ -2043,7 +2060,7 @@ export async function runMirrorMaintenance(
     const selection = await markKeepPacks(mirrorPath, keepBytes)
     deferred = selection.deferred
     label = 'Incremental'
-    repackArgs = ['-d', '-l', '-n', '--geometric=2', '--write-midx']
+    repackArgs = ['-d', '-l', '-n', '--geometric=2']
     core.info(
       `[git-mirror] Running incremental maintenance (timeout: ${budgetSecs}s, ${selection.kept.length} kept pack(s), ${deferred.length} deferred)`
     )
@@ -2075,6 +2092,9 @@ export async function runMirrorMaintenance(
   }
 
   try {
+    if (!(await removeMultiPackIndex(mirrorPath))) {
+      return await fail(false, 'could not remove the multi-pack-index')
+    }
     const result = await exec.getExecOutput(
       'timeout',
       [
