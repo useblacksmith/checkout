@@ -348,10 +348,10 @@ export async function setupCache(
     if (error instanceof ConnectError && error.code === Code.Aborted) {
       const hydrationMessage =
         error.message || 'Initial mirror clone is running'
-      core.warning(
+      core.info(
         `[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`
       )
-      core.warning(
+      core.info(
         '[git-mirror] No sticky disk will be mounted for this run; checkout will clone directly from GitHub onto the runner disk (no mirror cache). The mirror cache will be available on subsequent runs once hydration completes.'
       )
       return {

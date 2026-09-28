@@ -332,8 +332,8 @@ function setupCache(owner, repo) {
             // Check if this is a gRPC Aborted error indicating hydration in progress
             if (error instanceof connect_1.ConnectError && error.code === connect_1.Code.Aborted) {
                 const hydrationMessage = error.message || 'Initial mirror clone is running';
-                core.warning(`[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`);
-                core.warning('[git-mirror] No sticky disk will be mounted for this run; checkout will clone directly from GitHub onto the runner disk (no mirror cache). The mirror cache will be available on subsequent runs once hydration completes.');
+                core.info(`[git-mirror] Another job is hydrating the git mirror cache: ${hydrationMessage}`);
+                core.info('[git-mirror] No sticky disk will be mounted for this run; checkout will clone directly from GitHub onto the runner disk (no mirror cache). The mirror cache will be available on subsequent runs once hydration completes.');
                 return {
                     exposeId: '',
                     stickyDiskKey,
@@ -3714,7 +3714,7 @@ function getSourceInner(settings, report, onHydrationReport) {
                     report.sticky_disk_setup_ms = Date.now() - setupStart;
                     // Check if hydration is in progress - another job is doing the initial git clone --mirror
                     if (cacheInfo.hydrationInProgress) {
-                        // Warning already logged by setupCache, just fall back to standard checkout
+                        // Already logged by setupCache, just fall back to standard checkout
                         report.serving_mode = 'fallback-contention';
                         cacheInfo = null;
                         core.endGroup();

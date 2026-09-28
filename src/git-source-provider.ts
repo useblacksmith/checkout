@@ -172,7 +172,7 @@ async function getSourceInner(
 
         // Check if hydration is in progress - another job is doing the initial git clone --mirror
         if (cacheInfo.hydrationInProgress) {
-          // Warning already logged by setupCache, just fall back to standard checkout
+          // Already logged by setupCache, just fall back to standard checkout
           report.serving_mode = 'fallback-contention'
           cacheInfo = null
           core.endGroup()
