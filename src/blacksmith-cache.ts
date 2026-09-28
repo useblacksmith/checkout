@@ -16,6 +16,28 @@ const AGENT_RPC_TIMEOUT_MS = 45000
 const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
+/**
+ * Argv for a command that needs root. Job containers usually run as root
+ * and often ship without sudo, so the prefix is only added when needed.
+ */
+function asRoot(cmd: string, args: string[]): string[] {
+  return process.getuid?.() === 0 ? [cmd, ...args] : ['sudo', cmd, ...args]
+}
+
+async function execAsRoot(cmd: string, args: string[]): Promise<number> {
+  const [file, ...rest] = asRoot(cmd, args)
+  return exec.exec(file, rest)
+}
+
+async function getExecOutputAsRoot(
+  cmd: string,
+  args: string[],
+  options?: exec.ExecOptions
+): Promise<exec.ExecOutput> {
+  const [file, ...rest] = asRoot(cmd, args)
+  return exec.getExecOutput(file, rest, options)
+}
+
 // A sync that doesn't finish within this window is abandoned (single
 // attempt, no retries): sync failure is soft - the workspace is populated
 // from the mirror's last good state plus a targeted fetch of the job's own
@@ -237,9 +259,9 @@ async function waitForNonZeroDeviceSize(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const result = await exec.getExecOutput(
-      'sudo',
-      ['blockdev', '--getsize64', device],
+    const result = await getExecOutputAsRoot(
+      'blockdev',
+      ['--getsize64', device],
       {ignoreReturnCode: true, silent: true}
     )
     if (result.exitCode === 0) {
@@ -262,7 +284,7 @@ async function waitForNonZeroDeviceSize(
  */
 async function maybeFormatDevice(device: string): Promise<void> {
   // Check if already formatted
-  const result = await exec.getExecOutput('sudo', ['blkid', device], {
+  const result = await getExecOutputAsRoot('blkid', [device], {
     ignoreReturnCode: true
   })
 
@@ -270,7 +292,7 @@ async function maybeFormatDevice(device: string): Promise<void> {
     core.debug(`Device ${device} is already formatted`)
     // Resize to use full block device
     try {
-      await exec.exec('sudo', ['resize2fs', '-f', device])
+      await execAsRoot('resize2fs', ['-f', device])
       core.debug(`Resized filesystem on ${device}`)
     } catch {
       core.warning(`Error resizing filesystem on ${device}`)
@@ -280,8 +302,7 @@ async function maybeFormatDevice(device: string): Promise<void> {
 
   // Format with ext4
   core.info(`Formatting device ${device} with ext4`)
-  await exec.exec('sudo', [
-    'mkfs.ext4',
+  await execAsRoot('mkfs.ext4', [
     '-m0',
     '-Enodiscard,lazy_itable_init=1,lazy_journal_init=1',
     '-F',
@@ -403,10 +424,10 @@ export async function setupCache(
 
   // Mount the device at a unique path for this repository
   const mountPoint = getMountPoint(owner, repo)
-  await exec.exec('sudo', ['mkdir', '-p', mountPoint])
+  await execAsRoot('mkdir', ['-p', mountPoint])
   // noinit_itable stops the background zeroing of a non-trivial portion of
   // the device (uninitialized inode tables), which is unnecessary here.
-  await exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint])
+  await execAsRoot('mount', ['-o', 'noinit_itable', device, mountPoint])
   core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`)
 
   return {
@@ -467,12 +488,7 @@ async function adoptMirrorOwnership(mirrorPath: string): Promise<void> {
     return
   }
   const start = Date.now()
-  await exec.exec('sudo', [
-    'chown',
-    '-R',
-    `${uid}:${gid}`,
-    path.dirname(mirrorPath)
-  ])
+  await execAsRoot('chown', ['-R', `${uid}:${gid}`, path.dirname(mirrorPath)])
   core.info(
     `[git-mirror] Took over mirror owned by uid ${owner} in ${Date.now() - start}ms`
   )
@@ -586,11 +602,11 @@ export async function ensureMirror(
   const gitEnv = buildGitEnv(verbose, trace2PerfPath)
 
   const mirrorDir = path.dirname(mirrorPath)
-  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
+  await execAsRoot('mkdir', ['-p', mirrorDir])
   // Change ownership so git can write to it
   const uid = process.getuid?.() ?? 1000
   const gid = process.getgid?.() ?? 1000
-  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  await execAsRoot('chown', ['-R', `${uid}:${gid}`, mirrorDir])
   await retryHelper.execute(async () => {
     // Clean up any partial clone from a previous failed attempt
     if (fs.existsSync(mirrorPath)) {
@@ -2270,10 +2286,7 @@ async function flushBlockDevice(devicePath: string): Promise<void> {
       'timeout',
       [
         String(FLUSH_TIMEOUT_SECS),
-        'sudo',
-        'blockdev',
-        '--flushbufs',
-        devicePath
+        ...asRoot('blockdev', ['--flushbufs', devicePath])
       ],
       {ignoreReturnCode: true}
     )
@@ -2421,7 +2434,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
       try {
         const umountResult = await exec.getExecOutput(
           'timeout',
-          [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
+          [String(UMOUNT_TIMEOUT_SECS), ...asRoot('umount', [mountPoint])],
           {ignoreReturnCode: true}
         )
         if (umountResult.exitCode === 0) {

@@ -86,6 +86,26 @@ const mirror_telemetry_1 = __nccwpck_require__(7185);
 const AGENT_RPC_TIMEOUT_MS = 45000;
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
+/**
+ * Argv for a command that needs root. Job containers usually run as root
+ * and often ship without sudo, so the prefix is only added when needed.
+ */
+function asRoot(cmd, args) {
+    var _a;
+    return ((_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) === 0 ? [cmd, ...args] : ['sudo', cmd, ...args];
+}
+function execAsRoot(cmd, args) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [file, ...rest] = asRoot(cmd, args);
+        return exec.exec(file, rest);
+    });
+}
+function getExecOutputAsRoot(cmd, args, options) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [file, ...rest] = asRoot(cmd, args);
+        return exec.getExecOutput(file, rest, options);
+    });
+}
 // A sync that doesn't finish within this window is abandoned (single
 // attempt, no retries): sync failure is soft - the workspace is populated
 // from the mirror's last good state plus a targeted fetch of the job's own
@@ -238,7 +258,7 @@ function waitForNonZeroDeviceSize(device, timeoutMs) {
     return __awaiter(this, void 0, void 0, function* () {
         const deadline = Date.now() + timeoutMs;
         for (;;) {
-            const result = yield exec.getExecOutput('sudo', ['blockdev', '--getsize64', device], { ignoreReturnCode: true, silent: true });
+            const result = yield getExecOutputAsRoot('blockdev', ['--getsize64', device], { ignoreReturnCode: true, silent: true });
             if (result.exitCode === 0) {
                 const size = parseInt(result.stdout.trim(), 10);
                 if (!isNaN(size) && size > 0) {
@@ -258,14 +278,14 @@ function waitForNonZeroDeviceSize(device, timeoutMs) {
 function maybeFormatDevice(device) {
     return __awaiter(this, void 0, void 0, function* () {
         // Check if already formatted
-        const result = yield exec.getExecOutput('sudo', ['blkid', device], {
+        const result = yield getExecOutputAsRoot('blkid', [device], {
             ignoreReturnCode: true
         });
         if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
             core.debug(`Device ${device} is already formatted`);
             // Resize to use full block device
             try {
-                yield exec.exec('sudo', ['resize2fs', '-f', device]);
+                yield execAsRoot('resize2fs', ['-f', device]);
                 core.debug(`Resized filesystem on ${device}`);
             }
             catch (_a) {
@@ -275,8 +295,7 @@ function maybeFormatDevice(device) {
         }
         // Format with ext4
         core.info(`Formatting device ${device} with ext4`);
-        yield exec.exec('sudo', [
-            'mkfs.ext4',
+        yield execAsRoot('mkfs.ext4', [
             '-m0',
             '-Enodiscard,lazy_itable_init=1,lazy_journal_init=1',
             '-F',
@@ -373,10 +392,10 @@ function setupCache(owner, repo) {
         yield maybeFormatDevice(device);
         // Mount the device at a unique path for this repository
         const mountPoint = getMountPoint(owner, repo);
-        yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
+        yield execAsRoot('mkdir', ['-p', mountPoint]);
         // noinit_itable stops the background zeroing of a non-trivial portion of
         // the device (uninitialized inode tables), which is unnecessary here.
-        yield exec.exec('sudo', ['mount', '-o', 'noinit_itable', device, mountPoint]);
+        yield execAsRoot('mount', ['-o', 'noinit_itable', device, mountPoint]);
         core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
         return {
             exposeId,
@@ -430,12 +449,7 @@ function adoptMirrorOwnership(mirrorPath) {
             return;
         }
         const start = Date.now();
-        yield exec.exec('sudo', [
-            'chown',
-            '-R',
-            `${uid}:${gid}`,
-            path.dirname(mirrorPath)
-        ]);
+        yield execAsRoot('chown', ['-R', `${uid}:${gid}`, path.dirname(mirrorPath)]);
         core.info(`[git-mirror] Took over mirror owned by uid ${owner} in ${Date.now() - start}ms`);
     });
 }
@@ -531,11 +545,11 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         const trace2PerfPath = verbose ? newTrace2PerfPath('clone') : undefined;
         const gitEnv = buildGitEnv(verbose, trace2PerfPath);
         const mirrorDir = path.dirname(mirrorPath);
-        yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
+        yield execAsRoot('mkdir', ['-p', mirrorDir]);
         // Change ownership so git can write to it
         const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
         const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
-        yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
+        yield execAsRoot('chown', ['-R', `${uid}:${gid}`, mirrorDir]);
         yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
             // Clean up any partial clone from a previous failed attempt
             if (fs.existsSync(mirrorPath)) {
@@ -1906,10 +1920,7 @@ function flushBlockDevice(devicePath) {
         try {
             const result = yield exec.getExecOutput('timeout', [
                 String(FLUSH_TIMEOUT_SECS),
-                'sudo',
-                'blockdev',
-                '--flushbufs',
-                devicePath
+                ...asRoot('blockdev', ['--flushbufs', devicePath])
             ], { ignoreReturnCode: true });
             const duration = Date.now() - startTime;
             if (result.exitCode === TIMEOUT_EXIT_CODE) {
@@ -2000,7 +2011,7 @@ function cleanup(options) {
             for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
                 core.info(`[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`);
                 try {
-                    const umountResult = yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint], { ignoreReturnCode: true });
+                    const umountResult = yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), ...asRoot('umount', [mountPoint])], { ignoreReturnCode: true });
                     if (umountResult.exitCode === 0) {
                         unmountSuccess = true;
                         core.info(`[git-mirror] Successfully unmounted ${mountPoint}`);
