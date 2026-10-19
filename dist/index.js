@@ -71,6 +71,8 @@ exports.hasCommitGraph = hasCommitGraph;
 exports.markKeepPacks = markKeepPacks;
 exports.runMirrorMaintenance = runMirrorMaintenance;
 exports.parseFstrimTimeoutSecs = parseFstrimTimeoutSecs;
+exports.decodeVarint = decodeVarint;
+exports.fstrimTimeoutSecsFrom = fstrimTimeoutSecsFrom;
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -381,7 +383,7 @@ function setupCache(owner, repo) {
         const commitEarlyDenyReason = response.commitEarlyDeny
             ? response.commitEarlyDenyReason || 'denied by host policy'
             : '';
-        const fstrimTimeoutSecs = parseFstrimTimeoutSecs(response.fstrimTimeoutSecs);
+        const fstrimTimeoutSecs = fstrimTimeoutSecsFrom(response, response.getType().runtime.bin.listUnknownFields(response));
         if (commitEarlyDenyReason) {
             core.notice(`[git-mirror] Sticky disk changes will not be committed for this job (${commitEarlyDenyReason}). The git mirror cache is used as-is and any changes to it are discarded.`);
         }
@@ -1957,6 +1959,35 @@ function parseFstrimTimeoutSecs(value) {
     if (!Number.isFinite(n) || n <= 0)
         return 0;
     return Math.floor(n);
+}
+const FSTRIM_TIMEOUT_FIELD_NO = 8;
+const WIRE_TYPE_VARINT = 0;
+/** Decodes an unsigned LEB128 varint; null when malformed or above 2^53. */
+function decodeVarint(data) {
+    let value = 0;
+    let shift = 0;
+    for (let i = 0; i < data.length; i++) {
+        const byte = data[i];
+        value += (byte & 0x7f) * Math.pow(2, shift);
+        if ((byte & 0x80) === 0) {
+            return i === data.length - 1 && Number.isSafeInteger(value) ? value : null;
+        }
+        shift += 7;
+    }
+    return null;
+}
+/**
+ * GetStickyDiskResponse.fstrim_timeout_secs as whole seconds, whether the
+ * bundled proto package knows the field (typed int64) or predates it: the
+ * gRPC transport decodes binary and protobuf-es keeps unknown fields, so a
+ * release built before the field existed still honours the host budget.
+ */
+function fstrimTimeoutSecsFrom(response, unknownFields) {
+    const typed = response.fstrimTimeoutSecs;
+    if (typed !== undefined)
+        return parseFstrimTimeoutSecs(typed);
+    const field = unknownFields.find(f => f.no === FSTRIM_TIMEOUT_FIELD_NO && f.wireType === WIRE_TYPE_VARINT);
+    return field ? parseFstrimTimeoutSecs(decodeVarint(field.data)) : 0;
 }
 /**
  * Best-effort `fstrim` of the mirror filesystem before it is unmounted and

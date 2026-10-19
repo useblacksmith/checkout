@@ -410,8 +410,9 @@ export async function setupCache(
   const commitEarlyDenyReason = response.commitEarlyDeny
     ? response.commitEarlyDenyReason || 'denied by host policy'
     : ''
-  const fstrimTimeoutSecs = parseFstrimTimeoutSecs(
-    (response as {fstrimTimeoutSecs?: bigint | number}).fstrimTimeoutSecs
+  const fstrimTimeoutSecs = fstrimTimeoutSecsFrom(
+    response,
+    response.getType().runtime.bin.listUnknownFields(response)
   )
   if (commitEarlyDenyReason) {
     core.notice(
@@ -2340,6 +2341,48 @@ export function parseFstrimTimeoutSecs(value: unknown): number {
   const n = typeof value === 'bigint' ? Number(value) : Number(value ?? 0)
   if (!Number.isFinite(n) || n <= 0) return 0
   return Math.floor(n)
+}
+
+const FSTRIM_TIMEOUT_FIELD_NO = 8
+const WIRE_TYPE_VARINT = 0
+
+export interface UnknownProtoField {
+  no: number
+  wireType: number
+  data: Uint8Array
+}
+
+/** Decodes an unsigned LEB128 varint; null when malformed or above 2^53. */
+export function decodeVarint(data: Uint8Array): number | null {
+  let value = 0
+  let shift = 0
+  for (let i = 0; i < data.length; i++) {
+    const byte = data[i]
+    value += (byte & 0x7f) * 2 ** shift
+    if ((byte & 0x80) === 0) {
+      return i === data.length - 1 && Number.isSafeInteger(value) ? value : null
+    }
+    shift += 7
+  }
+  return null
+}
+
+/**
+ * GetStickyDiskResponse.fstrim_timeout_secs as whole seconds, whether the
+ * bundled proto package knows the field (typed int64) or predates it: the
+ * gRPC transport decodes binary and protobuf-es keeps unknown fields, so a
+ * release built before the field existed still honours the host budget.
+ */
+export function fstrimTimeoutSecsFrom(
+  response: object,
+  unknownFields: ReadonlyArray<UnknownProtoField>
+): number {
+  const typed = (response as {fstrimTimeoutSecs?: unknown}).fstrimTimeoutSecs
+  if (typed !== undefined) return parseFstrimTimeoutSecs(typed)
+  const field = unknownFields.find(
+    f => f.no === FSTRIM_TIMEOUT_FIELD_NO && f.wireType === WIRE_TYPE_VARINT
+  )
+  return field ? parseFstrimTimeoutSecs(decodeVarint(field.data)) : 0
 }
 
 /**
