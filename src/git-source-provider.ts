@@ -186,6 +186,9 @@ async function getSourceInner(
           stateHelper.setBlacksmithCacheCommitEarlyDenyReason(
             cacheInfo.commitEarlyDenyReason
           )
+          stateHelper.setBlacksmithCacheFstrimTimeoutSecs(
+            cacheInfo.fstrimTimeoutSecs
+          )
 
           const mirrorExisted = fsHelper.directoryExistsSync(
             cacheInfo.mirrorPath

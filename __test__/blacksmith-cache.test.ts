@@ -21,6 +21,23 @@ jest.mock('../src/container-detector', () => ({
 }))
 
 import * as blacksmithCache from '../src/blacksmith-cache'
+
+describe('parseFstrimTimeoutSecs', () => {
+  it('accepts the RPC bigint, a number, or the saved-state string', () => {
+    expect(blacksmithCache.parseFstrimTimeoutSecs(BigInt(5))).toBe(5)
+    expect(blacksmithCache.parseFstrimTimeoutSecs(5)).toBe(5)
+    expect(blacksmithCache.parseFstrimTimeoutSecs('5')).toBe(5)
+    expect(blacksmithCache.parseFstrimTimeoutSecs('2.9')).toBe(2)
+  })
+
+  it('treats anything unusable as disabled', () => {
+    expect(blacksmithCache.parseFstrimTimeoutSecs(BigInt(0))).toBe(0)
+    expect(blacksmithCache.parseFstrimTimeoutSecs(-1)).toBe(0)
+    expect(blacksmithCache.parseFstrimTimeoutSecs('')).toBe(0)
+    expect(blacksmithCache.parseFstrimTimeoutSecs(undefined)).toBe(0)
+    expect(blacksmithCache.parseFstrimTimeoutSecs('nope')).toBe(0)
+  })
+})
 import {isRunningInContainer} from '../src/container-detector'
 
 const mockIsRunningInContainer = isRunningInContainer as jest.MockedFunction<
