@@ -307,6 +307,53 @@ The mirror stays in sync with GitHub through **incremental fetches**:
 - Redundant pack files (consolidated into single optimized pack)
 - All unreachable objects (removed immediately via `git gc --prune=now`)
 
+## Serving the Workspace with gitfs
+
+When the job's installation has `use_gitfs_checkout` enabled, the agent
+exports `BLACKSMITH_USE_GITFS=true` into the runner environment and the
+action serves the workspace from the mirror with
+[gitfs](https://github.com/useblacksmith/gitfs) instead of fetching and
+checking it out:
+
+1. The requested ref/commit is resolved in the mirror. If the mirror does not
+   have it yet (a push it has not synced, a pull-request merge ref), only that
+   ref is fetched *into the mirror*, where the regular path would have fetched
+   it into the workspace.
+2. `gitfs mount <mirror> --ref <sha> $GITHUB_WORKSPACE --daemon` mounts the
+   tree in milliseconds. gitfs writes the real checkout out in the background
+   and atomically swaps it in for the mount once it is complete (seconds, even
+   for 100k-file trees); until then reads are served lazily from the mirror's
+   packs and writes go straight into the tree being written.
+3. `.git` is created through the mount exactly as in the regular path
+   (`git init`, alternates to the mirror, `origin`, auth, the mirror's
+   branch/tag refs, the local branch or detached HEAD the checkout would have
+   produced) plus `git read-tree <sha>` for the index. Git is usable from the
+   first step; the first `git status` verifies file contents instead of
+   trusting stat data.
+4. The post step takes gitfs down before the mirror sticky disk is unmounted
+   (after the swap the FUSE view stays mounted on a hidden sibling path so
+   processes that were inside it keep a working cwd; `gitfs unmount` removes
+   it). If the job ends before the swap, the partial tree is discarded.
+
+When the mirror lacks the revision — an empty sticky disk on the repository's
+first job, a push the mirror has not synced, a pull-request merge ref — the
+action does not hydrate with a blocking `git clone --mirror`. It creates an
+empty bare mirror (first job) and runs `gitfs mount <mirror> --ref <rev>
+--url <repo>`: gitfs fetches the revision with `--depth 1` *into the mirror*
+and serves the pack as it arrives, so the step returns as soon as the commit
+is in (about a second for a 28 000-file repository from GitHub); when that
+pack is complete gitfs fetches the rest of the repository in the background,
+and the sticky disk is committed with a complete, ordinary mirror. The post
+step's `gitfs unmount` ends a fetch still in flight; a mirror left shallow
+that way is completed by the next job's mount.
+
+gitfs is only used for the plain case — Linux runner VM (not inside a
+container), the mirror mounted, and no submodules, LFS, sparse checkout,
+`filter` or `dissociate` — and only when the `gitfs` binary is on the PATH.
+Everything else, and any gitfs failure, falls through to the regular fetch +
+checkout. Because objects come from the mirror through alternates, the
+workspace has the full history regardless of `fetch-depth`.
+
 ## The `dissociate` Option
 
 When to use `dissociate: true`:

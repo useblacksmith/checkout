@@ -431,7 +431,7 @@ export async function setupCache(
  * 1. The header value is not visible in process arguments
  * 2. It follows the same pattern used by the upstream checkout action
  */
-function getAuthConfigArgs(
+export function getAuthConfigArgs(
   repoUrl: string,
   authToken: string
 ): {configKey: string; configValue: string} {
@@ -546,6 +546,35 @@ function summarizeTrace2Perf(trace2PerfPath: string, title: string): void {
   } finally {
     fs.rmSync(trace2PerfPath, {force: true})
   }
+}
+
+/**
+ * An empty bare mirror with `git clone --mirror`'s config, for gitfs to
+ * stream the first job's revision into; gitfs completes the mirror in the
+ * background, so it is a full mirror by the time the job ends.
+ */
+export async function initEmptyMirror(
+  mirrorPath: string,
+  repoUrl: string
+): Promise<void> {
+  const mirrorDir = path.dirname(mirrorPath)
+  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
+  const uid = process.getuid?.() ?? 1000
+  const gid = process.getgid?.() ?? 1000
+  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  if (fs.existsSync(mirrorPath)) {
+    await fs.promises.rm(mirrorPath, {recursive: true, force: true})
+  }
+  await exec.exec('git', ['init', '-q', '--bare', mirrorPath])
+  await exec.exec('git', [
+    '-C',
+    mirrorPath,
+    'remote',
+    'add',
+    '--mirror=fetch',
+    'origin',
+    repoUrl
+  ])
 }
 
 /**
