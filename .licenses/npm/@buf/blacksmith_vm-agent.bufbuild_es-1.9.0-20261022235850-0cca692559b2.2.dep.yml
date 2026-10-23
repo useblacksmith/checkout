@@ -1,0 +1,10 @@
+---
+name: "@buf/blacksmith_vm-agent.bufbuild_es"
+version: 1.9.0-20261022235850-0cca692559b2.2
+type: npm
+summary: This package contains generated code for the protobuf module buf.build/blacksmith/vm-agent:0cca692559b244a9abe9cefb5aadd294
+  when generated with the plugin buf.build/bufbuild/es:v1.9.0 revision:2
+homepage: 
+license: none
+licenses: []
+notices: []
