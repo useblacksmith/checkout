@@ -189,6 +189,9 @@ async function getSourceInner(
           stateHelper.setBlacksmithCacheFstrimTimeoutSecs(
             cacheInfo.fstrimTimeoutSecs
           )
+          stateHelper.setBlacksmithCacheFstrimMinExtentBytes(
+            cacheInfo.fstrimMinExtentBytes
+          )
 
           const mirrorExisted = fsHelper.directoryExistsSync(
             cacheInfo.mirrorPath

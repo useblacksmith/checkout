@@ -116,6 +116,15 @@ export const BlacksmithCacheFstrimTimeoutSecs = (() => {
 })()
 
 /**
+ * The host's `fstrim -m` value in bytes, saved by the main action. 0 when
+ * the host left fstrim at its default minimum extent.
+ */
+export const BlacksmithCacheFstrimMinExtentBytes = (() => {
+  const n = Number(core.getState('blacksmithCacheFstrimMinExtentBytes') || '0')
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+})()
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -247,6 +256,13 @@ export function setBlacksmithCacheCommitEarlyDenyReason(reason: string) {
  */
 export function setBlacksmithCacheFstrimTimeoutSecs(secs: number) {
   core.saveState('blacksmithCacheFstrimTimeoutSecs', String(secs))
+}
+
+/**
+ * Save the host's `fstrim -m` value so the POST action can pass it along.
+ */
+export function setBlacksmithCacheFstrimMinExtentBytes(bytes: number) {
+  core.saveState('blacksmithCacheFstrimMinExtentBytes', String(bytes))
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

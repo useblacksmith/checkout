@@ -71,6 +71,7 @@ exports.hasCommitGraph = hasCommitGraph;
 exports.markKeepPacks = markKeepPacks;
 exports.runMirrorMaintenance = runMirrorMaintenance;
 exports.parseFstrimTimeoutSecs = parseFstrimTimeoutSecs;
+exports.parseFstrimMinExtentBytes = parseFstrimMinExtentBytes;
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -360,7 +361,8 @@ function setupCache(owner, repo) {
                     hydrationMessage,
                     performedHydration: false,
                     commitEarlyDenyReason: '',
-                    fstrimTimeoutSecs: 0
+                    fstrimTimeoutSecs: 0,
+                    fstrimMinExtentBytes: 0
                 };
             }
             // Re-throw other errors
@@ -382,6 +384,7 @@ function setupCache(owner, repo) {
             ? response.commitEarlyDenyReason || 'denied by host policy'
             : '';
         const fstrimTimeoutSecs = parseFstrimTimeoutSecs(response.fstrimTimeoutSecs);
+        const fstrimMinExtentBytes = parseFstrimMinExtentBytes(response.fstrimMinExtentBytes);
         if (commitEarlyDenyReason) {
             core.notice(`[git-mirror] Sticky disk changes will not be committed for this job (${commitEarlyDenyReason}). The git mirror cache is used as-is and any changes to it are discarded.`);
         }
@@ -405,7 +408,8 @@ function setupCache(owner, repo) {
             hydrationInProgress: false,
             performedHydration: false, // Will be set by ensureMirror if we do initial clone
             commitEarlyDenyReason,
-            fstrimTimeoutSecs
+            fstrimTimeoutSecs,
+            fstrimMinExtentBytes
         };
     });
 }
@@ -1959,16 +1963,32 @@ function parseFstrimTimeoutSecs(value) {
     return Math.floor(n);
 }
 /**
+ * Parse the host's `fstrim --minimum` value
+ * (GetStickyDiskResponse.fstrim_min_extent_bytes, a bigint or saved-state
+ * string) into whole bytes. Anything unusable is 0: the fstrim default.
+ */
+function parseFstrimMinExtentBytes(value) {
+    return parseFstrimTimeoutSecs(value);
+}
+/**
  * Best-effort `fstrim` of the mirror filesystem before it is unmounted and
  * committed: deleted packs keep their RBD extents allocated on the backing
  * store until the guest discards them. Bounded by the host-supplied budget;
  * any failure (discard not negotiated, missing binary, timeout) only logs.
  */
-function trimFilesystem(mountPoint, timeoutSecs) {
+function trimFilesystem(mountPoint, timeoutSecs, minExtentBytes) {
     return __awaiter(this, void 0, void 0, function* () {
         const start = Date.now();
         try {
-            const result = yield exec.getExecOutput('timeout', [String(timeoutSecs), 'sudo', 'fstrim', '-v', '--', mountPoint], { ignoreReturnCode: true, silent: true });
+            const result = yield exec.getExecOutput('timeout', [
+                String(timeoutSecs),
+                'sudo',
+                'fstrim',
+                '-v',
+                ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
+                '--',
+                mountPoint
+            ], { ignoreReturnCode: true, silent: true });
             const durationMs = Date.now() - start;
             if (result.exitCode === 0) {
                 core.info(`[git-mirror] fstrim ${mountPoint}: ${result.stdout.trim() || 'done'} in ${durationMs}ms`);
@@ -1995,7 +2015,7 @@ function trimFilesystem(mountPoint, timeoutSecs) {
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
-        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut, vmHydratedGitMirror, fstrimTimeoutSecs } = options;
+        const { exposeId, stickyDiskKey, repoName, mountPoint, mirrorPath, mirrorSyncFailed, mirrorSyncTimedOut, vmHydratedGitMirror, fstrimTimeoutSecs, fstrimMinExtentBytes } = options;
         let { shouldCommit } = options;
         const result = {
             // skipped until maintenance actually runs, so a mirror that is not
@@ -2036,7 +2056,7 @@ function cleanup(options) {
             shouldCommit &&
             fstrimTimeoutSecs &&
             fstrimTimeoutSecs > 0) {
-            yield trimFilesystem(mountPoint, fstrimTimeoutSecs);
+            yield trimFilesystem(mountPoint, fstrimTimeoutSecs, fstrimMinExtentBytes !== null && fstrimMinExtentBytes !== void 0 ? fstrimMinExtentBytes : 0);
         }
         // Get device path before unmount for durability flush
         let devicePath = null;
@@ -3786,6 +3806,7 @@ function getSourceInner(settings, report, onHydrationReport) {
                         stateHelper.setBlacksmithCacheMountPoint(cacheInfo.mountPoint);
                         stateHelper.setBlacksmithCacheCommitEarlyDenyReason(cacheInfo.commitEarlyDenyReason);
                         stateHelper.setBlacksmithCacheFstrimTimeoutSecs(cacheInfo.fstrimTimeoutSecs);
+                        stateHelper.setBlacksmithCacheFstrimMinExtentBytes(cacheInfo.fstrimMinExtentBytes);
                         const mirrorExisted = fsHelper.directoryExistsSync(cacheInfo.mirrorPath);
                         const cloneStart = Date.now();
                         let performedHydration = false;
@@ -4898,7 +4919,8 @@ function cleanup() {
                     vmHydratedGitMirror: performedHydration,
                     mirrorSyncFailed,
                     mirrorSyncTimedOut,
-                    fstrimTimeoutSecs: stateHelper.BlacksmithCacheFstrimTimeoutSecs
+                    fstrimTimeoutSecs: stateHelper.BlacksmithCacheFstrimTimeoutSecs,
+                    fstrimMinExtentBytes: stateHelper.BlacksmithCacheFstrimMinExtentBytes
                 });
             }
             catch (error) {
@@ -5603,7 +5625,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheFstrimTimeoutSecs = exports.BlacksmithCacheCommitEarlyDenyReason = exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheFstrimMinExtentBytes = exports.BlacksmithCacheFstrimTimeoutSecs = exports.BlacksmithCacheCommitEarlyDenyReason = exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -5622,6 +5644,7 @@ exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
 exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 exports.setBlacksmithCacheCommitEarlyDenyReason = setBlacksmithCacheCommitEarlyDenyReason;
 exports.setBlacksmithCacheFstrimTimeoutSecs = setBlacksmithCacheFstrimTimeoutSecs;
+exports.setBlacksmithCacheFstrimMinExtentBytes = setBlacksmithCacheFstrimMinExtentBytes;
 const core = __importStar(__nccwpck_require__(2186));
 /**
  * Indicates whether the POST action is running
@@ -5704,6 +5727,14 @@ exports.BlacksmithCacheCommitEarlyDenyReason = core.getState('blacksmithCacheCom
 exports.BlacksmithCacheFstrimTimeoutSecs = (() => {
     const secs = Number(core.getState('blacksmithCacheFstrimTimeoutSecs') || '0');
     return Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+})();
+/**
+ * The host's `fstrim -m` value in bytes, saved by the main action. 0 when
+ * the host left fstrim at its default minimum extent.
+ */
+exports.BlacksmithCacheFstrimMinExtentBytes = (() => {
+    const n = Number(core.getState('blacksmithCacheFstrimMinExtentBytes') || '0');
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 })();
 /**
  * Save the repository path so the POST action can retrieve the value.
@@ -5811,6 +5842,12 @@ function setBlacksmithCacheCommitEarlyDenyReason(reason) {
  */
 function setBlacksmithCacheFstrimTimeoutSecs(secs) {
     core.saveState('blacksmithCacheFstrimTimeoutSecs', String(secs));
+}
+/**
+ * Save the host's `fstrim -m` value so the POST action can pass it along.
+ */
+function setBlacksmithCacheFstrimMinExtentBytes(bytes) {
+    core.saveState('blacksmithCacheFstrimMinExtentBytes', String(bytes));
 }
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
 // This is necessary since we don't have a separate entry point.
@@ -66353,6 +66390,7 @@ const GetStickyDiskResponse = /*@__PURE__*/ proto3.makeMessageType(
     { no: 6, name: "commit_early_deny", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 7, name: "commit_early_deny_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "fstrim_timeout_secs", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "fstrim_min_extent_bytes", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ],
 );
 
