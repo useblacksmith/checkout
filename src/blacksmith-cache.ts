@@ -116,6 +116,13 @@ export interface CacheInfo {
   // sticky disk commit will be denied (e.g. branch protection): the mirror can
   // be used but changes to it are discarded at VM teardown.
   commitEarlyDenyReason: string
+  // fstrimTimeoutSecs is the host's budget, in whole seconds, for trimming the
+  // mirror filesystem before unmount at commit; 0 when the host has not
+  // enabled the trim.
+  fstrimTimeoutSecs: number
+  // fstrimMinExtentBytes is the host's `fstrim -m` value in bytes; 0 means
+  // the fstrim default (every free extent).
+  fstrimMinExtentBytes: number
 }
 
 /**
@@ -364,7 +371,9 @@ export async function setupCache(
         hydrationInProgress: true,
         hydrationMessage,
         performedHydration: false,
-        commitEarlyDenyReason: ''
+        commitEarlyDenyReason: '',
+        fstrimTimeoutSecs: 0,
+        fstrimMinExtentBytes: 0
       }
     }
     // Re-throw other errors
@@ -391,6 +400,10 @@ export async function setupCache(
   const commitEarlyDenyReason = response.commitEarlyDeny
     ? response.commitEarlyDenyReason || 'denied by host policy'
     : ''
+  const fstrimTimeoutSecs = parseFstrimTimeoutSecs(response.fstrimTimeoutSecs)
+  const fstrimMinExtentBytes = parseFstrimMinExtentBytes(
+    response.fstrimMinExtentBytes
+  )
   if (commitEarlyDenyReason) {
     core.notice(
       `[git-mirror] Sticky disk changes will not be committed for this job (${commitEarlyDenyReason}). The git mirror cache is used as-is and any changes to it are discarded.`
@@ -418,7 +431,9 @@ export async function setupCache(
     mirrorPath: getMirrorPath(owner, repo),
     hydrationInProgress: false,
     performedHydration: false, // Will be set by ensureMirror if we do initial clone
-    commitEarlyDenyReason
+    commitEarlyDenyReason,
+    fstrimTimeoutSecs,
+    fstrimMinExtentBytes
   }
 }
 
@@ -2315,6 +2330,74 @@ async function flushBlockDevice(devicePath: string): Promise<void> {
   }
 }
 
+/**
+ * Parse the host's fstrim budget (GetStickyDiskResponse.fstrim_timeout_secs,
+ * a protobuf int64 that arrives as a bigint, or the string read back from
+ * action state) into whole seconds. Anything unusable is 0, which disables
+ * the trim.
+ */
+export function parseFstrimTimeoutSecs(value: unknown): number {
+  const n = typeof value === 'bigint' ? Number(value) : Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return Math.floor(n)
+}
+
+/**
+ * Parse the host's `fstrim --minimum` value
+ * (GetStickyDiskResponse.fstrim_min_extent_bytes, a bigint or saved-state
+ * string) into whole bytes. Anything unusable is 0: the fstrim default.
+ */
+export function parseFstrimMinExtentBytes(value: unknown): number {
+  return parseFstrimTimeoutSecs(value)
+}
+
+/**
+ * Best-effort `fstrim` of the mirror filesystem before it is unmounted and
+ * committed: deleted packs keep their RBD extents allocated on the backing
+ * store until the guest discards them. Bounded by the host-supplied budget;
+ * any failure (discard not negotiated, missing binary, timeout) only logs.
+ */
+async function trimFilesystem(
+  mountPoint: string,
+  timeoutSecs: number,
+  minExtentBytes: number
+): Promise<void> {
+  const start = Date.now()
+  try {
+    const result = await exec.getExecOutput(
+      'timeout',
+      [
+        String(timeoutSecs),
+        'sudo',
+        'fstrim',
+        '-v',
+        ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
+        '--',
+        mountPoint
+      ],
+      {ignoreReturnCode: true, silent: true}
+    )
+    const durationMs = Date.now() - start
+    if (result.exitCode === 0) {
+      core.info(
+        `[git-mirror] fstrim ${mountPoint}: ${result.stdout.trim() || 'done'} in ${durationMs}ms`
+      )
+    } else if (result.exitCode === TIMEOUT_EXIT_CODE) {
+      core.info(
+        `[git-mirror] fstrim ${mountPoint}: timed out after ${timeoutSecs}s`
+      )
+    } else {
+      core.info(
+        `[git-mirror] fstrim ${mountPoint}: failed in ${durationMs}ms: ${result.stderr.trim()}`
+      )
+    }
+  } catch (error) {
+    core.info(
+      `[git-mirror] fstrim ${mountPoint}: failed: ${(error as Error).message}`
+    )
+  }
+}
+
 export interface CleanupOptions {
   exposeId: string
   stickyDiskKey: string
@@ -2332,12 +2415,16 @@ export interface CleanupOptions {
   // Mirror sync outcome from the main step.
   mirrorSyncFailed?: boolean
   mirrorSyncTimedOut?: boolean
+  // Host-supplied fstrim budget in whole seconds; 0 or absent skips the trim.
+  fstrimTimeoutSecs?: number
+  // Host-supplied `fstrim -m` value in bytes; 0 or absent uses the default.
+  fstrimMinExtentBytes?: number
 }
 
 /**
  * Cleanup: run mirror maintenance, sync, unmount, and commit the sticky disk.
  *
- * Execution order: maintenance → sync → unmount (with retry) → flush → commit
+ * Execution order: maintenance → sync → fstrim → unmount (with retry) → flush → commit
  * If the mirror sync failed or timed out, shouldCommit is set to false.
  * Maintenance failure or timeout does not affect the commit.
  */
@@ -2350,7 +2437,9 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     mirrorPath,
     mirrorSyncFailed,
     mirrorSyncTimedOut,
-    vmHydratedGitMirror
+    vmHydratedGitMirror,
+    fstrimTimeoutSecs,
+    fstrimMinExtentBytes
   } = options
   let {shouldCommit} = options
 
@@ -2392,6 +2481,22 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     await exec.exec('sync')
   } catch {
     core.warning('[git-mirror] Failed to sync filesystem')
+  }
+
+  // Discard freed blocks before unmount so the committed snapshot does not
+  // keep them allocated. Only worth it when the result is persisted, and only
+  // when the host has enabled it.
+  if (
+    mountPoint &&
+    shouldCommit &&
+    fstrimTimeoutSecs &&
+    fstrimTimeoutSecs > 0
+  ) {
+    await trimFilesystem(
+      mountPoint,
+      fstrimTimeoutSecs,
+      fstrimMinExtentBytes ?? 0
+    )
   }
 
   // Get device path before unmount for durability flush
