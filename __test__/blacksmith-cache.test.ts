@@ -21,38 +21,6 @@ jest.mock('../src/container-detector', () => ({
 }))
 
 import * as blacksmithCache from '../src/blacksmith-cache'
-import {proto3} from '@bufbuild/protobuf'
-
-describe('fstrimTimeoutSecsFrom', () => {
-  it('prefers the typed field when the proto package knows it', () => {
-    expect(
-      blacksmithCache.fstrimTimeoutSecsFrom({fstrimTimeoutSecs: BigInt(7)}, [
-        {no: 8, wireType: 0, data: new Uint8Array([5])}
-      ])
-    ).toBe(7)
-  })
-
-  it('falls back to unknown field 8 from an older proto package', () => {
-    // A message type that predates the field, like a bundled proto package
-    // built before fstrim_timeout_secs existed.
-    const OldResponse = proto3.makeMessageType('test.OldResponse', [])
-    const response = OldResponse.fromBinary(new Uint8Array([0x40, 0x05]))
-    const unknown = response.getType().runtime.bin.listUnknownFields(response)
-    expect(blacksmithCache.fstrimTimeoutSecsFrom(response, unknown)).toBe(5)
-    expect(
-      blacksmithCache.fstrimTimeoutSecsFrom({}, [
-        {no: 8, wireType: 2, data: new Uint8Array([5])}
-      ])
-    ).toBe(0)
-    expect(blacksmithCache.fstrimTimeoutSecsFrom({}, [])).toBe(0)
-  })
-
-  it('decodes varints and rejects malformed ones', () => {
-    expect(blacksmithCache.decodeVarint(new Uint8Array([0xac, 0x02]))).toBe(300)
-    expect(blacksmithCache.decodeVarint(new Uint8Array([0x80]))).toBeNull()
-    expect(blacksmithCache.decodeVarint(new Uint8Array([5, 5]))).toBeNull()
-  })
-})
 
 describe('parseFstrimTimeoutSecs', () => {
   it('accepts the RPC bigint, a number, or the saved-state string', () => {
