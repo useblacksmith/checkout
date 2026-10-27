@@ -4388,6 +4388,7 @@ const fsHelper = __importStar(__nccwpck_require__(7219));
 const github = __importStar(__nccwpck_require__(5438));
 const path = __importStar(__nccwpck_require__(1017));
 const workflowContextHelper = __importStar(__nccwpck_require__(9568));
+const unsafePrCheckoutHelper = __importStar(__nccwpck_require__(843));
 function getInputs() {
     return __awaiter(this, void 0, void 0, function* () {
         const result = {};
@@ -4516,6 +4517,23 @@ function getInputs() {
         result.verbose =
             (core.getInput('verbose') || 'false').toUpperCase() === 'TRUE';
         core.debug(`verbose = ${result.verbose}`);
+        result.allowUnsafePrCheckout =
+            (core.getInput('allow-unsafe-pr-checkout') || 'false').toUpperCase() ===
+                'TRUE';
+        core.debug(`allow unsafe PR checkout = ${result.allowUnsafePrCheckout}`);
+        // The default self-checkout (this repository with no explicit ref) always
+        // resolves to the trusted ref/commit GitHub set for the triggering event, so
+        // the fork-checkout guard only needs to run when the caller customized the
+        // repository or ref.
+        const isDefaultCheckout = isWorkflowRepository && !core.getInput('ref');
+        if (!isDefaultCheckout) {
+            unsafePrCheckoutHelper.assertSafePrCheckout({
+                qualifiedRepository,
+                ref: result.ref,
+                commit: result.commit,
+                allowUnsafePrCheckout: result.allowUnsafePrCheckout
+            });
+        }
         return result;
     });
 }
@@ -5149,6 +5167,7 @@ exports.getRefSpecForAllHistory = getRefSpecForAllHistory;
 exports.getRefSpec = getRefSpec;
 exports.testRef = testRef;
 exports.checkCommitInfo = checkCommitInfo;
+exports.fromPayload = fromPayload;
 const core = __importStar(__nccwpck_require__(2186));
 const github = __importStar(__nccwpck_require__(5438));
 const url_helper_1 = __nccwpck_require__(9437);
@@ -5930,6 +5949,105 @@ function hasAnyStepFailed(runnerBasePath) {
         const result = yield checkPreviousStepFailures(runnerBasePath);
         return result.hasFailures;
     });
+}
+
+
+/***/ }),
+
+/***/ 843:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.assertSafePrCheckout = assertSafePrCheckout;
+const github = __importStar(__nccwpck_require__(5438));
+const ref_helper_1 = __nccwpck_require__(8601);
+const PR_REF_PATTERN = /^refs\/pull\/[0-9]+\/(?:head|merge)$/;
+function assertSafePrCheckout(input) {
+    if (input.allowUnsafePrCheckout) {
+        return;
+    }
+    const eventName = github.context.eventName;
+    if (eventName !== 'pull_request_target' && eventName !== 'workflow_run') {
+        return;
+    }
+    const baseRepoId = (0, ref_helper_1.fromPayload)('repository.id');
+    if (typeof baseRepoId !== 'number') {
+        return;
+    }
+    let prHeadRepoId;
+    let prHeadRepoFullName;
+    const prShas = [];
+    if (eventName === 'pull_request_target') {
+        prHeadRepoId = (0, ref_helper_1.fromPayload)('pull_request.head.repo.id');
+        prHeadRepoFullName = (0, ref_helper_1.fromPayload)('pull_request.head.repo.full_name');
+        pushIfSha(prShas, (0, ref_helper_1.fromPayload)('pull_request.head.sha'));
+        pushIfSha(prShas, (0, ref_helper_1.fromPayload)('pull_request.merge_commit_sha'));
+    }
+    else {
+        const wrEvent = (0, ref_helper_1.fromPayload)('workflow_run.event');
+        if (typeof wrEvent !== 'string' || !wrEvent.startsWith('pull_request')) {
+            return;
+        }
+        prHeadRepoId = (0, ref_helper_1.fromPayload)('workflow_run.head_repository.id');
+        prHeadRepoFullName = (0, ref_helper_1.fromPayload)('workflow_run.head_repository.full_name');
+        pushIfSha(prShas, (0, ref_helper_1.fromPayload)('workflow_run.head_commit.id'));
+        // For `pull_request_target`-triggered workflow_run, `head_sha` is the base
+        // default branch SHA (not the PR head)
+        if (wrEvent !== 'pull_request_target') {
+            pushIfSha(prShas, (0, ref_helper_1.fromPayload)('workflow_run.head_sha'));
+        }
+    }
+    // (A) Fork PR?
+    if (typeof prHeadRepoId !== 'number' || prHeadRepoId === baseRepoId) {
+        return;
+    }
+    // (B) We cannot check for all fork PR refs so check to see
+    // if the resolved input points to the fork PR sha we have in the payload
+    const repositoryMatchesPrHead = typeof prHeadRepoFullName === 'string' &&
+        input.qualifiedRepository.toLowerCase() === prHeadRepoFullName.toLowerCase();
+    const refMatchesPullPattern = PR_REF_PATTERN.test(input.ref);
+    const commitMatchesPrHeadSha = !!input.commit && prShas.includes(input.commit.toLowerCase());
+    if (!repositoryMatchesPrHead &&
+        !refMatchesPullPattern &&
+        !commitMatchesPrHeadSha) {
+        return;
+    }
+    throw new Error(`Refusing to check out fork pull request code from a '${eventName}' workflow. ` +
+        `This workflow runs with the base repository's GITHUB_TOKEN, secrets, default-branch ` +
+        `cache scope, and runner access. Fetching and executing a fork's code in that trusted ` +
+        `context commonly leads to "pwn request" vulnerabilities. To opt in, review the risks ` +
+        `at https://gh.io/securely-using-pull_request_target and set 'allow-unsafe-pr-checkout: true' ` +
+        `on the actions/checkout step.`);
+}
+function pushIfSha(target, value) {
+    if (typeof value === 'string' && value.length > 0) {
+        target.push(value.toLowerCase());
+    }
 }
 
 

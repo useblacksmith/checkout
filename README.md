@@ -107,6 +107,7 @@ In addition to all upstream `actions/checkout` inputs, this action provides:
 | `dissociate` | `false` | Copies objects from the mirror into the workspace so it no longer depends on the Sticky Disk mount. |
 | `allow-inside-container` | `false` | Attempts to use the Sticky Disk cache inside a container job whose runner devices have been passed through. |
 | `verbose` | `false` | Enables verbose Git tracing for mirror operations when debugging checkout or cache performance. |
+| `allow-unsafe-pr-checkout` | `false` | Required to check out fork pull request code from a `pull_request_target` or `workflow_run` workflow, matching upstream `actions/checkout`. Those workflows run with the base repository's secrets and token, so review https://gh.io/securely-using-pull_request_target before enabling. |
 
 ## Documentation
 
