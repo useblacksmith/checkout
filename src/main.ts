@@ -5,6 +5,7 @@ import * as inputHelper from './input-helper'
 import * as path from 'path'
 import * as stateHelper from './state-helper'
 import * as blacksmithCache from './blacksmith-cache'
+import * as gitfs from './gitfs'
 import {checkPreviousStepFailures} from './step-checker'
 import {reportInternalMetric} from './internal-metrics'
 import * as mirrorTelemetry from './mirror-telemetry'
@@ -46,6 +47,16 @@ async function cleanup(): Promise<void> {
   const repoName = stateHelper.BlacksmithCacheRepoName
   const mountPoint = stateHelper.BlacksmithCacheMountPoint
   const mirrorPath = stateHelper.BlacksmithCacheMirrorPath
+
+  // gitfs maps the mirror's packs, so it has to be gone before the sticky
+  // disk can be unmounted below.
+  if (stateHelper.GitfsMountPoint && mirrorPath) {
+    try {
+      await gitfs.teardown(stateHelper.GitfsMountPoint, mirrorPath)
+    } catch (error) {
+      core.warning(`[gitfs] teardown failed: ${error}`)
+    }
+  }
   const performedHydration = stateHelper.BlacksmithCachePerformedHydration
   let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged
   let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed

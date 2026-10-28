@@ -49,6 +49,8 @@ exports.shouldUseBlacksmithCache = shouldUseBlacksmithCache;
 exports.getMirrorPath = getMirrorPath;
 exports.stickyDiskKeyFor = stickyDiskKeyFor;
 exports.setupCache = setupCache;
+exports.getAuthConfigArgs = getAuthConfigArgs;
+exports.initEmptyMirror = initEmptyMirror;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.purgePullRefs = purgePullRefs;
@@ -499,6 +501,34 @@ function summarizeTrace2Perf(trace2PerfPath, title) {
     finally {
         fs.rmSync(trace2PerfPath, { force: true });
     }
+}
+/**
+ * An empty bare mirror with `git clone --mirror`'s config, for gitfs to
+ * stream the first job's revision into; gitfs completes the mirror in the
+ * background, so it is a full mirror by the time the job ends.
+ */
+function initEmptyMirror(mirrorPath, repoUrl) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c, _d;
+        const mirrorDir = path.dirname(mirrorPath);
+        yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
+        const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
+        const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
+        yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
+        if (fs.existsSync(mirrorPath)) {
+            yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
+        }
+        yield exec.exec('git', ['init', '-q', '--bare', mirrorPath]);
+        yield exec.exec('git', [
+            '-C',
+            mirrorPath,
+            'remote',
+            'add',
+            '--mirror=fetch',
+            'origin',
+            repoUrl
+        ]);
+    });
 }
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
@@ -3603,6 +3633,7 @@ const stateHelper = __importStar(__nccwpck_require__(4866));
 const urlHelper = __importStar(__nccwpck_require__(9437));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
 const mirrorTelemetry = __importStar(__nccwpck_require__(7185));
+const gitfs = __importStar(__nccwpck_require__(1574));
 const git_command_manager_1 = __nccwpck_require__(738);
 function getSource(settings) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -3706,6 +3737,8 @@ function getSourceInner(settings, report, onHydrationReport) {
             // of this run (hydrated now, or synced via ls-remote diff). Only then can
             // the workspace copy its refs from the mirror instead of the network.
             let mirrorFresh = false;
+            // gitfs is hydrating an empty mirror: it has no refs to populate from.
+            let gitfsHydrates = false;
             if (blacksmithCache.shouldUseBlacksmithCache()) {
                 const setupStart = Date.now();
                 try {
@@ -3731,7 +3764,22 @@ function getSourceInner(settings, report, onHydrationReport) {
                         const cloneStart = Date.now();
                         let performedHydration = false;
                         try {
-                            performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            if (!mirrorExisted &&
+                                gitfs.isGitfsRequested() &&
+                                !gitfs.gitfsIneligibilityReason(settings, {
+                                    mirrorPath: cacheInfo.mirrorPath
+                                }) &&
+                                (yield gitfs.findBinary())) {
+                                // No blocking clone: gitfs streams the job's revision into the
+                                // empty mirror and completes it in the background.
+                                core.info(`[gitfs] no mirror at ${cacheInfo.mirrorPath}: gitfs hydrates it`);
+                                yield blacksmithCache.initEmptyMirror(cacheInfo.mirrorPath, repositoryUrl);
+                                performedHydration = true;
+                                gitfsHydrates = true;
+                            }
+                            else {
+                                performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            }
                         }
                         catch (error) {
                             if (!mirrorExisted) {
@@ -3766,7 +3814,7 @@ function getSourceInner(settings, report, onHydrationReport) {
                         }
                         if (performedHydration) {
                             // A freshly-cloned mirror is exactly the remote's current state
-                            mirrorFresh = true;
+                            mirrorFresh = !gitfsHydrates;
                         }
                         else if (settings.fetchDepth <= 0) {
                             // Bring the mirror's branch/tag refs up to date with the remote
@@ -3809,6 +3857,23 @@ function getSourceInner(settings, report, onHydrationReport) {
                     // so cleanup can still call commitStickyDisk with shouldCommit: false
                     cacheInfo = null;
                 }
+            }
+            // Serve the workspace with gitfs when the job asks for it: mount the
+            // requested revision from the mirror now (milliseconds), and let the
+            // tree be written out behind the job. The .git set up below is created
+            // through the mount, so git works from the first step. Anything gitfs
+            // cannot serve falls through to the regular fetch + checkout.
+            let gitfsRevision = null;
+            if (gitfs.isGitfsRequested()) {
+                core.startGroup('Mounting the repository with gitfs');
+                try {
+                    gitfsRevision = yield mountWithGitfs(settings, cacheInfo, repositoryUrl);
+                }
+                catch (error) {
+                    core.warning(`[gitfs] mount failed, using the regular checkout: ${error}`);
+                    gitfsRevision = null;
+                }
+                core.endGroup();
             }
             // Initialize the repository
             if (!fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))) {
@@ -3854,157 +3919,21 @@ function getSourceInner(settings, report, onHydrationReport) {
             if (settings.lfs) {
                 yield git.lfsInstall();
             }
-            // Fetch
-            core.startGroup('Fetching the repository');
-            const objectsDir = path.join(settings.repositoryPath, '.git', 'objects');
-            const objectsBytesBefore = cacheInfo
-                ? yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
-                : null;
-            const fetchStart = Date.now();
-            const fetchOptions = {};
-            if (settings.filter) {
-                fetchOptions.filter = settings.filter;
-            }
-            else if (settings.sparseCheckout) {
-                fetchOptions.filter = 'blob:none';
-            }
-            if (settings.fetchDepth <= 0) {
-                // When the Blacksmith mirror is available and synced with the remote,
-                // copy branch/tag refs from it locally (objects are already shared via
-                // alternates) instead of doing a full +refs/heads/* fetch over the
-                // network, and only ask the network for the specific ref/commit this
-                // run needs.
-                let fetchedFromMirror = false;
-                if (cacheInfo &&
-                    mirrorFresh &&
-                    !fetchOptions.filter &&
-                    !fsHelper.fileExistsSync(path.join(settings.repositoryPath, '.git', 'shallow'))) {
-                    fetchedFromMirror = yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath, git.getEnvironment());
-                }
-                if (fetchedFromMirror) {
-                    // The mirror copy only materializes branches and tags. Any other ref
-                    // (refs/pull/*, etc.) must be fetched from the network so its local
-                    // destination ref exists for checkout. For branches/tags, verify the
-                    // wanted ref/commit is present and fetch it directly if not.
-                    const upperRef = (settings.ref || '').toUpperCase();
-                    const coveredByMirror = !settings.ref ||
-                        !upperRef.startsWith('REFS/') ||
-                        upperRef.startsWith('REFS/HEADS/') ||
-                        upperRef.startsWith('REFS/TAGS/');
-                    let verified = false;
-                    if (coveredByMirror) {
-                        verified = yield refHelper.testRef(git, settings.ref, settings.commit);
-                        if (verified && settings.commit) {
-                            verified = yield git.shaExists(settings.commit);
-                        }
-                    }
-                    if (!verified) {
-                        const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                        yield git.fetch(refSpec, fetchOptions);
-                    }
-                }
-                else {
-                    // Fetch all branches and tags
-                    let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
-                    yield git.fetch(refSpec, fetchOptions);
-                    // When all history is fetched, the ref we're interested in may have moved to a different
-                    // commit (push or force push). If so, fetch again with a targeted refspec.
-                    if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
-                        refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                        yield git.fetch(refSpec, fetchOptions);
-                    }
-                }
-            }
-            else {
-                fetchOptions.fetchDepth = settings.fetchDepth;
-                fetchOptions.fetchTags = settings.fetchTags;
-                // With the mirror attached as an alternate, git would treat every
-                // mirror ref as a known tip: the deepening fetch's connectivity check
-                // walks the whole mirror object graph and negotiation offers every
-                // mirror ref. Turn alternate ref discovery off and offer a few mirror
-                // tips explicitly instead, so the server still sends only the delta
-                // from the mirror (see resolveShallowNegotiationTips).
-                if (cacheInfo &&
-                    (yield git.version()).checkMinimum(git_command_manager_1.MinimumGitAlternateRefsCommandVersion) &&
-                    (yield blacksmithCache.sharesMirrorObjects(settings.repositoryPath, cacheInfo.mirrorPath))) {
-                    fetchOptions.ignoreAlternateRefs = true;
-                    fetchOptions.negotiationTips =
-                        yield blacksmithCache.resolveShallowNegotiationTips(cacheInfo.mirrorPath, settings.ref, process.env['GITHUB_BASE_REF'] || '');
-                    core.info(`[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`);
-                }
-                const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
-            }
-            if (cacheInfo) {
-                // Mirror-served: the fetch pulls only the delta the mirror is missing.
-                report.delta_fetch_ms = Date.now() - fetchStart;
-                const objectsBytesAfter = yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir);
-                report.delta_fetch_bytes =
-                    objectsBytesBefore !== null && objectsBytesAfter !== null
-                        ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
-                        : 0;
+            if (gitfsRevision && cacheInfo) {
+                // The tree is already served from the mirror: give the workspace the
+                // refs and index the regular path would have produced and skip the
+                // fetch + checkout.
+                core.startGroup('Pointing the repository at the mounted revision');
+                const pointStart = Date.now();
+                yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath, git.getEnvironment());
+                yield gitfs.pointWorkspaceAt(settings.repositoryPath, settings.ref, gitfsRevision, git.getEnvironment());
+                report.clone_from_mirror_ms += Date.now() - pointStart;
                 report.mirror_size_bytes = yield mirrorTelemetry.packSizeBytes(cacheInfo.mirrorPath);
                 report.ref_count = yield mirrorTelemetry.refCount(cacheInfo.mirrorPath);
-            }
-            else {
-                // Fallback/bypass: the fetch is the full checkout cost.
-                report.full_checkout_ms = Date.now() - fetchStart;
-            }
-            core.endGroup();
-            // Checkout info
-            core.startGroup('Determining the checkout info');
-            const checkoutInfo = yield refHelper.getCheckoutInfo(git, settings.ref, settings.commit);
-            core.endGroup();
-            // LFS fetch
-            // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
-            // Explicit lfs fetch will fetch lfs objects in parallel.
-            // For sparse checkouts, let `checkout` fetch the needed objects lazily.
-            if (settings.lfs && !settings.sparseCheckout) {
-                core.startGroup('Fetching LFS objects');
-                const lfsStart = Date.now();
-                yield git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref);
-                report.lfs_ms = Date.now() - lfsStart;
                 core.endGroup();
             }
-            // Sparse checkout
-            if (!settings.sparseCheckout) {
-                let gitVersion = yield git.version();
-                // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
-                if (gitVersion.checkMinimum(git_command_manager_1.MinimumGitSparseCheckoutVersion)) {
-                    yield git.disableSparseCheckout();
-                }
-            }
             else {
-                core.startGroup('Setting up sparse checkout');
-                if (settings.sparseCheckoutConeMode) {
-                    yield git.sparseCheckout(settings.sparseCheckout);
-                }
-                else {
-                    yield git.sparseCheckoutNonConeMode(settings.sparseCheckout);
-                }
-                core.endGroup();
-            }
-            // Checkout
-            core.startGroup('Checking out the ref');
-            const checkoutStart = Date.now();
-            yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
-            if (cacheInfo) {
-                // Materializing the working tree reads objects from the mirror through
-                // alternates — the second half of the clone-from-mirror cost.
-                report.clone_from_mirror_ms += Date.now() - checkoutStart;
-            }
-            else {
-                // Fallback/bypass: working-tree materialization is part of the full
-                // checkout cost, keeping phase totals comparable across serving modes.
-                report.full_checkout_ms += Date.now() - checkoutStart;
-            }
-            core.endGroup();
-            // Dissociate from Blacksmith mirror if requested
-            // This copies all objects from alternates into the local repo so it's independent
-            if (settings.dissociate && cacheInfo) {
-                core.startGroup('Dissociating from Blacksmith mirror');
-                yield blacksmithCache.dissociate(settings.repositoryPath, git.getEnvironment());
-                core.endGroup();
+                yield fetchAndCheckout(settings, git, cacheInfo, mirrorFresh, report);
             }
             // Submodules
             if (settings.submodules) {
@@ -4045,6 +3974,210 @@ function getSourceInner(settings, report, onHydrationReport) {
                 }
                 authHelper.removeGlobalConfig();
             }
+        }
+    });
+}
+/**
+ * Mount the requested revision from the mirror with gitfs. Returns null,
+ * after logging why, when this checkout is outside the gitfs cohort; throws
+ * when gitfs was attempted and failed.
+ */
+function mountWithGitfs(settings, cacheInfo, repositoryUrl) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        const reason = gitfs.gitfsIneligibilityReason(settings, {
+            mirrorPath: (_a = cacheInfo === null || cacheInfo === void 0 ? void 0 : cacheInfo.mirrorPath) !== null && _a !== void 0 ? _a : null
+        });
+        if (reason || !cacheInfo) {
+            core.info(`[gitfs] not used: ${reason}`);
+            return null;
+        }
+        const binary = yield gitfs.findBinary();
+        if (!binary) {
+            core.info('[gitfs] not used: gitfs binary not found on PATH');
+            return null;
+        }
+        const candidates = gitfs.mirrorRevisionCandidates(settings.ref, settings.commit);
+        const revision = yield gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates);
+        const mountStart = Date.now();
+        if (revision) {
+            yield gitfs.mount(binary, cacheInfo.mirrorPath, revision.sha, settings.repositoryPath);
+            stateHelper.setGitfsMountPoint(settings.repositoryPath);
+            core.info(`[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`);
+            return revision;
+        }
+        // The mirror lacks the revision (an empty mirror, a push it has not
+        // synced, a pull-request merge ref): gitfs fetches it from the remote into
+        // the mirror and serves the pack as it arrives; the rest of the repository
+        // follows in the background. The mirror changes, so the post step commits
+        // it.
+        const rev = gitfs.coldRevision(settings.ref, settings.commit);
+        core.info(`[gitfs] ${rev} is not in the mirror, streaming it from the remote`);
+        const sha = yield gitfs.mountCold(binary, cacheInfo.mirrorPath, rev, settings.repositoryPath, repositoryUrl, settings.authToken);
+        stateHelper.setGitfsMountPoint(settings.repositoryPath);
+        stateHelper.setBlacksmithCacheMirrorChanged(true);
+        const { mirrorRef, kind } = candidates[0];
+        core.info(`[gitfs] ${settings.repositoryPath} serves ${sha} streamed from the remote (mounted in ${Date.now() - mountStart} ms); the mirror is completed in the background`);
+        return { sha, mirrorRef, kind };
+    });
+}
+/**
+ * The regular path: fetch the requested revision into the workspace (from
+ * the mirror where possible) and check it out.
+ */
+function fetchAndCheckout(settings, git, cacheInfo, mirrorFresh, report) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Fetch
+        core.startGroup('Fetching the repository');
+        const objectsDir = path.join(settings.repositoryPath, '.git', 'objects');
+        const objectsBytesBefore = cacheInfo
+            ? yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+            : null;
+        const fetchStart = Date.now();
+        const fetchOptions = {};
+        if (settings.filter) {
+            fetchOptions.filter = settings.filter;
+        }
+        else if (settings.sparseCheckout) {
+            fetchOptions.filter = 'blob:none';
+        }
+        if (settings.fetchDepth <= 0) {
+            // When the Blacksmith mirror is available and synced with the remote,
+            // copy branch/tag refs from it locally (objects are already shared via
+            // alternates) instead of doing a full +refs/heads/* fetch over the
+            // network, and only ask the network for the specific ref/commit this
+            // run needs.
+            let fetchedFromMirror = false;
+            if (cacheInfo &&
+                mirrorFresh &&
+                !fetchOptions.filter &&
+                !fsHelper.fileExistsSync(path.join(settings.repositoryPath, '.git', 'shallow'))) {
+                fetchedFromMirror = yield blacksmithCache.fetchRefsFromMirror(settings.repositoryPath, cacheInfo.mirrorPath, git.getEnvironment());
+            }
+            if (fetchedFromMirror) {
+                // The mirror copy only materializes branches and tags. Any other ref
+                // (refs/pull/*, etc.) must be fetched from the network so its local
+                // destination ref exists for checkout. For branches/tags, verify the
+                // wanted ref/commit is present and fetch it directly if not.
+                const upperRef = (settings.ref || '').toUpperCase();
+                const coveredByMirror = !settings.ref ||
+                    !upperRef.startsWith('REFS/') ||
+                    upperRef.startsWith('REFS/HEADS/') ||
+                    upperRef.startsWith('REFS/TAGS/');
+                let verified = false;
+                if (coveredByMirror) {
+                    verified = yield refHelper.testRef(git, settings.ref, settings.commit);
+                    if (verified && settings.commit) {
+                        verified = yield git.shaExists(settings.commit);
+                    }
+                }
+                if (!verified) {
+                    const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                    yield git.fetch(refSpec, fetchOptions);
+                }
+            }
+            else {
+                // Fetch all branches and tags
+                let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
+                yield git.fetch(refSpec, fetchOptions);
+                // When all history is fetched, the ref we're interested in may have moved to a different
+                // commit (push or force push). If so, fetch again with a targeted refspec.
+                if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
+                    refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                    yield git.fetch(refSpec, fetchOptions);
+                }
+            }
+        }
+        else {
+            fetchOptions.fetchDepth = settings.fetchDepth;
+            fetchOptions.fetchTags = settings.fetchTags;
+            // With the mirror attached as an alternate, git would treat every
+            // mirror ref as a known tip: the deepening fetch's connectivity check
+            // walks the whole mirror object graph and negotiation offers every
+            // mirror ref. Turn alternate ref discovery off and offer a few mirror
+            // tips explicitly instead, so the server still sends only the delta
+            // from the mirror (see resolveShallowNegotiationTips).
+            if (cacheInfo &&
+                (yield git.version()).checkMinimum(git_command_manager_1.MinimumGitAlternateRefsCommandVersion) &&
+                (yield blacksmithCache.sharesMirrorObjects(settings.repositoryPath, cacheInfo.mirrorPath))) {
+                fetchOptions.ignoreAlternateRefs = true;
+                fetchOptions.negotiationTips =
+                    yield blacksmithCache.resolveShallowNegotiationTips(cacheInfo.mirrorPath, settings.ref, process.env['GITHUB_BASE_REF'] || '');
+                core.info(`[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`);
+            }
+            const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+            yield git.fetch(refSpec, fetchOptions);
+        }
+        if (cacheInfo) {
+            // Mirror-served: the fetch pulls only the delta the mirror is missing.
+            report.delta_fetch_ms = Date.now() - fetchStart;
+            const objectsBytesAfter = yield mirrorTelemetry.dirSizeBytesOrNull(objectsDir);
+            report.delta_fetch_bytes =
+                objectsBytesBefore !== null && objectsBytesAfter !== null
+                    ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
+                    : 0;
+            report.mirror_size_bytes = yield mirrorTelemetry.packSizeBytes(cacheInfo.mirrorPath);
+            report.ref_count = yield mirrorTelemetry.refCount(cacheInfo.mirrorPath);
+        }
+        else {
+            // Fallback/bypass: the fetch is the full checkout cost.
+            report.full_checkout_ms = Date.now() - fetchStart;
+        }
+        core.endGroup();
+        // Checkout info
+        core.startGroup('Determining the checkout info');
+        const checkoutInfo = yield refHelper.getCheckoutInfo(git, settings.ref, settings.commit);
+        core.endGroup();
+        // LFS fetch
+        // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
+        // Explicit lfs fetch will fetch lfs objects in parallel.
+        // For sparse checkouts, let `checkout` fetch the needed objects lazily.
+        if (settings.lfs && !settings.sparseCheckout) {
+            core.startGroup('Fetching LFS objects');
+            const lfsStart = Date.now();
+            yield git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref);
+            report.lfs_ms = Date.now() - lfsStart;
+            core.endGroup();
+        }
+        // Sparse checkout
+        if (!settings.sparseCheckout) {
+            let gitVersion = yield git.version();
+            // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
+            if (gitVersion.checkMinimum(git_command_manager_1.MinimumGitSparseCheckoutVersion)) {
+                yield git.disableSparseCheckout();
+            }
+        }
+        else {
+            core.startGroup('Setting up sparse checkout');
+            if (settings.sparseCheckoutConeMode) {
+                yield git.sparseCheckout(settings.sparseCheckout);
+            }
+            else {
+                yield git.sparseCheckoutNonConeMode(settings.sparseCheckout);
+            }
+            core.endGroup();
+        }
+        // Checkout
+        core.startGroup('Checking out the ref');
+        const checkoutStart = Date.now();
+        yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+        if (cacheInfo) {
+            // Materializing the working tree reads objects from the mirror through
+            // alternates — the second half of the clone-from-mirror cost.
+            report.clone_from_mirror_ms += Date.now() - checkoutStart;
+        }
+        else {
+            // Fallback/bypass: working-tree materialization is part of the full
+            // checkout cost, keeping phase totals comparable across serving modes.
+            report.full_checkout_ms += Date.now() - checkoutStart;
+        }
+        core.endGroup();
+        // Dissociate from Blacksmith mirror if requested
+        // This copies all objects from alternates into the local repo so it's independent
+        if (settings.dissociate && cacheInfo) {
+            core.startGroup('Dissociating from Blacksmith mirror');
+            yield blacksmithCache.dissociate(settings.repositoryPath, git.getEnvironment());
+            core.endGroup();
         }
     });
 }
@@ -4179,6 +4312,376 @@ class GitVersion {
     }
 }
 exports.GitVersion = GitVersion;
+
+
+/***/ }),
+
+/***/ 1574:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.GITFS_ENV = void 0;
+exports.isGitfsRequested = isGitfsRequested;
+exports.gitfsIneligibilityReason = gitfsIneligibilityReason;
+exports.findBinary = findBinary;
+exports.mirrorRevisionCandidates = mirrorRevisionCandidates;
+exports.coldRevision = coldRevision;
+exports.resolveInMirror = resolveInMirror;
+exports.fetchIntoMirror = fetchIntoMirror;
+exports.mount = mount;
+exports.mountCold = mountCold;
+exports.pointWorkspaceAt = pointWorkspaceAt;
+exports.teardown = teardown;
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const fs = __importStar(__nccwpck_require__(7147));
+const io = __importStar(__nccwpck_require__(7436));
+const path = __importStar(__nccwpck_require__(1017));
+const container_detector_1 = __nccwpck_require__(6424);
+const blacksmith_cache_1 = __nccwpck_require__(9242);
+/**
+ * gitfs serves the workspace from the git mirror sticky disk instead of
+ * checking it out: `gitfs mount <mirror> --ref <sha> <workspace> --daemon`
+ * returns as soon as the tree is mounted (milliseconds), writes the real
+ * checkout out in the background and swaps it in for the mount once it is
+ * complete. Writes made through the mount in the meantime (`.git`, npm's
+ * node_modules, ...) land in that same tree. The agent enables it per job via
+ * BLACKSMITH_USE_GITFS=true, driven by the installation's use_gitfs_checkout
+ * flag; anything gitfs cannot serve falls through to the regular checkout.
+ */
+exports.GITFS_ENV = 'BLACKSMITH_USE_GITFS';
+const GITFS_BINARY = 'gitfs';
+const DAEMON_EXIT_TIMEOUT_MS = 10000;
+const DAEMON_KILL_TIMEOUT_MS = 5000;
+function isGitfsRequested(env = process.env) {
+    return env[exports.GITFS_ENV] === 'true';
+}
+/**
+ * Why gitfs cannot serve this checkout, or null when it can. The v1 cohort is
+ * the plain case: a Linux runner VM with the mirror mounted, a branch, tag,
+ * pull ref or commit to serve, and none of the features that need the
+ * workspace to be a real fetch (submodules, LFS, sparse/partial clones,
+ * dissociate).
+ */
+function gitfsIneligibilityReason(settings, ctx) {
+    var _a, _b;
+    const platform = (_a = ctx.platform) !== null && _a !== void 0 ? _a : process.platform;
+    if (platform !== 'linux') {
+        return `platform ${platform} is not linux`;
+    }
+    if (!ctx.mirrorPath) {
+        return 'git mirror is not available';
+    }
+    const inContainer = (_b = ctx.inContainer) !== null && _b !== void 0 ? _b : (0, container_detector_1.isRunningInContainer)();
+    if (inContainer) {
+        return 'running inside a container';
+    }
+    if (!settings.ref && !settings.commit) {
+        return 'no ref or commit requested';
+    }
+    if (settings.submodules) {
+        return 'submodules are enabled';
+    }
+    if (settings.lfs) {
+        return 'lfs is enabled';
+    }
+    if (settings.sparseCheckout && settings.sparseCheckout.length > 0) {
+        return 'sparse checkout is enabled';
+    }
+    if (settings.filter) {
+        return `filter ${settings.filter} is set`;
+    }
+    if (settings.dissociate) {
+        return 'dissociate is enabled';
+    }
+    if (fs.existsSync(path.join(settings.repositoryPath, '.git'))) {
+        return 'workspace already contains a repository';
+    }
+    return null;
+}
+function findBinary() {
+    return __awaiter(this, void 0, void 0, function* () {
+        const found = yield io.which(GITFS_BINARY, false);
+        return found || null;
+    });
+}
+function classify(ref) {
+    const upper = ref.toUpperCase();
+    if (upper.startsWith('REFS/HEADS/'))
+        return 'branch';
+    if (upper.startsWith('REFS/TAGS/'))
+        return 'tag';
+    if (upper.startsWith('REFS/PULL/'))
+        return 'pull';
+    return 'other';
+}
+/**
+ * Revisions to try in the mirror for the requested ref/commit, in order. A
+ * commit wins over the ref (that is what the checkout would end up at); an
+ * unqualified ref is a branch first, then a tag, as in getCheckoutInfo.
+ */
+function mirrorRevisionCandidates(ref, commit) {
+    if (commit) {
+        const kind = ref ? classify(ref) : 'commit';
+        const mirrorRef = ref && ref.toUpperCase().startsWith('REFS/') ? ref : '';
+        return [{ rev: `${commit}^{commit}`, mirrorRef, kind }];
+    }
+    if (!ref) {
+        return [];
+    }
+    if (ref.toUpperCase().startsWith('REFS/')) {
+        return [{ rev: `${ref}^{commit}`, mirrorRef: ref, kind: classify(ref) }];
+    }
+    return [
+        {
+            rev: `refs/heads/${ref}^{commit}`,
+            mirrorRef: `refs/heads/${ref}`,
+            kind: 'branch'
+        },
+        {
+            rev: `refs/tags/${ref}^{commit}`,
+            mirrorRef: `refs/tags/${ref}`,
+            kind: 'tag'
+        }
+    ];
+}
+/**
+ * What `gitfs mount --url` fetches for a revision the mirror lacks: a commit
+ * by sha, a qualified ref by name, an unqualified ref as a branch.
+ */
+function coldRevision(ref, commit) {
+    if (commit) {
+        return commit;
+    }
+    if (ref.toUpperCase().startsWith('REFS/')) {
+        return ref;
+    }
+    return `refs/heads/${ref}`;
+}
+function resolveInMirror(mirrorPath, candidates) {
+    return __awaiter(this, void 0, void 0, function* () {
+        for (const candidate of candidates) {
+            const result = yield exec.getExecOutput('git', ['-C', mirrorPath, 'rev-parse', '--verify', '--quiet', candidate.rev], { silent: true, ignoreReturnCode: true });
+            const sha = result.stdout.trim();
+            if (result.exitCode === 0 && /^[0-9a-f]{40}$/.test(sha)) {
+                return { sha, mirrorRef: candidate.mirrorRef, kind: candidate.kind };
+            }
+        }
+        return null;
+    });
+}
+function fetchIntoMirror(mirrorPath, repositoryUrl, authToken, refspecs) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const auth = (0, blacksmith_cache_1.getAuthConfigArgs)(repositoryUrl, authToken);
+        yield exec.exec('git', [
+            '-C',
+            mirrorPath,
+            '-c',
+            `${auth.configKey}=${auth.configValue}`,
+            '-c',
+            'gc.auto=0',
+            'fetch',
+            '--no-tags',
+            '--no-recurse-submodules',
+            '--no-write-fetch-head',
+            repositoryUrl,
+            ...refspecs
+        ]);
+    });
+}
+function mount(binary, mirrorPath, sha, mountpoint) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (fs.existsSync(mountpoint) && fs.readdirSync(mountpoint).length > 0) {
+            throw new Error(`${mountpoint} is not empty`);
+        }
+        yield exec.exec(binary, [
+            'mount',
+            mirrorPath,
+            '--ref',
+            sha,
+            mountpoint,
+            '--daemon'
+        ]);
+    });
+}
+/**
+ * Mount a revision the mirror does not have: gitfs fetches it from the
+ * remote into the mirror (`--depth 1`, serving the pack as it arrives) and
+ * completes the mirror in the background. Returns the commit sha, which
+ * gitfs prints once the commit is in, before git has written the ref.
+ */
+function mountCold(binary, mirrorPath, rev, mountpoint, repositoryUrl, authToken) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b;
+        if (fs.existsSync(mountpoint) && fs.readdirSync(mountpoint).length > 0) {
+            throw new Error(`${mountpoint} is not empty`);
+        }
+        const env = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (value !== undefined) {
+                env[key] = value;
+            }
+        }
+        env.GITFS_TOKEN = authToken;
+        const result = yield exec.getExecOutput(binary, [
+            'mount',
+            mirrorPath,
+            '--ref',
+            rev,
+            mountpoint,
+            '--daemon',
+            '--url',
+            repositoryUrl
+        ], { env });
+        const sha = (_b = (_a = result.stdout.trim().split('\n').pop()) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : '';
+        if (!/^[0-9a-f]{40}$/.test(sha)) {
+            throw new Error(`gitfs did not report the mounted commit: ${result.stdout.trim()}`);
+        }
+        return sha;
+    });
+}
+/**
+ * Point the workspace at the mounted revision without touching the tree:
+ * the local branch / tag / pull ref the regular checkout would have created,
+ * HEAD on it (or detached, as `git checkout` would leave it), and an index
+ * for the tree. The files are already there, served by gitfs.
+ */
+function pointWorkspaceAt(repositoryPath, ref, revision, env) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const git = (...args) => __awaiter(this, void 0, void 0, function* () {
+            yield exec.exec('git', ['-C', repositoryPath, ...args], { env });
+        });
+        const { sha } = revision;
+        if (revision.kind === 'branch') {
+            const branch = revision.mirrorRef.slice('refs/heads/'.length);
+            yield git('update-ref', `refs/remotes/origin/${branch}`, sha);
+            yield git('update-ref', `refs/heads/${branch}`, sha);
+            yield git('config', `branch.${branch}.remote`, 'origin');
+            yield git('config', `branch.${branch}.merge`, `refs/heads/${branch}`);
+            yield git('symbolic-ref', 'HEAD', `refs/heads/${branch}`);
+        }
+        else {
+            if (revision.kind === 'tag') {
+                yield git('update-ref', revision.mirrorRef, sha);
+            }
+            else if (revision.kind === 'pull') {
+                const name = revision.mirrorRef.slice('refs/pull/'.length);
+                yield git('update-ref', `refs/remotes/pull/${name}`, sha);
+            }
+            yield git('update-ref', '--no-deref', 'HEAD', sha);
+        }
+        // Index entries without stat data: git re-verifies file contents on the
+        // first status/diff instead of touching every file now.
+        yield git('read-tree', sha);
+    });
+}
+function daemonPids(mirrorPath) {
+    const pids = [];
+    let entries;
+    try {
+        entries = fs.readdirSync('/proc');
+    }
+    catch (_a) {
+        return pids;
+    }
+    for (const entry of entries) {
+        if (!/^\d+$/.test(entry))
+            continue;
+        let cmdline;
+        try {
+            cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8');
+        }
+        catch (_b) {
+            continue;
+        }
+        const argv = cmdline.split('\0');
+        if (path.basename(argv[0] || '') === GITFS_BINARY &&
+            argv.includes('mount') &&
+            argv.includes(mirrorPath)) {
+            pids.push(Number(entry));
+        }
+    }
+    return pids;
+}
+function waitForDaemons(mirrorPath, timeoutMs) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const deadline = Date.now() + timeoutMs;
+        let pids = daemonPids(mirrorPath);
+        while (pids.length > 0 && Date.now() < deadline) {
+            yield new Promise(resolve => setTimeout(resolve, 100));
+            pids = daemonPids(mirrorPath);
+        }
+        return pids;
+    });
+}
+/**
+ * Take gitfs down before the mirror sticky disk is unmounted: the daemon has
+ * the mirror's packs mapped, so the disk cannot be released while it lives.
+ * `gitfs unmount` handles both phases — while the tree is still being
+ * written the workspace path is a symlink into the mount and unmounting
+ * discards the partial tree (the workspace is left empty); after the swap
+ * the path is a plain directory and the FUSE view that served it is still up
+ * on the hidden sibling path, which unmount takes down.
+ */
+function teardown(mountpoint, mirrorPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const binary = yield findBinary();
+        if (binary && fs.existsSync(mountpoint)) {
+            core.info(`[gitfs] Unmounting ${mountpoint}`);
+            yield exec.exec(binary, ['unmount', mountpoint], { ignoreReturnCode: true });
+        }
+        let pids = yield waitForDaemons(mirrorPath, DAEMON_EXIT_TIMEOUT_MS);
+        if (pids.length > 0) {
+            core.info(`[gitfs] Stopping daemon(s) ${pids.join(', ')} still serving ${mirrorPath}`);
+            for (const pid of pids) {
+                try {
+                    process.kill(pid, 'SIGTERM');
+                }
+                catch (_a) {
+                    // already gone
+                }
+            }
+            pids = yield waitForDaemons(mirrorPath, DAEMON_KILL_TIMEOUT_MS);
+            if (pids.length > 0) {
+                core.warning(`[gitfs] daemon(s) ${pids.join(', ')} did not exit; the mirror unmount may fail`);
+            }
+        }
+    });
+}
 
 
 /***/ }),
@@ -4709,6 +5212,7 @@ const inputHelper = __importStar(__nccwpck_require__(5480));
 const path = __importStar(__nccwpck_require__(1017));
 const stateHelper = __importStar(__nccwpck_require__(4866));
 const blacksmithCache = __importStar(__nccwpck_require__(9242));
+const gitfs = __importStar(__nccwpck_require__(1574));
 const step_checker_1 = __nccwpck_require__(9716);
 const internal_metrics_1 = __nccwpck_require__(7753);
 const mirrorTelemetry = __importStar(__nccwpck_require__(7185));
@@ -4749,6 +5253,16 @@ function cleanup() {
         const repoName = stateHelper.BlacksmithCacheRepoName;
         const mountPoint = stateHelper.BlacksmithCacheMountPoint;
         const mirrorPath = stateHelper.BlacksmithCacheMirrorPath;
+        // gitfs maps the mirror's packs, so it has to be gone before the sticky
+        // disk can be unmounted below.
+        if (stateHelper.GitfsMountPoint && mirrorPath) {
+            try {
+                yield gitfs.teardown(stateHelper.GitfsMountPoint, mirrorPath);
+            }
+            catch (error) {
+                core.warning(`[gitfs] teardown failed: ${error}`);
+            }
+        }
         const performedHydration = stateHelper.BlacksmithCachePerformedHydration;
         let mirrorChanged = stateHelper.BlacksmithCacheMirrorChanged;
         let mirrorSyncFailed = stateHelper.BlacksmithCacheMirrorSyncFailed;
@@ -5543,7 +6057,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.BlacksmithCacheCommitEarlyDenyReason = exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
+exports.BlacksmithCacheCommitEarlyDenyReason = exports.GitfsMountPoint = exports.BlacksmithCacheVerbose = exports.BlacksmithCacheRepoUrl = exports.BlacksmithCacheMirrorSyncDeferred = exports.BlacksmithCacheMirrorSyncTimedOut = exports.BlacksmithCacheMirrorSyncFailed = exports.BlacksmithCacheMirrorChanged = exports.BlacksmithCachePerformedHydration = exports.BlacksmithCacheStickyDiskKey = exports.BlacksmithCacheRepoName = exports.BlacksmithCacheMountPoint = exports.BlacksmithCacheMirrorPath = exports.BlacksmithCacheExposeId = exports.SshKnownHostsPath = exports.SshKeyPath = exports.PostSetSafeDirectory = exports.RepositoryPath = exports.IsPost = void 0;
 exports.setRepositoryPath = setRepositoryPath;
 exports.setSshKeyPath = setSshKeyPath;
 exports.setSshKnownHostsPath = setSshKnownHostsPath;
@@ -5561,6 +6075,7 @@ exports.setBlacksmithCacheMirrorSyncDeferred = setBlacksmithCacheMirrorSyncDefer
 exports.setBlacksmithCacheRepoUrl = setBlacksmithCacheRepoUrl;
 exports.setBlacksmithCacheVerbose = setBlacksmithCacheVerbose;
 exports.setBlacksmithCacheCommitEarlyDenyReason = setBlacksmithCacheCommitEarlyDenyReason;
+exports.setGitfsMountPoint = setGitfsMountPoint;
 const core = __importStar(__nccwpck_require__(2186));
 /**
  * Indicates whether the POST action is running
@@ -5635,6 +6150,11 @@ exports.BlacksmithCacheVerbose = core.getState('blacksmithCacheVerbose') === 'tr
  * Reason the host gave at mount time for denying this job's sticky disk commit
  * (e.g. branch protection). Empty when no denial was reported.
  */
+/**
+ * Workspace path served by gitfs, so the POST action can take the mount down
+ * before the mirror sticky disk is unmounted.
+ */
+exports.GitfsMountPoint = core.getState('gitfsMountPoint');
 exports.BlacksmithCacheCommitEarlyDenyReason = core.getState('blacksmithCacheCommitEarlyDenyReason');
 /**
  * Save the repository path so the POST action can retrieve the value.
@@ -5736,6 +6256,9 @@ function setBlacksmithCacheVerbose(verbose) {
  */
 function setBlacksmithCacheCommitEarlyDenyReason(reason) {
     core.saveState('blacksmithCacheCommitEarlyDenyReason', reason);
+}
+function setGitfsMountPoint(mountPoint) {
+    core.saveState('gitfsMountPoint', mountPoint);
 }
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
 // This is necessary since we don't have a separate entry point.

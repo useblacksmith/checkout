@@ -102,6 +102,12 @@ export const BlacksmithCacheVerbose =
  * Reason the host gave at mount time for denying this job's sticky disk commit
  * (e.g. branch protection). Empty when no denial was reported.
  */
+/**
+ * Workspace path served by gitfs, so the POST action can take the mount down
+ * before the mirror sticky disk is unmounted.
+ */
+export const GitfsMountPoint = core.getState('gitfsMountPoint')
+
 export const BlacksmithCacheCommitEarlyDenyReason = core.getState(
   'blacksmithCacheCommitEarlyDenyReason'
 )
@@ -231,6 +237,10 @@ export function setBlacksmithCacheVerbose(verbose: boolean) {
  */
 export function setBlacksmithCacheCommitEarlyDenyReason(reason: string) {
   core.saveState('blacksmithCacheCommitEarlyDenyReason', reason)
+}
+
+export function setGitfsMountPoint(mountPoint: string): void {
+  core.saveState('gitfsMountPoint', mountPoint)
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.
