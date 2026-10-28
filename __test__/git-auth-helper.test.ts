@@ -1176,7 +1176,8 @@ async function setup(testName: string): Promise<void> {
     setSafeDirectory: true,
     githubServerUrl: githubServerUrl,
     dissociate: false,
-    verbose: false
+    verbose: false,
+    allowUnsafePrCheckout: false
   }
 }
 

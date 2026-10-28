@@ -131,4 +131,10 @@ export interface IGitSourceSettings {
    * When true, outputs GIT_TRACE and GIT_CURL_VERBOSE for debugging.
    */
   verbose: boolean
+
+  /**
+   * Opt in to checking out fork pull request code from a `pull_request_target`
+   * or `workflow_run` workflow. See https://gh.io/securely-using-pull_request_target.
+   */
+  allowUnsafePrCheckout: boolean
 }
