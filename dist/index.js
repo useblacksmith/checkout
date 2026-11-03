@@ -4734,6 +4734,20 @@ function run() {
         }
     });
 }
+// Why the post step skips the deferred mirror refresh, or '' to run it
+// (src/mirror-refresh.ts).
+function deferredRefreshSkipReason(options) {
+    if (!options.refreshMirror) {
+        return 'refresh-mirror is false';
+    }
+    if (options.commitEarlyDenyReason) {
+        return `commit denied for this job (${options.commitEarlyDenyReason})`;
+    }
+    return '';
+}
+function parseRefreshMirrorInput(value) {
+    return value.trim().toUpperCase() !== 'FALSE';
+}
 function cleanup() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
@@ -4758,8 +4772,17 @@ function cleanup() {
             let deferredSyncResult = null;
             // For shallow checkouts the checkout step never populates the workspace
             // from mirror refs, so the mirror sync is deferred here to keep the
-            // checkout step fast.
-            if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
+            // checkout step fast. A refresh that cannot be committed is skipped.
+            const refreshSkipReason = deferredRefreshSkipReason({
+                refreshMirror: parseRefreshMirrorInput(core.getInput('refresh-mirror')),
+                commitEarlyDenyReason: stateHelper.BlacksmithCacheCommitEarlyDenyReason
+            });
+            if (stateHelper.BlacksmithCacheMirrorSyncDeferred &&
+                mirrorPath &&
+                refreshSkipReason) {
+                core.info(`[git-mirror] Skipping mirror refresh: ${refreshSkipReason}`);
+            }
+            else if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
                 const repoUrl = stateHelper.BlacksmithCacheRepoUrl;
                 // Re-read auth token from input (don't store sensitive data in state)
                 const authToken = core.getInput('token', { required: false });
