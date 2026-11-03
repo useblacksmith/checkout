@@ -106,6 +106,7 @@ In addition to all upstream `actions/checkout` inputs, this action provides:
 | --- | --- | --- |
 | `dissociate` | `false` | Copies objects from the mirror into the workspace so it no longer depends on the Sticky Disk mount. |
 | `allow-inside-container` | `false` | Attempts to use the Sticky Disk cache inside a container job whose runner devices have been passed through. |
+| `refresh-mirror` | `true` | Refreshes the git mirror in the post step after a shallow checkout. Set to `false` to skip the refresh. It is also skipped automatically when sticky disk branch protection has denied the job's commit, since the refreshed mirror would be discarded. |
 | `verbose` | `false` | Enables verbose Git tracing for mirror operations when debugging checkout or cache performance. |
 | `allow-unsafe-pr-checkout` | `false` | Required to check out fork pull request code from a `pull_request_target` or `workflow_run` workflow, matching upstream `actions/checkout`. Those workflows run with the base repository's secrets and token, so review https://gh.io/securely-using-pull_request_target before enabling. |
 

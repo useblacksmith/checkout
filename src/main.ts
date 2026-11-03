@@ -8,6 +8,10 @@ import * as blacksmithCache from './blacksmith-cache'
 import {checkPreviousStepFailures} from './step-checker'
 import {reportInternalMetric} from './internal-metrics'
 import * as mirrorTelemetry from './mirror-telemetry'
+import {
+  deferredRefreshSkipReason,
+  parseRefreshMirrorInput
+} from './mirror-refresh'
 
 async function run(): Promise<void> {
   try {
@@ -55,8 +59,18 @@ async function cleanup(): Promise<void> {
     let deferredSyncResult: blacksmithCache.MirrorSyncResult | null = null
     // For shallow checkouts the checkout step never populates the workspace
     // from mirror refs, so the mirror sync is deferred here to keep the
-    // checkout step fast.
-    if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
+    // checkout step fast. A refresh that cannot be committed is skipped.
+    const refreshSkipReason = deferredRefreshSkipReason({
+      refreshMirror: parseRefreshMirrorInput(core.getInput('refresh-mirror')),
+      commitEarlyDenyReason: stateHelper.BlacksmithCacheCommitEarlyDenyReason
+    })
+    if (
+      stateHelper.BlacksmithCacheMirrorSyncDeferred &&
+      mirrorPath &&
+      refreshSkipReason
+    ) {
+      core.info(`[git-mirror] Skipping mirror refresh: ${refreshSkipReason}`)
+    } else if (stateHelper.BlacksmithCacheMirrorSyncDeferred && mirrorPath) {
       const repoUrl = stateHelper.BlacksmithCacheRepoUrl
       // Re-read auth token from input (don't store sensitive data in state)
       const authToken = core.getInput('token', {required: false})
