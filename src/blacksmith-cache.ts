@@ -2355,7 +2355,8 @@ export function parseFstrimMinExtentBytes(value: unknown): number {
  * Best-effort `fstrim` of the mirror filesystem before it is unmounted and
  * committed: deleted packs keep their RBD extents allocated on the backing
  * store until the guest discards them. Bounded by the host-supplied budget;
- * any failure (discard not negotiated, missing binary, timeout) only logs.
+ * `timeout` runs under sudo so it has the privilege to stop root's fstrim.
+ * Any failure (discard not negotiated, missing binary, timeout) only logs.
  */
 async function trimFilesystem(
   mountPoint: string,
@@ -2365,10 +2366,10 @@ async function trimFilesystem(
   const start = Date.now()
   try {
     const result = await exec.getExecOutput(
-      'timeout',
+      'sudo',
       [
+        'timeout',
         String(timeoutSecs),
-        'sudo',
         'fstrim',
         '-v',
         ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
