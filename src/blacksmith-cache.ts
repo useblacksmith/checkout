@@ -2364,6 +2364,8 @@ async function trimFilesystem(
   minExtentBytes: number
 ): Promise<void> {
   const start = Date.now()
+  let outcome: TrimOutcome
+  let detail: string
   try {
     const result = await exec.getExecOutput(
       'sudo',
@@ -2378,25 +2380,35 @@ async function trimFilesystem(
       ],
       {ignoreReturnCode: true, silent: true}
     )
-    const durationMs = Date.now() - start
-    if (result.exitCode === 0) {
-      core.info(
-        `[git-mirror] fstrim ${mountPoint}: ${result.stdout.trim() || 'done'} in ${durationMs}ms`
-      )
-    } else if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.info(
-        `[git-mirror] fstrim ${mountPoint}: timed out after ${timeoutSecs}s`
-      )
-    } else {
-      core.info(
-        `[git-mirror] fstrim ${mountPoint}: failed in ${durationMs}ms: ${result.stderr.trim()}`
-      )
-    }
+    detail = (result.stdout + result.stderr).trim()
+    outcome = trimOutcome(result.exitCode, detail)
   } catch (error) {
-    core.info(
-      `[git-mirror] fstrim ${mountPoint}: failed: ${(error as Error).message}`
-    )
+    detail = (error as Error).message
+    outcome = trimOutcome((error as {code?: unknown}).code, detail)
   }
+  core.info(
+    `[git-mirror] fstrim ${mountPoint}: ${outcome} in ${Date.now() - start}ms${detail ? `: ${detail}` : ''}`
+  )
+}
+
+// Same vocabulary as setup-docker-builder and the agent's FstrimOutcome.
+type TrimOutcome = 'ok' | 'timeout' | 'unsupported' | 'failed'
+
+// 124 is timeout(1)'s exit code; discard not negotiated by the hypervisor
+// (EOPNOTSUPP) or no fstrim binary are "unsupported"; anything else "failed".
+function trimOutcome(code: unknown, detail: string): TrimOutcome {
+  if (code === 0) return 'ok'
+  if (code === TIMEOUT_EXIT_CODE) return 'timeout'
+  if (code === 127 || code === 'ENOENT') return 'unsupported'
+  const msg = detail.toLowerCase()
+  if (
+    msg.includes('not supported') ||
+    msg.includes('command not found') ||
+    msg.includes('no such file or directory')
+  ) {
+    return 'unsupported'
+  }
+  return 'failed'
 }
 
 export interface CleanupOptions {

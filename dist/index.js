@@ -1974,6 +1974,8 @@ function parseFstrimMinExtentBytes(value) {
 function trimFilesystem(mountPoint, timeoutSecs, minExtentBytes) {
     return __awaiter(this, void 0, void 0, function* () {
         const start = Date.now();
+        let outcome;
+        let detail;
         try {
             const result = yield exec.getExecOutput('sudo', [
                 'timeout',
@@ -1984,21 +1986,32 @@ function trimFilesystem(mountPoint, timeoutSecs, minExtentBytes) {
                 '--',
                 mountPoint
             ], { ignoreReturnCode: true, silent: true });
-            const durationMs = Date.now() - start;
-            if (result.exitCode === 0) {
-                core.info(`[git-mirror] fstrim ${mountPoint}: ${result.stdout.trim() || 'done'} in ${durationMs}ms`);
-            }
-            else if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                core.info(`[git-mirror] fstrim ${mountPoint}: timed out after ${timeoutSecs}s`);
-            }
-            else {
-                core.info(`[git-mirror] fstrim ${mountPoint}: failed in ${durationMs}ms: ${result.stderr.trim()}`);
-            }
+            detail = (result.stdout + result.stderr).trim();
+            outcome = trimOutcome(result.exitCode, detail);
         }
         catch (error) {
-            core.info(`[git-mirror] fstrim ${mountPoint}: failed: ${error.message}`);
+            detail = error.message;
+            outcome = trimOutcome(error.code, detail);
         }
+        core.info(`[git-mirror] fstrim ${mountPoint}: ${outcome} in ${Date.now() - start}ms${detail ? `: ${detail}` : ''}`);
     });
+}
+// 124 is timeout(1)'s exit code; discard not negotiated by the hypervisor
+// (EOPNOTSUPP) or no fstrim binary are "unsupported"; anything else "failed".
+function trimOutcome(code, detail) {
+    if (code === 0)
+        return 'ok';
+    if (code === TIMEOUT_EXIT_CODE)
+        return 'timeout';
+    if (code === 127 || code === 'ENOENT')
+        return 'unsupported';
+    const msg = detail.toLowerCase();
+    if (msg.includes('not supported') ||
+        msg.includes('command not found') ||
+        msg.includes('no such file or directory')) {
+        return 'unsupported';
+    }
+    return 'failed';
 }
 /**
  * Cleanup: run mirror maintenance, sync, unmount, and commit the sticky disk.
