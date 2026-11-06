@@ -262,6 +262,30 @@ describe('runMirrorMaintenance (real git)', () => {
     fsck(mirror)
   })
 
+  it('defers the roll-up until the small packs reach the limit', async () => {
+    const {mirror} = buildMirror(root)
+    const before = packs(mirror)
+    const smallPacks = before.length - 1
+
+    const deferred = await blacksmithCache.runMirrorMaintenance(mirror, {
+      timeoutSecs: 60,
+      keepBytes: KEEP_BYTES,
+      rollupPackLimit: smallPacks + 1
+    })
+    expect(deferred).toMatchObject({success: true, skipped: true})
+    expect(packs(mirror)).toEqual(before)
+
+    const rolled = await blacksmithCache.runMirrorMaintenance(mirror, {
+      timeoutSecs: 60,
+      keepBytes: KEEP_BYTES,
+      rollupPackLimit: smallPacks
+    })
+    expect(rolled.skipped).toBeUndefined()
+    expect(packs(mirror).length).toBeLessThan(before.length)
+    fsck(mirror)
+    refsResolve(mirror)
+  })
+
   it('excludes kept packs from the roll-up regardless of size', async () => {
     const {mirror, basePack} = buildMirror(root)
     // Kept by an earlier run; a larger pack arriving later must not pull

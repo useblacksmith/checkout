@@ -140,19 +140,13 @@ describe('mirror maintenance telemetry', () => {
   it('reports a repack that consolidated packs as a real run', async () => {
     const mirror = twoPackMirror(root)
 
-    const result = await blacksmithCache.cleanup({
-      exposeId: 'expose-1',
-      stickyDiskKey: 'owner-repo',
-      mirrorPath: mirror,
-      shouldCommit: true,
-      vmHydratedGitMirror: false
-    })
+    const result = await blacksmithCache.runMirrorMaintenance(mirror)
 
     expect(packCount(mirror)).toBe(1)
-    expect(result.maintenanceResult.success).toBe(true)
-    expect(result.maintenanceResult.skipped).toBeUndefined()
-    expect(result.maintenanceResult.durationMs).toBeGreaterThanOrEqual(0)
-    expect(result.maintenanceResult.mirrorSizeBytes).toBeGreaterThan(0)
+    expect(result.success).toBe(true)
+    expect(result.skipped).toBeUndefined()
+    expect(result.durationMs).toBeGreaterThanOrEqual(0)
+    expect(result.mirrorSizeBytes).toBeGreaterThan(0)
   })
 
   it('reports no maintenance when the disk is not committed', async () => {

@@ -33,6 +33,11 @@ const MAINTENANCE_TIMEOUT_SECS = 120 // 2 minutes
 // Packs at or above this size are kept permanently; the packs below it that
 // one run rewrites are chosen so their combined size stays under it too.
 const MAINTENANCE_KEEP_PACK_BYTES = 256 * 1024 * 1024
+// A geometric repack that folds any packs enumerates objects across the whole
+// mirror, however small the packs (about 18s on a 12 GiB mirror), and every
+// concurrent job repeats it on its own copy. Each sync adds one small pack, so
+// defer roll-ups until there are as many as git's gc.autoPackLimit default.
+const MAINTENANCE_ROLLUP_PACK_LIMIT = 50
 // Kept packs hold on to objects that later become unreachable (deleted or
 // rewritten branches). A full rewrite with the keeps lifted reclaims them;
 // it is unbounded in size, so it runs rarely and under its own deadline.
@@ -1976,6 +1981,9 @@ async function reclaimDue(
 export interface MaintenanceOptions {
   timeoutSecs?: number
   keepBytes?: number
+  // Minimum number of small (not kept or deferred) packs before an
+  // incremental run rolls them up; 0 always rolls up.
+  rollupPackLimit?: number
   reclaimIntervalMs?: number
   reclaimTimeoutSecs?: number
   now?: number
@@ -2046,6 +2054,7 @@ export async function runMirrorMaintenance(
     Math.max(1, Math.ceil((deadline - Date.now()) / 1000))
 
   let deferred: string[] = []
+  let keptCount = 0
   let label: string
   let repackArgs: string[]
   if (reclaim) {
@@ -2059,6 +2068,7 @@ export async function runMirrorMaintenance(
   } else {
     const selection = await markKeepPacks(mirrorPath, keepBytes)
     deferred = selection.deferred
+    keptCount = selection.kept.length
     label = 'Incremental'
     repackArgs = ['-d', '-l', '-n', '--geometric=2']
     core.info(
@@ -2070,6 +2080,19 @@ export async function runMirrorMaintenance(
   // pack consolidation; loose objects are never walked on the sticky disk.
   const sizeBefore = await packSizeBytesOrNull(mirrorPath)
   const packsBefore = await packNamesOrNull(mirrorPath)
+  const smallPacks =
+    packsBefore === null
+      ? null
+      : packsBefore.length - keptCount - deferred.length
+  const rollUp =
+    reclaim ||
+    smallPacks === null ||
+    smallPacks >= (options.rollupPackLimit ?? 0)
+  if (!rollUp) {
+    core.info(
+      `[git-mirror] ${smallPacks} small pack(s), below the roll-up limit of ${options.rollupPackLimit}; skipping repack`
+    )
+  }
 
   const fail = async (
     timedOut: boolean,
@@ -2095,28 +2118,30 @@ export async function runMirrorMaintenance(
     if (!(await removeMultiPackIndex(mirrorPath))) {
       return await fail(false, 'could not remove the multi-pack-index')
     }
-    const result = await exec.getExecOutput(
-      'timeout',
-      [
-        String(remainingSecs()),
-        'git',
-        '-c',
-        'repack.writeBitmaps=false',
-        '-C',
-        mirrorPath,
-        'repack',
-        ...repackArgs
-      ],
-      {ignoreReturnCode: true}
-    )
-    if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      return await fail(true, `git repack timed out after ${budgetSecs}s`)
-    }
-    if (result.exitCode !== 0) {
-      return await fail(
-        false,
-        `git repack failed with exit code ${result.exitCode}`
+    if (rollUp) {
+      const result = await exec.getExecOutput(
+        'timeout',
+        [
+          String(remainingSecs()),
+          'git',
+          '-c',
+          'repack.writeBitmaps=false',
+          '-C',
+          mirrorPath,
+          'repack',
+          ...repackArgs
+        ],
+        {ignoreReturnCode: true}
       )
+      if (result.exitCode === TIMEOUT_EXIT_CODE) {
+        return await fail(true, `git repack timed out after ${budgetSecs}s`)
+      }
+      if (result.exitCode !== 0) {
+        return await fail(
+          false,
+          `git repack failed with exit code ${result.exitCode}`
+        )
+      }
     }
 
     if (reclaim) {
@@ -2376,7 +2401,9 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
 
   // Maintenance only pays off if the result is persisted.
   if (mirrorPath && shouldCommit) {
-    result.maintenanceResult = await runMirrorMaintenance(mirrorPath)
+    result.maintenanceResult = await runMirrorMaintenance(mirrorPath, {
+      rollupPackLimit: MAINTENANCE_ROLLUP_PACK_LIMIT
+    })
     // Catch-up for mirrors that predate commit-graph writing: build the
     // initial graph here in the post step, off the checkout critical path.
     // Once it exists, the sync fetch keeps it current incrementally.
