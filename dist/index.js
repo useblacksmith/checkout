@@ -1716,7 +1716,7 @@ function reclaimDue(mirrorPath, now, intervalMs) {
  */
 function runMirrorMaintenance(mirrorPath_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, options = {}) {
-        var _a, _b, _c, _d, _e;
+        var _a, _b, _c, _d, _e, _f;
         const timeoutSecs = (_a = options.timeoutSecs) !== null && _a !== void 0 ? _a : MAINTENANCE_TIMEOUT_SECS;
         const keepBytes = (_b = options.keepBytes) !== null && _b !== void 0 ? _b : MAINTENANCE_KEEP_PACK_BYTES;
         const reclaimIntervalMs = (_c = options.reclaimIntervalMs) !== null && _c !== void 0 ? _c : MAINTENANCE_RECLAIM_INTERVAL_MS;
@@ -1762,7 +1762,7 @@ function runMirrorMaintenance(mirrorPath_1) {
             : packsBefore.length - keptCount - deferred.length;
         const rollUp = reclaim ||
             smallPacks === null ||
-            smallPacks >= (options.rollupPackLimit ?? 0);
+            smallPacks >= ((_f = options.rollupPackLimit) !== null && _f !== void 0 ? _f : 0);
         if (!rollUp) {
             core.info(`[git-mirror] ${smallPacks} small pack(s), below the roll-up limit of ${options.rollupPackLimit}; skipping repack`);
         }
