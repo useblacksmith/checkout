@@ -145,11 +145,12 @@ jobs:
       image: ubuntu:24.04
       options: --privileged -v /dev:/dev
     steps:
-      - name: Install git, sudo and the sticky disk tooling
+      # No sudo: the job runs as root, like most job container images.
+      - name: Install git and the sticky disk tooling
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            bash git sudo util-linux e2fsprogs mount ca-certificates
+            bash git util-linux e2fsprogs mount ca-certificates
 
       - name: Checkout action repo
         uses: actions/checkout@v4

@@ -259,6 +259,31 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('asRoot', () => {
+    afterEach(() => {
+      jest.restoreAllMocks()
+    })
+
+    it('runs the command directly when already root', () => {
+      jest.spyOn(process, 'getuid').mockReturnValue(0)
+      expect(blacksmithCache.asRoot('mount', '/dev/vdb', '/mnt')).toEqual([
+        'mount',
+        '/dev/vdb',
+        '/mnt'
+      ])
+    })
+
+    it('runs the command through sudo for any other user', () => {
+      jest.spyOn(process, 'getuid').mockReturnValue(1001)
+      expect(blacksmithCache.asRoot('mount', '/dev/vdb', '/mnt')).toEqual([
+        'sudo',
+        'mount',
+        '/dev/vdb',
+        '/mnt'
+      ])
+    })
+  })
+
   describe('diffMirrorRefs', () => {
     const shaA = 'a'.repeat(40)
     const shaB = 'b'.repeat(40)
