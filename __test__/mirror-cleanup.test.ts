@@ -65,6 +65,13 @@ describe('cleanup commit decision', () => {
     process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT = '1'
     mirrorPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-cleanup-'))
     fs.mkdirSync(path.join(mirrorPath, 'objects', 'pack'), {recursive: true})
+    // Enough small packs to reach the incremental roll-up limit.
+    for (let i = 0; i < 50; i++) {
+      fs.writeFileSync(
+        path.join(mirrorPath, 'objects', 'pack', `pack-${i}.pack`),
+        ''
+      )
+    }
     repackExitCode = 0
     packRefsExitCode = 0
     mockExec.mockResolvedValue(0)
