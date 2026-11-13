@@ -154,7 +154,9 @@ async function cleanup(): Promise<void> {
         shouldCommit,
         vmHydratedGitMirror: performedHydration,
         mirrorSyncFailed,
-        mirrorSyncTimedOut
+        mirrorSyncTimedOut,
+        fstrimTimeoutSecs: stateHelper.BlacksmithCacheFstrimTimeoutSecs,
+        fstrimMinExtentBytes: stateHelper.BlacksmithCacheFstrimMinExtentBytes
       })
     } catch (error) {
       core.warning(
