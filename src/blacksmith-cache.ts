@@ -86,6 +86,18 @@ export interface OperationResult {
  */
 export interface CleanupResult {
   maintenanceResult: OperationResult
+  // Set when the pre-unmount fstrim ran (positive host budget, committing).
+  fstrimResult?: TrimResult
+}
+
+// Same vocabulary as setup-docker-builder and the agent's FstrimOutcome.
+export type TrimOutcome = 'ok' | 'timeout' | 'unsupported' | 'failed'
+
+export interface TrimResult {
+  outcome: TrimOutcome
+  durationMs: number
+  // Byte count from `fstrim -v`; 0 when the output carried none.
+  trimmedBytes: number
 }
 
 /**
@@ -2357,48 +2369,56 @@ export function parseFstrimMinExtentBytes(value: unknown): number {
   return parseFstrimTimeoutSecs(value)
 }
 
+/** The byte count in `fstrim -v` output: "... (N bytes) trimmed". */
+export function parseTrimmedBytes(fstrimOutput: string): number {
+  const match = fstrimOutput.match(/\((\d+) bytes\) trimmed/)
+  return match ? parseInt(match[1], 10) : 0
+}
+
 /**
  * Best-effort `fstrim` of the mirror filesystem before it is unmounted and
  * committed: deleted packs keep their RBD extents allocated on the backing
  * store until the guest discards them. Bounded by the host-supplied budget;
- * `timeout` runs under sudo so it has the privilege to stop root's fstrim.
- * Any failure (discard not negotiated, missing binary, timeout) only logs.
+ * `timeout` runs as root (like fstrim) so it has the privilege to stop it.
+ * Never throws: any failure (discard not negotiated, missing binary,
+ * timeout) is classified into the result and logged.
  */
 async function trimFilesystem(
   mountPoint: string,
   timeoutSecs: number,
   minExtentBytes: number
-): Promise<void> {
+): Promise<TrimResult> {
   const start = Date.now()
   let outcome: TrimOutcome
   let detail: string
+  let trimmedBytes = 0
   try {
-    const result = await exec.getExecOutput(
-      'sudo',
-      [
-        'timeout',
-        String(timeoutSecs),
-        'fstrim',
-        '-v',
-        ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
-        '--',
-        mountPoint
-      ],
-      {ignoreReturnCode: true, silent: true}
+    const [command, ...args] = asRoot(
+      'timeout',
+      String(timeoutSecs),
+      'fstrim',
+      '-v',
+      ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
+      '--',
+      mountPoint
     )
+    const result = await exec.getExecOutput(command, args, {
+      ignoreReturnCode: true,
+      silent: true
+    })
     detail = (result.stdout + result.stderr).trim()
     outcome = trimOutcome(result.exitCode, detail)
+    if (outcome === 'ok') trimmedBytes = parseTrimmedBytes(result.stdout)
   } catch (error) {
     detail = (error as Error).message
     outcome = trimOutcome((error as {code?: unknown}).code, detail)
   }
+  const durationMs = Date.now() - start
   core.info(
-    `[git-mirror] fstrim ${mountPoint}: ${outcome} in ${Date.now() - start}ms${detail ? `: ${detail}` : ''}`
+    `[git-mirror] fstrim ${mountPoint}: ${outcome} in ${durationMs}ms${detail ? `: ${detail}` : ''}`
   )
+  return {outcome, durationMs, trimmedBytes}
 }
-
-// Same vocabulary as setup-docker-builder and the agent's FstrimOutcome.
-type TrimOutcome = 'ok' | 'timeout' | 'unsupported' | 'failed'
 
 // 124 is timeout(1)'s exit code; discard not negotiated by the hypervisor
 // (EOPNOTSUPP) or no fstrim binary are "unsupported"; anything else "failed".
@@ -2511,7 +2531,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     fstrimTimeoutSecs &&
     fstrimTimeoutSecs > 0
   ) {
-    await trimFilesystem(
+    result.fstrimResult = await trimFilesystem(
       mountPoint,
       fstrimTimeoutSecs,
       fstrimMinExtentBytes ?? 0
