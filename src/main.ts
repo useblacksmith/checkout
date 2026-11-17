@@ -206,6 +206,14 @@ async function cleanup(): Promise<void> {
         )
       )
     }
+    if (cleanupResult?.fstrimResult) {
+      await mirrorTelemetry.reportMaintenance(
+        mirrorTelemetry.maintenanceRunFromTrim(
+          stickyDiskKey,
+          cleanupResult.fstrimResult
+        )
+      )
+    }
   }
 }
 

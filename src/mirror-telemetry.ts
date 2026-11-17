@@ -3,6 +3,7 @@ import * as exec from '@actions/exec'
 import * as fs from 'fs'
 import * as path from 'path'
 import {reportStructuredMetric} from './internal-metrics'
+import type {TrimResult} from './blacksmith-cache'
 
 /**
  * Structured git-mirror telemetry reported to the Blacksmith agent over the
@@ -63,7 +64,7 @@ export interface HydrationReport {
 
 /** Field names match the fa agent's internalmetric.MaintenanceRun JSON tags. */
 export interface MaintenanceRun {
-  op: 'refresh' | 'gc' | 'fsck'
+  op: 'refresh' | 'gc' | 'fsck' | 'fstrim'
   sticky_disk_key: string
   duration_ms: number
   bytes: number
@@ -103,6 +104,35 @@ export function maintenanceRunFromResult(
   if (!result.success && result.error) {
     run.error_class = result.timedOut ? 'timeout' : 'error'
   }
+  return run
+}
+
+/**
+ * The pre-unmount fstrim as a maintenance row: bytes are the bytes
+ * discarded, and the fstrim outcome folds into the maintenance vocabulary
+ * with error_class keeping "unsupported" (discard not negotiated, or no
+ * fstrim binary) apart from a real failure.
+ */
+export function maintenanceRunFromTrim(
+  stickyDiskKey: string,
+  trim: TrimResult
+): MaintenanceRun {
+  const run: MaintenanceRun = {
+    op: 'fstrim',
+    sticky_disk_key: stickyDiskKey,
+    duration_ms: trim.durationMs,
+    bytes: trim.trimmedBytes,
+    outcome:
+      trim.outcome === 'ok'
+        ? 'success'
+        : trim.outcome === 'timeout'
+          ? 'timeout'
+          : 'failure',
+    mirror_size_bytes: 0
+  }
+  if (trim.outcome === 'timeout') run.error_class = 'timeout'
+  else if (trim.outcome === 'unsupported') run.error_class = 'unsupported'
+  else if (trim.outcome === 'failed') run.error_class = 'error'
   return run
 }
 

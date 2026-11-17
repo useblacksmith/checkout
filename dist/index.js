@@ -72,6 +72,7 @@ exports.markKeepPacks = markKeepPacks;
 exports.runMirrorMaintenance = runMirrorMaintenance;
 exports.parseFstrimTimeoutSecs = parseFstrimTimeoutSecs;
 exports.parseFstrimMinExtentBytes = parseFstrimMinExtentBytes;
+exports.parseTrimmedBytes = parseTrimmedBytes;
 exports.cleanup = cleanup;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
@@ -1970,36 +1971,43 @@ function parseFstrimTimeoutSecs(value) {
 function parseFstrimMinExtentBytes(value) {
     return parseFstrimTimeoutSecs(value);
 }
+/** The byte count in `fstrim -v` output: "... (N bytes) trimmed". */
+function parseTrimmedBytes(fstrimOutput) {
+    const match = fstrimOutput.match(/\((\d+) bytes\) trimmed/);
+    return match ? parseInt(match[1], 10) : 0;
+}
 /**
  * Best-effort `fstrim` of the mirror filesystem before it is unmounted and
  * committed: deleted packs keep their RBD extents allocated on the backing
  * store until the guest discards them. Bounded by the host-supplied budget;
- * `timeout` runs under sudo so it has the privilege to stop root's fstrim.
- * Any failure (discard not negotiated, missing binary, timeout) only logs.
+ * `timeout` runs as root (like fstrim) so it has the privilege to stop it.
+ * Never throws: any failure (discard not negotiated, missing binary,
+ * timeout) is classified into the result and logged.
  */
 function trimFilesystem(mountPoint, timeoutSecs, minExtentBytes) {
     return __awaiter(this, void 0, void 0, function* () {
         const start = Date.now();
         let outcome;
         let detail;
+        let trimmedBytes = 0;
         try {
-            const result = yield exec.getExecOutput('sudo', [
-                'timeout',
-                String(timeoutSecs),
-                'fstrim',
-                '-v',
-                ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []),
-                '--',
-                mountPoint
-            ], { ignoreReturnCode: true, silent: true });
+            const [command, ...args] = asRoot('timeout', String(timeoutSecs), 'fstrim', '-v', ...(minExtentBytes > 0 ? ['-m', String(minExtentBytes)] : []), '--', mountPoint);
+            const result = yield exec.getExecOutput(command, args, {
+                ignoreReturnCode: true,
+                silent: true
+            });
             detail = (result.stdout + result.stderr).trim();
             outcome = trimOutcome(result.exitCode, detail);
+            if (outcome === 'ok')
+                trimmedBytes = parseTrimmedBytes(result.stdout);
         }
         catch (error) {
             detail = error.message;
             outcome = trimOutcome(error.code, detail);
         }
-        core.info(`[git-mirror] fstrim ${mountPoint}: ${outcome} in ${Date.now() - start}ms${detail ? `: ${detail}` : ''}`);
+        const durationMs = Date.now() - start;
+        core.info(`[git-mirror] fstrim ${mountPoint}: ${outcome} in ${durationMs}ms${detail ? `: ${detail}` : ''}`);
+        return { outcome, durationMs, trimmedBytes };
     });
 }
 // 124 is timeout(1)'s exit code; discard not negotiated by the hypervisor
@@ -2070,7 +2078,7 @@ function cleanup(options) {
             shouldCommit &&
             fstrimTimeoutSecs &&
             fstrimTimeoutSecs > 0) {
-            yield trimFilesystem(mountPoint, fstrimTimeoutSecs, fstrimMinExtentBytes !== null && fstrimMinExtentBytes !== void 0 ? fstrimMinExtentBytes : 0);
+            result.fstrimResult = yield trimFilesystem(mountPoint, fstrimTimeoutSecs, fstrimMinExtentBytes !== null && fstrimMinExtentBytes !== void 0 ? fstrimMinExtentBytes : 0);
         }
         // Get device path before unmount for durability flush
         let devicePath = null;
@@ -4967,6 +4975,9 @@ function cleanup() {
                 !cleanupResult.maintenanceResult.skipped) {
                 yield mirrorTelemetry.reportMaintenance(mirrorTelemetry.maintenanceRunFromResult('gc', stickyDiskKey, cleanupResult.maintenanceResult));
             }
+            if (cleanupResult === null || cleanupResult === void 0 ? void 0 : cleanupResult.fstrimResult) {
+                yield mirrorTelemetry.reportMaintenance(mirrorTelemetry.maintenanceRunFromTrim(stickyDiskKey, cleanupResult.fstrimResult));
+            }
         }
     });
 }
@@ -5021,6 +5032,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.maintenanceRunFromResult = maintenanceRunFromResult;
+exports.maintenanceRunFromTrim = maintenanceRunFromTrim;
 exports.newCheckoutReport = newCheckoutReport;
 exports.dirSizeBytesOrNull = dirSizeBytesOrNull;
 exports.packSizeBytesOrNull = packSizeBytesOrNull;
@@ -5057,6 +5069,33 @@ function maintenanceRunFromResult(op, stickyDiskKey, result) {
     if (!result.success && result.error) {
         run.error_class = result.timedOut ? 'timeout' : 'error';
     }
+    return run;
+}
+/**
+ * The pre-unmount fstrim as a maintenance row: bytes are the bytes
+ * discarded, and the fstrim outcome folds into the maintenance vocabulary
+ * with error_class keeping "unsupported" (discard not negotiated, or no
+ * fstrim binary) apart from a real failure.
+ */
+function maintenanceRunFromTrim(stickyDiskKey, trim) {
+    const run = {
+        op: 'fstrim',
+        sticky_disk_key: stickyDiskKey,
+        duration_ms: trim.durationMs,
+        bytes: trim.trimmedBytes,
+        outcome: trim.outcome === 'ok'
+            ? 'success'
+            : trim.outcome === 'timeout'
+                ? 'timeout'
+                : 'failure',
+        mirror_size_bytes: 0
+    };
+    if (trim.outcome === 'timeout')
+        run.error_class = 'timeout';
+    else if (trim.outcome === 'unsupported')
+        run.error_class = 'unsupported';
+    else if (trim.outcome === 'failed')
+        run.error_class = 'error';
     return run;
 }
 function newCheckoutReport() {
