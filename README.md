@@ -100,7 +100,7 @@ The action copies the required objects into the workspace and removes its depend
 
 ## Blacksmith-specific inputs
 
-In addition to all upstream `actions/checkout` inputs, this action provides:
+In addition to all upstream `actions/checkout` inputs, this action provides the following:
 
 | Input | Default | Description |
 | --- | --- | --- |
