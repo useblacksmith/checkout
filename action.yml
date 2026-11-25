@@ -112,6 +112,15 @@ inputs:
       (e.g. `options: --privileged -v /dev:/dev`). Can also be enabled via the
       BLACKSMITH_ALLOW_INSIDE_CONTAINER=true environment variable.
     default: false
+  refresh-mirror:
+    description: >
+      Refresh the Blacksmith git mirror in the post step after a shallow
+      checkout (fetch-depth above 0). Set to false to skip the refresh, for
+      example in jobs whose sticky disk changes are never committed. The
+      refresh is also skipped automatically when the host has already denied
+      this job's commit (sticky disk branch protection). Full checkouts
+      always refresh the mirror before populating the workspace.
+    default: true
   verbose:
     description: >
       Enable verbose output for git mirror operations. Outputs GIT_TRACE and GIT_CURL_VERBOSE
