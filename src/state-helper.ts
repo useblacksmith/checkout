@@ -107,6 +107,24 @@ export const BlacksmithCacheCommitEarlyDenyReason = core.getState(
 )
 
 /**
+ * Host-supplied budget, in whole seconds, for trimming the mirror filesystem
+ * before unmount at commit. 0 when the host has not enabled the trim.
+ */
+export const BlacksmithCacheFstrimTimeoutSecs = (() => {
+  const secs = Number(core.getState('blacksmithCacheFstrimTimeoutSecs') || '0')
+  return Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0
+})()
+
+/**
+ * The host's `fstrim -m` value in bytes, saved by the main action. 0 when
+ * the host left fstrim at its default minimum extent.
+ */
+export const BlacksmithCacheFstrimMinExtentBytes = (() => {
+  const n = Number(core.getState('blacksmithCacheFstrimMinExtentBytes') || '0')
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+})()
+
+/**
  * Save the repository path so the POST action can retrieve the value.
  */
 export function setRepositoryPath(repositoryPath: string) {
@@ -231,6 +249,20 @@ export function setBlacksmithCacheVerbose(verbose: boolean) {
  */
 export function setBlacksmithCacheCommitEarlyDenyReason(reason: string) {
   core.saveState('blacksmithCacheCommitEarlyDenyReason', reason)
+}
+
+/**
+ * Save the host's fstrim budget so the POST action can trim before unmount.
+ */
+export function setBlacksmithCacheFstrimTimeoutSecs(secs: number) {
+  core.saveState('blacksmithCacheFstrimTimeoutSecs', String(secs))
+}
+
+/**
+ * Save the host's `fstrim -m` value so the POST action can pass it along.
+ */
+export function setBlacksmithCacheFstrimMinExtentBytes(bytes: number) {
+  core.saveState('blacksmithCacheFstrimMinExtentBytes', String(bytes))
 }
 
 // Publish a variable so that when the POST action runs, it can determine it should run the cleanup logic.

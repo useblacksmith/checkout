@@ -154,7 +154,9 @@ async function cleanup(): Promise<void> {
         shouldCommit,
         vmHydratedGitMirror: performedHydration,
         mirrorSyncFailed,
-        mirrorSyncTimedOut
+        mirrorSyncTimedOut,
+        fstrimTimeoutSecs: stateHelper.BlacksmithCacheFstrimTimeoutSecs,
+        fstrimMinExtentBytes: stateHelper.BlacksmithCacheFstrimMinExtentBytes
       })
     } catch (error) {
       core.warning(
@@ -201,6 +203,14 @@ async function cleanup(): Promise<void> {
           'gc',
           stickyDiskKey,
           cleanupResult.maintenanceResult
+        )
+      )
+    }
+    if (cleanupResult?.fstrimResult) {
+      await mirrorTelemetry.reportMaintenance(
+        mirrorTelemetry.maintenanceRunFromTrim(
+          stickyDiskKey,
+          cleanupResult.fstrimResult
         )
       )
     }
